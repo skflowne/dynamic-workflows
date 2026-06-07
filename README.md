@@ -92,6 +92,18 @@ codex-workflow run hello --args '{"name":"Ada"}' --json | jq .result
 
 `.claude/workflows/nested-demo.js` demonstrates the `workflow()` nesting primitive.
 
+### `examples/`
+
+Sample scripts you run by **path** (`codex-workflow run examples/<file>`); unlike `.claude/workflows/`,
+they are not registered for name lookup or `list`.
+
+- `complex-chain.js`, `live-check.js` — small original demos.
+- `deep-research.js` — Claude Code's built-in `deep-research` workflow (fan-out → fetch → 3-vote
+  verify → synthesize); runnable here as-is.
+- `code-review.js` — Claude Code's built-in hidden `code-review` workflow. **Reference only**: it was
+  extracted from the compiled client with unresolved `${…}` template placeholders, so it does not
+  parse/run; it's included to document the find → verify → synthesize architecture.
+
 ## Viewer
 
 A local web viewer (zero runtime dependencies — Node's `http` + a vanilla SPA) visualizes runs:
@@ -202,8 +214,8 @@ The live Codex path is gated to avoid spending tokens:
 RUN_CODEX_SDK_LIVE=1 npm test
 ```
 
-`test:deepresearch` executes the actual `deep-research` workflow from
-`/tmp/codex-workflow-research/gist/claude-code-deep-research-workflow.js` (not vendored here).
+`test:deepresearch` runs the vendored `deep-research` workflow (`examples/deep-research.js`) against a
+stubbed runner. (Override the path with `DEEP_RESEARCH_WORKFLOW_PATH`.)
 
 ## Not included (yet)
 

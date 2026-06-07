@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { parseWorkflowScript, runWorkflow, ScriptedAgentRunner, type WorkflowAgentCall } from "../src/index.js";
 
 const fixturePath =
-  process.env.DEEP_RESEARCH_WORKFLOW_PATH ??
-  "/tmp/codex-workflow-research/gist/claude-code-deep-research-workflow.js";
+  process.env.DEEP_RESEARCH_WORKFLOW_PATH ?? fileURLToPath(new URL("../examples/deep-research.js", import.meta.url));
 
 const maybeTest = existsSync(fixturePath) ? test : test.skip;
 

@@ -43,7 +43,7 @@
     "serve": "npm run build && node dist/cli.js serve",
     "test": "npm run build && npm run test:unit",
     "test:unit": "tsx --test tests/**/*.test.ts",
-    "test:deepresearch": "DEEP_RESEARCH_WORKFLOW_PATH=/tmp/codex-workflow-research/gist/claude-code-deep-research-workflow.js tsx --test tests/deep-research-compat.test.ts",
+    "test:deepresearch": "tsx --test tests/deep-research-compat.test.ts",
     "typecheck": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
