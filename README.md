@@ -45,7 +45,8 @@ codex-workflow doctor
 ## CLI
 
 ```text
-codex-workflow run <file> [options]        Run a workflow file (foreground, live progress)
+codex-workflow run <file|name> [options]   Run a workflow file or registered name
+codex-workflow list [--json]               List workflows from .claude/workflows and ~/.claude/workflows
 codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
 codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
 codex-workflow runs [--json]               List recorded run history
@@ -53,7 +54,9 @@ codex-workflow show <runId> [--json]       Show a recorded run
 codex-workflow doctor                      Check Bun, Codex CLI, auth, and the viewer
 ```
 
-`run` takes a **path** to a workflow file (absolute or relative) — there is no name-based lookup.
+`run` takes a workflow file path (absolute or relative) or a bare registered name. Name lookup scans
+project `.claude/workflows` and user `~/.claude/workflows`; file-like targets (`./x.js`, `x.ts`,
+etc.) are treated as paths and report a file-not-found error if missing.
 
 Run options:
 
@@ -70,10 +73,11 @@ Run options:
 | `--approval <policy>` | `never` \| `on-request` \| `on-failure` \| `untrusted` |
 | `--reasoning <effort>` | `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
 | `--bun <path>` | Path to the Bun binary |
-
-Web search + network access are **always enabled** for agents.
+| `--idle-timeout <ms>` | Bun child idle watchdog in milliseconds (`0` disables; default 300000) |
 | `--json` | Machine-readable output to stdout (suppresses progress) |
 | `--quiet` / `--no-progress` | Reduce / plainify progress output |
+
+Web search + network access are **always enabled** for agents.
 
 Run history, the per-agent journal, and session links are recorded in a **global** data dir,
 `~/.codex-workflow/` (override with `CODEX_WORKFLOW_HOME`), so runs from every project are shared by
@@ -90,7 +94,8 @@ CODEX_WORKFLOW_FAKE_AGENT=1 codex-workflow run examples/hello.js --args '{"name"
 codex-workflow run examples/hello.js --args '{"name":"Ada"}' --json | jq .result
 ```
 
-`examples/nested-demo.js` demonstrates the `workflow()` nesting primitive (nesting by path).
+`examples/nested-demo.js` demonstrates the `workflow()` nesting primitive (nesting by path; registered
+names work when the target workflow is in a discovered workflow directory).
 
 ### `examples/`
 
@@ -146,15 +151,17 @@ return { findings: findings.flat().filter(Boolean) }
 
 - `agent(prompt, opts?)` — spawn a Codex subagent. Options: `label`, `phase`, `schema` (JSON Schema →
   validated structured output), `model`, `agentType`, `isolation: 'worktree'` (runs in a fresh
-  detached git worktree). Without a schema it returns the final text; with a schema it returns the
-  validated object.
+  detached git worktree). If the current `meta.phases[]` entry has a `model`, agents in that phase
+  inherit it unless they pass `model` explicitly. `agentType` is prompt context only; Codex does not
+  load Claude's built-in agent definitions or tool bundles. Without a schema it returns the final
+  text; with a schema it returns the validated object.
 - `parallel(thunks)` — run `() => …` thunks concurrently; a thrown thunk resolves to `null`.
 - `pipeline(items, stage1, stage2, …)` — run each item through all stages independently (no barrier);
   stages receive `(prevResult, originalItem, index)`; a throwing stage drops the item to `null`.
 - `workflow(ref, args?)` — run another workflow inline (one level deep), sharing this run's
   concurrency limiter, agent-count cap, token budget, journal, and abort signal. `ref` is a path to a
-  workflow file — a path-like string (`'./other.js'`) or `{ scriptPath }`, resolved relative to the
-  current working directory.
+  workflow file or registered name — a path-like string (`'./other.js'`) or `{ scriptPath }`, resolved
+  relative to the run `cwd`, or a bare name resolved from the workflow registry.
 - `phase(title)`, `log(message)`, `args`, `budget` (`total`, `spent()`, `remaining()` — shared across
   the root and nested workflows).
 
@@ -166,6 +173,10 @@ workflow is a runnable subset, and you may additionally use anything Bun/Node pr
 filesystem, `Bun`, etc.). Resume is therefore *best-effort*: completed `agent()` calls are cached in a
 journal keyed by prompt+options+runId and reused on `--resume`, but non-deterministic script logic is
 not snapshotted.
+
+Codex structured output also requires stricter JSON Schema than Claude. The runner sends a strict
+copy to Codex while preserving the original schema for runtime validation; optional fields are
+represented as nullable in the strict copy and stripped back out before loose-schema validation.
 
 ## Library use
 
@@ -186,7 +197,7 @@ const output = await controller.run({ scriptPath: "examples/deep-research.js", a
 
 `runWorkflow`, `runWorkflowTool`, `FileWorkflowJournal`, `FileRunStore`, and `ScriptedAgentRunner` are
 also exported. `WorkflowRegistry` / `buildWorkflowResolver` remain available for embedders who want
-opt-in name-based discovery (the CLI itself is path-only).
+custom name-based discovery.
 
 ## Architecture
 
@@ -226,3 +237,5 @@ stubbed runner. (Override the path with `DEEP_RESEARCH_WORKFLOW_PATH`.)
 - MCP server / in-Codex tool registration (this is a standalone CLI by design).
 - Remote/cloud workflows; a long-running background daemon.
 - Real LLM token accounting — `budget` uses a length-based estimate.
+- Claude built-in agent definitions/tool bundles behind `agentType`; Codex receives `agentType` as
+  prompt context only.

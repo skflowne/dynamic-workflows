@@ -215,3 +215,88 @@ return { value }
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("runWorkflow enforces maxAgents before limiter-queued calls start", async () => {
+  let invocations = 0;
+  const runner = new ScriptedAgentRunner(async (call) => {
+    invocations++;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return call.prompt;
+  });
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'agent_cap', description: 'Agent cap' }
+const calls = [0, 1, 2].map((n) => agent('p' + n, { label: 'p' + n }))
+return Promise.all(calls)
+`,
+        { runner, concurrency: 1, maxAgents: 2 },
+      ),
+    /agent\(\) call cap reached/,
+  );
+
+  assert.ok(invocations <= 2);
+});
+
+test("runWorkflow reports missing Bun with an actionable error", async () => {
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'missing_bun', description: 'Missing Bun' }
+return 1
+`,
+        {
+          bunPath: "definitely-not-a-bun-binary",
+          runner: new ScriptedAgentRunner(() => "unused"),
+        },
+      ),
+    /Bun runtime not found/,
+  );
+});
+
+test("runWorkflow strips null optional structured fields before loose-schema validation", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'optional_schema', description: 'Optional structured output' }
+return agent('json', {
+  label: 'json',
+  schema: {
+    type: 'object',
+    required: ['required'],
+    properties: {
+      required: { type: 'string' },
+      optional: { type: 'string' },
+    },
+  },
+})
+`,
+    {
+      runner: new ScriptedAgentRunner(() => ({ required: "ok", optional: null })),
+    },
+  );
+
+  assert.deepEqual(result.result, { required: "ok" });
+});
+
+test("runWorkflow applies meta phase model unless an agent sets model explicitly", async () => {
+  const result = await runWorkflow(
+    `export const meta = {
+  name: 'phase_model',
+  description: 'Phase model',
+  phases: [{ title: 'Plan', model: 'phase-model' }],
+}
+phase('Plan')
+const inherited = await agent('inherited', { label: 'inherited' })
+const explicit = await agent('explicit', { label: 'explicit', model: 'explicit-model' })
+return { inherited, explicit }
+`,
+    {
+      runner: new ScriptedAgentRunner((call) => call.options.model ?? "none"),
+    },
+  );
+
+  assert.deepEqual(result.result, {
+    inherited: "phase-model",
+    explicit: "explicit-model",
+  });
+});

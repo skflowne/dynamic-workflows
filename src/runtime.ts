@@ -9,6 +9,7 @@ import { cloneJournalResult, journalEntryFromCall, workflowAgentCacheKey } from 
 import { parseWorkflowScript } from "./parser.js";
 import type {
   JsonSchema,
+  WorkflowMeta,
   WorkflowAgentOptions,
   WorkflowRef,
   WorkflowRunOptions,
@@ -16,6 +17,7 @@ import type {
 } from "./types.js";
 
 const MAX_ITEMS_PER_CALL = 4096;
+const DEFAULT_WORKFLOW_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 interface RuntimeState {
   logs: string[];
@@ -90,11 +92,17 @@ interface BunChildOptions {
   bunPath: string;
   cwd: string;
   signal?: AbortSignal;
+  idleTimeoutMs: number | null;
   emitLog: (message: unknown) => void;
   recordPhase: (title: unknown) => void;
   runAgent: (prompt: unknown, options?: unknown) => Promise<unknown>;
   runNestedWorkflow: (nameOrRef: unknown, args: unknown, callerDepth: number) => Promise<unknown>;
   spent: () => number;
+}
+
+interface BunChildRequestHooks {
+  requestStarted: () => void;
+  requestSettled: () => void;
 }
 
 const ajv = new Ajv({ allErrors: true, strict: false });
@@ -110,7 +118,7 @@ export async function runWorkflow<T = unknown>(
   const ctx = createRunContext(options, runId);
 
   try {
-    const result = await executeWorkflow(parsed.body, parsed.meta.name, ctx, options.args, 0, undefined);
+    const result = await executeWorkflow(parsed.body, parsed.meta, ctx, options.args, 0, undefined);
 
     assertStructuredCloneable(result, "workflow result");
     const clonedResult = structuredClone(result);
@@ -177,6 +185,8 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
 
   ctx.runAgent = async (prompt: unknown, rawOptions: unknown = {}) => {
     throwIfUserAborted();
+    const taskPrompt = requireString(prompt, "agent prompt");
+    const agentOptions = normalizeAgentOptions(rawOptions);
     if (state.agentCount >= ctx.maxAgents) {
       throw new WorkflowBudgetExceededError(
         `Workflow agent() call cap reached (${ctx.maxAgents}). Add a hard iteration cap to the loop, or pass a token budget.`,
@@ -186,9 +196,8 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
       throw new WorkflowBudgetExceededError("workflow token budget exhausted");
     }
 
-    const taskPrompt = requireString(prompt, "agent prompt");
-    const agentOptions = normalizeAgentOptions(rawOptions);
     const assignedPhase = agentOptions.phase;
+    state.agentCount++;
     const index = ++state.nextAgentIndex;
     const label = agentOptions.label?.trim() || defaultAgentLabel(assignedPhase, index);
     const callOptions = withAgentIdentity(agentOptions, label, assignedPhase);
@@ -203,7 +212,6 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
     };
 
     return limiter(async () => {
-      state.agentCount++;
       options.onProgress?.(agentProgress(label, assignedPhase, "started", { index, key: cacheKey }));
       try {
         throwIfUserAborted();
@@ -269,7 +277,7 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
     const ref = toWorkflowRef(nameOrRef);
     const resolved = await options.resolveWorkflow(ref);
     const parsed = parseWorkflowScript(resolved.script);
-    return executeWorkflow(parsed.body, parsed.meta.name, ctx, args, callerDepth + 1, resolved.name);
+    return executeWorkflow(parsed.body, parsed.meta, ctx, args, callerDepth + 1, resolved.name);
   };
 
   return ctx;
@@ -281,7 +289,7 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
  */
 async function executeWorkflow(
   body: string,
-  name: string,
+  meta: WorkflowMeta,
   ctx: RunContext,
   args: unknown,
   depth: number,
@@ -289,12 +297,18 @@ async function executeWorkflow(
 ): Promise<unknown> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "codex-workflow-bun-"));
   try {
+    const name = meta.name;
     const safeName = (name || "workflow").replace(/[^A-Za-z0-9_.-]/g, "_") || "workflow";
     const runnerPath = path.join(tempDir, `${safeName}.runner.ts`);
-    await writeFile(runnerPath, bunRunnerSource(body, ctx.tokenBudget, args, ctx.cwd, depth, phasePrefix), "utf8");
+    await writeFile(
+      runnerPath,
+      bunRunnerSource(body, ctx.tokenBudget, args, ctx.cwd, depth, phasePrefix, phaseModelMap(meta)),
+      "utf8",
+    );
     const childOptions: BunChildOptions = {
       bunPath: ctx.bunPath,
       cwd: ctx.cwd,
+      idleTimeoutMs: resolveWorkflowIdleTimeout(ctx.options.workflowIdleTimeoutMs),
       emitLog: ctx.emitLog,
       recordPhase: ctx.recordPhase,
       runAgent: ctx.runAgent,
@@ -315,6 +329,7 @@ function bunRunnerSource(
   cwd: string,
   depth: number,
   phasePrefix: string | undefined,
+  phaseModels: Record<string, string>,
 ): string {
   return `const IPC_PREFIX = ${JSON.stringify(IPC_PREFIX)};
 let nextRequestId = 1;
@@ -327,7 +342,9 @@ const args = ${args === undefined ? "undefined" : JSON.stringify(args)};
 const cwd = ${JSON.stringify(cwd)};
 const __depth = ${JSON.stringify(depth)};
 const __phasePrefix = ${phasePrefix === undefined ? "undefined" : JSON.stringify(phasePrefix)};
+const __phaseModels = ${JSON.stringify(phaseModels)};
 let currentPhase = __phasePrefix;
+let currentPhaseModel = undefined;
 
 function send(message) {
   process.stdout.write(IPC_PREFIX + JSON.stringify(message) + "\\n");
@@ -383,6 +400,7 @@ console.error = (...values) => emitLog("[error] " + values.join(" "));
 function phase(title) {
   const text = String(title);
   currentPhase = __phasePrefix ? __phasePrefix + " \\u00b7 " + text : text;
+  currentPhaseModel = __phaseModels[text];
   send({ kind: "event", type: "phase", payload: { title: currentPhase } });
 }
 
@@ -395,7 +413,20 @@ function agent(prompt, options = {}) {
   if (opts && typeof opts === "object" && opts.phase === undefined && currentPhase !== undefined) {
     opts.phase = currentPhase;
   }
+  if (opts && typeof opts === "object" && opts.model === undefined) {
+    const phaseModel = typeof opts.phase === "string" ? modelForPhase(opts.phase) : currentPhaseModel;
+    if (phaseModel !== undefined) opts.model = phaseModel;
+  }
   return trackWorkflowPromise(request("agent", { prompt, options: opts }));
+}
+
+function modelForPhase(phaseTitle) {
+  if (Object.prototype.hasOwnProperty.call(__phaseModels, phaseTitle)) return __phaseModels[phaseTitle];
+  if (__phasePrefix && typeof phaseTitle === "string") {
+    const prefix = __phasePrefix + " \\u00b7 ";
+    if (phaseTitle.startsWith(prefix)) return __phaseModels[phaseTitle.slice(prefix.length)];
+  }
+  return undefined;
 }
 
 function workflow(nameOrRef, workflowArgs) {
@@ -504,10 +535,44 @@ async function runBunChild(runnerPath: string, options: BunChildOptions): Promis
     let settled = false;
     let stdoutBuffer = "";
     let stderrBuffer = "";
+    let pendingChildRequests = 0;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = undefined;
+    };
+
+    const armIdleTimer = () => {
+      clearIdleTimer();
+      if (settled || options.idleTimeoutMs === null || pendingChildRequests > 0) return;
+      idleTimer = setTimeout(() => {
+        child.kill("SIGTERM");
+        settle(
+          new WorkflowInputError(
+            `Bun workflow made no progress for ${options.idleTimeoutMs}ms while not waiting on an agent/workflow request. ` +
+              "Check for an infinite loop or pass workflowIdleTimeoutMs: null to disable the watchdog.",
+          ),
+        );
+      }, options.idleTimeoutMs);
+      idleTimer.unref?.();
+    };
+
+    const requestHooks: BunChildRequestHooks = {
+      requestStarted: () => {
+        pendingChildRequests++;
+        clearIdleTimer();
+      },
+      requestSettled: () => {
+        pendingChildRequests = Math.max(0, pendingChildRequests - 1);
+        armIdleTimer();
+      },
+    };
 
     const settle = (error: unknown, value?: unknown) => {
       if (settled) return;
       settled = true;
+      clearIdleTimer();
       options.signal?.removeEventListener("abort", abort);
       if (error) reject(error);
       else resolve(value);
@@ -524,7 +589,9 @@ async function runBunChild(runnerPath: string, options: BunChildOptions): Promis
     }
     options.signal?.addEventListener("abort", abort, { once: true });
 
-    child.on("error", (error) => settle(error));
+    armIdleTimer();
+
+    child.on("error", (error) => settle(normalizeBunSpawnError(error, options.bunPath)));
     child.on("exit", (code, signal) => {
       if (settled) return;
       if (code === 0) {
@@ -536,16 +603,18 @@ async function runBunChild(runnerPath: string, options: BunChildOptions): Promis
     });
 
     child.stdout.on("data", (chunk: Buffer) => {
+      armIdleTimer();
       stdoutBuffer += chunk.toString("utf8");
       let index: number;
       while ((index = stdoutBuffer.indexOf("\n")) >= 0) {
         const line = stdoutBuffer.slice(0, index);
         stdoutBuffer = stdoutBuffer.slice(index + 1);
-        handleChildStdoutLine(child, line, options, settle);
+        handleChildStdoutLine(child, line, options, settle, requestHooks);
       }
     });
 
     child.stderr.on("data", (chunk: Buffer) => {
+      armIdleTimer();
       const text = chunk.toString("utf8");
       stderrBuffer += text;
       for (const line of text.split(/\r?\n/)) {
@@ -560,6 +629,7 @@ function handleChildStdoutLine(
   line: string,
   options: BunChildOptions,
   settle: (error: unknown, value?: unknown) => void,
+  requestHooks: BunChildRequestHooks,
 ): void {
   if (!line.startsWith(IPC_PREFIX)) {
     if (line.trim()) options.emitLog(line);
@@ -582,18 +652,22 @@ function handleChildStdoutLine(
 
   if (message.kind === "request") {
     if (message.type === "agent") {
+      requestHooks.requestStarted();
       options
         .runAgent(message.payload.prompt, message.payload.options)
         .then((value) => sendChildResponse(child, message.id, value, undefined, options.spent()))
-        .catch((error) => sendChildResponse(child, message.id, undefined, error, options.spent()));
+        .catch((error) => sendChildResponse(child, message.id, undefined, error, options.spent()))
+        .finally(requestHooks.requestSettled);
       return;
     }
     if (message.type === "workflow") {
       const callerDepth = typeof message.payload.depth === "number" ? message.payload.depth : 0;
+      requestHooks.requestStarted();
       options
         .runNestedWorkflow(message.payload.nameOrRef, message.payload.args, callerDepth)
         .then((value) => sendChildResponse(child, message.id, value, undefined, options.spent()))
-        .catch((error) => sendChildResponse(child, message.id, undefined, error, options.spent()));
+        .catch((error) => sendChildResponse(child, message.id, undefined, error, options.spent()))
+        .finally(requestHooks.requestSettled);
       return;
     }
     sendChildResponse(child, message.id, undefined, new WorkflowInputError(`Unknown workflow request: ${message.type}`), options.spent());
@@ -648,11 +722,53 @@ function normalizeAgentResult(result: unknown, schema: JsonSchema | undefined): 
   if (!schema) return result;
   if (result === null) return null;
   const value = typeof result === "string" ? parseJsonResult(result) : result;
+  const normalized = stripNullOptionalFields(value, schema);
   const validate = ajv.compile(schema);
-  if (!validate(value)) {
+  if (!validate(normalized)) {
     throw new WorkflowInputError(`StructuredOutput validation failure: ${ajv.errorsText(validate.errors)}`);
   }
-  return value;
+  return normalized;
+}
+
+function stripNullOptionalFields(value: unknown, schema: JsonSchema): unknown {
+  if (value === null || value === undefined) return value;
+
+  if (Array.isArray(value)) {
+    const itemSchema = !Array.isArray(schema.items) ? schema.items : undefined;
+    if (!itemSchema) return value;
+    let changed = false;
+    const next = value.map((item) => {
+      const stripped = stripNullOptionalFields(item, itemSchema);
+      if (stripped !== item) changed = true;
+      return stripped;
+    });
+    return changed ? next : value;
+  }
+
+  if (typeof value !== "object") return value;
+  const properties = schema.properties;
+  if (!properties || typeof properties !== "object") return value;
+
+  const input = value as Record<string, unknown>;
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  let output: Record<string, unknown> | undefined;
+
+  for (const [key, propertySchema] of Object.entries(properties)) {
+    if (!(key in input)) continue;
+    const propertyValue = input[key];
+    if (propertyValue === null && !required.has(key)) {
+      output ??= { ...input };
+      delete output[key];
+      continue;
+    }
+    const stripped = stripNullOptionalFields(propertyValue, propertySchema);
+    if (stripped !== propertyValue) {
+      output ??= { ...input };
+      output[key] = stripped;
+    }
+  }
+
+  return output ?? value;
 }
 
 function parseJsonResult(text: string): unknown {
@@ -676,6 +792,31 @@ function resolveConcurrency(requested: number | undefined): number {
   const ceiling = Math.min(16, cpuBased);
   if (requested === undefined) return ceiling;
   return Math.max(1, Math.min(requested, 16));
+}
+
+function resolveWorkflowIdleTimeout(requested: number | null | undefined): number | null {
+  if (requested === null) return null;
+  if (requested === undefined) return DEFAULT_WORKFLOW_IDLE_TIMEOUT_MS;
+  if (requested <= 0) return null;
+  return requested;
+}
+
+function normalizeBunSpawnError(error: Error, bunPath: string): Error {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ENOENT") {
+    return new WorkflowInputError(
+      `Bun runtime not found at "${bunPath}". Install Bun, add it to PATH, or pass --bun <path> / bunPath in the library API.`,
+    );
+  }
+  return error;
+}
+
+function phaseModelMap(meta: WorkflowMeta): Record<string, string> {
+  const models: Record<string, string> = {};
+  for (const phase of meta.phases ?? []) {
+    if (phase.model !== undefined) models[phase.title] = phase.model;
+  }
+  return models;
 }
 
 function anySignal(signals: AbortSignal[]): AbortSignal {

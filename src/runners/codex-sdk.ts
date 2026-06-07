@@ -27,7 +27,8 @@ export interface CodexSdkAgentRunnerOptions {
 /**
  * Runs each workflow `agent()` call as an independent Codex thread via `@openai/codex-sdk`.
  * Honors the Claude-style agent options: `model`, `schema` (StructuredOutput), `label`/`phase`
- * (prompt context), `agentType`, and `isolation: 'worktree'` (a fresh detached git worktree).
+ * (prompt context), `agentType` as prompt context, and `isolation: 'worktree'` (a fresh detached
+ * git worktree).
  */
 export class CodexSdkAgentRunner implements WorkflowAgentRunner {
   private readonly codex: Codex;
@@ -67,8 +68,8 @@ export class CodexSdkAgentRunner implements WorkflowAgentRunner {
       const turnOptions: Parameters<typeof thread.run>[1] = {};
       // Codex/OpenAI structured output requires a *strict* JSON Schema (every object must set
       // additionalProperties:false and list all keys in `required`). Claude workflow schemas are
-      // looser, so transform before sending; the runtime still validates results against the
-      // original (looser) schema.
+      // looser, so transform before sending; optional fields become nullable in the strict copy, and
+      // the runtime still validates results against the original (looser) schema.
       if (call.options.schema !== undefined) turnOptions.outputSchema = toStrictJsonSchema(call.options.schema);
       if (signal !== undefined) turnOptions.signal = signal;
 
@@ -112,7 +113,9 @@ export class CodexSdkAgentRunner implements WorkflowAgentRunner {
 
 /**
  * Rewrites a (possibly loose) JSON Schema into OpenAI/Codex strict form: every object schema gets
- * `additionalProperties: false` and a `required` listing all of its properties. Recurses through
+ * `additionalProperties: false` and a `required` listing all of its properties. Properties that were
+ * optional in the original schema are made nullable in the strict copy so the model can satisfy
+ * OpenAI strict mode without changing the caller-visible loose schema semantics. Recurses through
  * `properties`, `items`, and `anyOf`/`oneOf`/`allOf`. Leaves non-object schemas untouched.
  */
 export function toStrictJsonSchema(schema: unknown): unknown {
@@ -123,9 +126,11 @@ function strictify(node: unknown): unknown {
   if (Array.isArray(node)) return node.map(strictify);
   if (!node || typeof node !== "object") return node;
 
+  const original = node as Record<string, unknown>;
+  const originalRequired = stringSet(original.required);
   const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    out[key] = key === "properties" ? strictifyProperties(value) : strictify(value);
+  for (const [key, value] of Object.entries(original)) {
+    out[key] = key === "properties" ? strictifyProperties(value, originalRequired) : strictify(value);
   }
 
   const type = out.type;
@@ -140,13 +145,58 @@ function strictify(node: unknown): unknown {
 }
 
 // `properties` is a map of name -> subschema; strictify each subschema but keep the map shape.
-function strictifyProperties(value: unknown): unknown {
+function strictifyProperties(value: unknown, required: Set<string>): unknown {
   if (!value || typeof value !== "object") return value;
   const out: Record<string, unknown> = {};
   for (const [name, subschema] of Object.entries(value as Record<string, unknown>)) {
-    out[name] = strictify(subschema);
+    const strict = strictify(subschema);
+    out[name] = required.has(name) ? strict : nullableSchema(strict);
   }
   return out;
+}
+
+function stringSet(value: unknown): Set<string> {
+  if (!Array.isArray(value)) return new Set();
+  return new Set(value.filter((item): item is string => typeof item === "string"));
+}
+
+function nullableSchema(schema: unknown): unknown {
+  if (allowsNull(schema)) return schema;
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return { anyOf: [schema, { type: "null" }] };
+  }
+
+  const out: Record<string, unknown> = { ...(schema as Record<string, unknown>) };
+  if (typeof out.type === "string") {
+    out.type = [out.type, "null"];
+    return out;
+  }
+  if (Array.isArray(out.type)) {
+    out.type = [...out.type, "null"];
+    return out;
+  }
+  if (Array.isArray(out.anyOf)) {
+    out.anyOf = [...out.anyOf, { type: "null" }];
+    return out;
+  }
+  if (Array.isArray(out.oneOf)) {
+    out.oneOf = [...out.oneOf, { type: "null" }];
+    return out;
+  }
+  return { anyOf: [out, { type: "null" }] };
+}
+
+function allowsNull(schema: unknown): boolean {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return false;
+  const node = schema as Record<string, unknown>;
+  if (node.type === "null") return true;
+  if (Array.isArray(node.type) && node.type.includes("null")) return true;
+  if (Array.isArray(node.enum) && node.enum.includes(null)) return true;
+  for (const key of ["anyOf", "oneOf"] as const) {
+    const branches = node[key];
+    if (Array.isArray(branches) && branches.some(allowsNull)) return true;
+  }
+  return false;
 }
 
 function buildPrompt(call: WorkflowAgentCall, baseInstructions: string | undefined, inWorktree: boolean): string {
@@ -156,11 +206,13 @@ function buildPrompt(call: WorkflowAgentCall, baseInstructions: string | undefin
     "Your final response is returned verbatim as this agent() call's result.",
     call.options.phase ? `Workflow phase: ${call.options.phase}` : undefined,
     call.options.label ? `Task label: ${call.options.label}` : undefined,
-    call.options.agentType ? `Act as workflow subagent type: ${call.options.agentType}` : undefined,
+    call.options.agentType
+      ? `Requested Claude-style agentType label: ${call.options.agentType}. Codex does not load Claude's built-in agent definitions; use this as role/task context only.`
+      : undefined,
     call.options.isolation && !inWorktree
       ? `Requested isolation: ${call.options.isolation} (not available here — work in the current directory)`
       : inWorktree
-        ? "You are running in an isolated git worktree; changes here do not affect the main checkout."
+        ? "You are running in an isolated git worktree; changes here do not affect the main checkout and are discarded when this agent finishes."
         : undefined,
     call.options.schema
       ? [

@@ -7,11 +7,12 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { CodexSdkAgentRunner, type CodexSdkAgentRunnerOptions } from "../runners/codex-sdk.js";
 import type { SandboxMode, ThreadOptions } from "@openai/codex-sdk";
-import { WorkflowController } from "../controller.js";
+import { defaultWorkflowDirs, WorkflowController } from "../controller.js";
 import { WorkflowInputError } from "../errors.js";
 import { parseWorkflowScript } from "../parser.js";
 import { FileRunStore, type RunRecord } from "../run-store.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner, WorkflowProgressEvent } from "../types.js";
+import { WorkflowRegistry, type WorkflowInput } from "../workflow-tool.js";
 import { ProgressRenderer, type ProgressMode } from "./progress.js";
 import { createWebServer } from "../web/server.js";
 import {
@@ -41,6 +42,7 @@ export interface RunFlags {
   reasoning?: string;
   reasoningEffort?: string;
   bun?: string;
+  "idle-timeout"?: string;
   json?: boolean;
   quiet?: boolean;
   "no-progress"?: boolean;
@@ -73,16 +75,22 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   const runner = buildAgentRunner(cwd, flags);
   const runStore = new FileRunStore(runsDir(dataDir));
 
-  const input = await buildRunInput(target, cwd, flags);
+  let input: WorkflowInput;
+  try {
+    input = await buildRunInput(target, cwd, flags);
+  } catch (error) {
+    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
   const runId = flags.resume ?? `wf_${randomId()}`;
   input.resumeFromRunId = runId;
 
   const startedAt = Date.now();
   const baseRecord: RunRecord = {
     runId,
-    name: path.basename(String(input.scriptPath ?? "inline")),
+    name: input.name ?? path.basename(String(input.scriptPath ?? "inline")),
     status: "running",
-    source: "scriptPath",
+    source: input.name ? "named" : input.scriptPath ? "scriptPath" : "inline",
     startedAt,
     ...(input.args !== undefined ? { args: input.args } : {}),
     ...(input.scriptPath ? { scriptPath: path.resolve(String(input.scriptPath)) } : {}),
@@ -114,13 +122,12 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
     cwd,
     runner,
     onProgress,
-    // Path-only CLI: no name discovery. `workflow()` nests by path/{scriptPath}, not by name.
-    workflowDirs: [],
     persistDir: runsDir(dataDir),
     journalDir: journalDir(dataDir),
     ...numericFlag("concurrency", flags.concurrency),
     ...numericFlag("maxAgents", flags["max-agents"]),
     ...numericFlag("tokenBudget", flags.budget),
+    ...numericFlag("workflowIdleTimeoutMs", flags["idle-timeout"]),
     ...(flags.bun ? { bunPath: flags.bun } : {}),
   });
 
@@ -190,6 +197,46 @@ export async function validateCommand(target: string | undefined, flags: { json?
     else process.stderr.write(`${red("✗")} invalid workflow: ${message}\n`);
     return 1;
   }
+}
+
+/** `codex-workflow list` */
+export async function listCommand(flags: { cwd?: string; json?: boolean }): Promise<number> {
+  const cwd = path.resolve(flags.cwd ?? process.cwd());
+  const dirs = defaultWorkflowDirs(cwd);
+  const registry = new WorkflowRegistry(dirs);
+  const workflows = await registry.list();
+
+  if (flags.json) {
+    process.stdout.write(
+      `${JSON.stringify(
+        workflows.map((workflow) => ({
+          name: workflow.name,
+          description: workflow.meta.description,
+          source: workflow.source,
+          path: workflow.path,
+          phases: workflow.meta.phases ?? [],
+        })),
+        null,
+        2,
+      )}\n`,
+    );
+    return 0;
+  }
+
+  if (workflows.length === 0) {
+    process.stdout.write(`No workflows found in ${dirs.map((entry) => entry.dir).join(", ")}.\n`);
+    return 0;
+  }
+
+  for (const workflow of workflows) {
+    const source = workflow.path ? `${workflow.source}:${workflow.path}` : workflow.source;
+    process.stdout.write(`${bold(workflow.name)}  ${dim(source)}\n`);
+    process.stdout.write(`  ${workflow.meta.description}\n`);
+    if (workflow.meta.phases?.length) {
+      process.stdout.write(`  phases: ${workflow.meta.phases.map((phase) => phase.title).join(" → ")}\n`);
+    }
+  }
+  return 0;
 }
 
 /** `codex-workflow runs` */
@@ -342,14 +389,16 @@ async function buildRunInput(
   target: string,
   cwd: string,
   flags: RunFlags,
-): Promise<{ scriptPath?: string; args?: unknown; resumeFromRunId?: string }> {
+): Promise<WorkflowInput> {
   const args = await parseArgsValue(flags.args, cwd);
-  // Path-only: `run` takes a path to a workflow file (absolute or relative). No name lookup.
   const asPath = path.resolve(cwd, target);
   if (await isFile(asPath)) {
     return { scriptPath: asPath, ...(args !== undefined ? { args } : {}) };
   }
-  throw new WorkflowInputError(`workflow file not found: ${target} — run takes a path to a .js/.ts/.mjs workflow file`);
+  if (looksLikeWorkflowPath(target)) {
+    throw new WorkflowInputError(`workflow file not found: ${target}`);
+  }
+  return { name: target, ...(args !== undefined ? { args } : {}) };
 }
 
 async function parseArgsValue(raw: string | undefined, cwd: string): Promise<unknown> {
@@ -390,6 +439,10 @@ function numericFlag<K extends string>(key: K, raw: string | undefined): Partial
   const value = Number(raw);
   if (!Number.isFinite(value)) throw new WorkflowInputError(`${key} must be a number, got "${raw}"`);
   return { [key]: value } as Record<K, number>;
+}
+
+function looksLikeWorkflowPath(target: string): boolean {
+  return target.includes("/") || target.includes("\\") || /\.(m?[jt]s)$/.test(target);
 }
 
 function assertOneOf(value: string, allowed: string[], flag: string): string {

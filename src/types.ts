@@ -109,6 +109,11 @@ export interface WorkflowRunOptions {
   onProgress?: (event: WorkflowProgressEvent) => void;
   journal?: WorkflowJournal;
   bunPath?: string;
+  /**
+   * Maximum time the Bun workflow child may sit idle while not waiting on parent-run agent/workflow
+   * requests. Set to null or <= 0 to disable. Defaults to 5 minutes.
+   */
+  workflowIdleTimeoutMs?: number | null;
   /** Resolves nested `workflow(nameOrRef)` calls. Without it, `workflow()` throws at runtime. */
   resolveWorkflow?: WorkflowResolver;
 }

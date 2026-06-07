@@ -117,5 +117,6 @@ function controllerRunOptions(options: WorkflowControllerOptions): WorkflowContr
   if (options.signal !== undefined) runOptions.signal = options.signal;
   if (options.onProgress !== undefined) runOptions.onProgress = options.onProgress;
   if (options.bunPath !== undefined) runOptions.bunPath = options.bunPath;
+  if (options.workflowIdleTimeoutMs !== undefined) runOptions.workflowIdleTimeoutMs = options.workflowIdleTimeoutMs;
   return runOptions;
 }

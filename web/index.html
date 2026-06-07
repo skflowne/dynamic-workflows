@@ -9,7 +9,15 @@
   </head>
   <body>
     <div id="app">
-      <aside class="sidebar">
+      <header class="mobile-topbar">
+        <button class="mobile-menu" id="mobile-menu" aria-label="Open run history" aria-controls="sidebar" aria-expanded="false">☰</button>
+        <div class="mobile-brand">Codex Workflow</div>
+        <div class="live-dot mobile-live" title="live stream">
+          <span class="dot"></span><span class="live-label">live</span>
+        </div>
+      </header>
+
+      <aside class="sidebar" id="sidebar">
         <header class="sidebar-head">
           <div class="brand">
             <span class="brand-mark" aria-hidden="true">✻</span>
@@ -33,12 +41,13 @@
         <div class="empty-state" id="empty-state">
           <div class="empty-mark">✻</div>
           <h1>Select a run</h1>
-          <p>Pick a workflow run from the left to see its full overview, every step's progress, and the complete Codex session behind each agent.</p>
+          <p>Run details, agent progress, logs, and linked Codex sessions appear here.</p>
         </div>
         <section class="run-view" id="run-view" hidden></section>
       </main>
     </div>
 
+    <div class="sidebar-scrim" id="sidebar-scrim" hidden></div>
     <div class="drawer-scrim" id="drawer-scrim" hidden></div>
     <aside class="drawer" id="drawer" hidden aria-label="Agent detail"></aside>
 

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
   doctorCommand,
+  listCommand,
   runCommand,
   runsCommand,
   serveCommand,
@@ -23,6 +24,7 @@ const OPTIONS = {
   approval: { type: "string" },
   reasoning: { type: "string" },
   bun: { type: "string" },
+  "idle-timeout": { type: "string" },
   json: { type: "boolean" },
   quiet: { type: "boolean" },
   "no-progress": { type: "boolean" },
@@ -38,7 +40,8 @@ const OPTIONS = {
 const HELP = `codex-workflow — run Claude-compatible dynamic workflows, backed by Codex.
 
 Usage:
-  codex-workflow run <file> [options]        Run a workflow file (foreground, live progress)
+  codex-workflow run <file|name> [options]   Run a workflow file or registered name
+  codex-workflow list [--json]               List workflows from .claude/workflows and ~/.claude/workflows
   codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
   codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
   codex-workflow runs [--json]               List recorded run history
@@ -57,6 +60,7 @@ Run options:
   --approval <policy>        never | on-request | on-failure | untrusted
   --reasoning <effort>       minimal | low | medium | high | xhigh
   --bun <path>               Path to the Bun binary
+  --idle-timeout <ms>         Bun child idle watchdog in ms (0 disables; default 300000)
   --json                     Emit machine-readable JSON (suppresses progress & viewer)
   --quiet                    Suppress progress output
   --no-progress              Plain (non-TTY) progress lines
@@ -73,6 +77,7 @@ Viewer options (run / serve):
 Workflows are open TS/JS executed under Bun; each agent() spawns a Codex thread.
 Web search + network access are always enabled for agents.
 Pass run a path to a workflow file (e.g. examples/deep-research.js).
+Bare names resolve from .claude/workflows and ~/.claude/workflows.
 `;
 
 async function main(): Promise<number> {
@@ -102,6 +107,8 @@ async function main(): Promise<number> {
   switch (command) {
     case "run":
       return runCommand(target, flags);
+    case "list":
+      return listCommand(flags);
     case "serve":
       return serveCommand(flags);
     case "validate":

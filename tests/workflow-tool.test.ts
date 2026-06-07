@@ -58,8 +58,8 @@ test("runWorkflowTool resolves scriptPath and uses resumeFromRunId as run id", a
     const runner = new ScriptedAgentRunner((call) => `run:${call.runId}:${call.prompt}`);
 
     const output = await runWorkflowTool(
-      { scriptPath: file, args: { name: "path" }, resumeFromRunId: "wf_resume-test" },
-      { runner },
+      { scriptPath: "tool_demo.js", args: { name: "path" }, resumeFromRunId: "wf_resume-test" },
+      { runner, cwd: dir },
     );
 
     assert.equal(output.source, "scriptPath");

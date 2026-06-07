@@ -115,7 +115,7 @@ export async function runWorkflowTool<T = unknown>(
   input: WorkflowInput,
   options: WorkflowToolOptions,
 ): Promise<WorkflowOutput<T>> {
-  const resolved = await resolveWorkflowInput(input, options.registry);
+  const resolved = await resolveWorkflowInput(input, options.registry, options.cwd);
   const runId = input.resumeFromRunId ?? `wf_${randomUUID().slice(0, 12)}`;
   const persistedScriptPath = await persistWorkflowScript(resolved.script, runId, options.persistDir, resolved.scriptPath);
   const result = await runWorkflow<T>(resolved.script, {
@@ -123,7 +123,7 @@ export async function runWorkflowTool<T = unknown>(
     args: input.args,
     runId,
     runner: options.runner,
-    resolveWorkflow: options.resolveWorkflow ?? buildWorkflowResolver(options.registry),
+    resolveWorkflow: options.resolveWorkflow ?? buildWorkflowResolver(options.registry, options.cwd),
   });
 
   return workflowOutput(result, resolved.source, persistedScriptPath);
@@ -131,10 +131,11 @@ export async function runWorkflowTool<T = unknown>(
 
 /**
  * Builds the resolver used by the in-script `workflow()` primitive: `{ scriptPath }` reads the file;
- * a **path-like string** (contains a separator or ends in `.js`/`.ts`/`.mjs`) is loaded as a file;
- * any other bare string is looked up by name in the registry (when one is provided).
+ * a **path-like string** (contains a separator or ends in `.js`/`.ts`/`.mjs`) is loaded as a file
+ * relative to `cwd`; any other bare string is looked up by name in the registry (when one is
+ * provided).
  */
-export function buildWorkflowResolver(registry: WorkflowRegistry | undefined): WorkflowResolver {
+export function buildWorkflowResolver(registry: WorkflowRegistry | undefined, cwd: string = process.cwd()): WorkflowResolver {
   return async (ref: WorkflowRef) => {
     const scriptPath =
       typeof ref === "object" && ref && "scriptPath" in ref
@@ -143,7 +144,7 @@ export function buildWorkflowResolver(registry: WorkflowRegistry | undefined): W
           ? ref
           : undefined;
     if (scriptPath !== undefined) {
-      const resolvedPath = path.resolve(scriptPath);
+      const resolvedPath = path.resolve(cwd, scriptPath);
       const script = await readWorkflowFile(resolvedPath);
       return { script, name: parseWorkflowScript(script).meta.name };
     }
@@ -161,9 +162,10 @@ function looksLikePath(ref: string): boolean {
 export async function resolveWorkflowInput(
   input: WorkflowInput,
   registry: WorkflowRegistry | undefined,
+  cwd: string = process.cwd(),
 ): Promise<{ script: string; source: WorkflowSourceKind; scriptPath?: string }> {
   if (input.scriptPath) {
-    const resolvedPath = path.resolve(input.scriptPath);
+    const resolvedPath = path.resolve(cwd, input.scriptPath);
     if (input.script !== undefined) return { script: input.script, source: "scriptPath", scriptPath: resolvedPath };
     return {
       script: await readWorkflowFile(resolvedPath),
@@ -245,7 +247,7 @@ export async function scanWorkflowsDir(
 
   const workflows: RegisteredWorkflow[] = [];
   for (const entry of entries) {
-    if (!entry.endsWith(".js") && !entry.endsWith(".mjs")) continue;
+    if (!/\.(m?[jt]s)$/.test(entry)) continue;
     const candidatePath = path.join(dir, entry);
     try {
       const script = await readFile(candidatePath, "utf8");

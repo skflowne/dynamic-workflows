@@ -24,6 +24,7 @@ npx tsx --test tests/nested-workflow.test.ts
 
 # CLI smoke (token-free fake runner — see env flags below):
 CODEX_WORKFLOW_FAKE_AGENT=1 node dist/cli.js run examples/hello.js --args '{"name":"Ada"}'
+node dist/cli.js list            # lists .claude/workflows and ~/.claude/workflows
 node dist/cli.js doctor          # checks Bun, Codex CLI, ~/.codex/auth.json, workflow dirs, viewer
 node dist/cli.js serve --port 4173   # local web viewer (overview + per-step + full Codex session)
 ```
@@ -50,6 +51,9 @@ Parent ↔ child talk over **JSONL on stdio**, every line prefixed `__CODEX_WORK
   with `{kind:"response", value, spent}`); **events**: `phase`/`log`; terminal `result`/`error`.
 - The child resolves an agent's `phase` locally (from `phase()` calls) and sends it in the request,
   so the parent holds no global "current phase" — this keeps concurrent/nested phases race-free.
+- The Bun child has an idle watchdog (`workflowIdleTimeoutMs`, default 300000ms). It is armed only
+  when the child is not waiting on a parent-handled `agent()`/`workflow()` request, so long Codex
+  agents are not killed just because the workflow script is awaiting them.
 
 ### Shared RunContext + `workflow()` nesting
 `createRunContext()` builds one context per top-level run holding the concurrency limiter, agent
@@ -80,16 +84,17 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   `--resume`. Files at `~/.codex-workflow/journal/<runId>/<hash>.json` (prompt + options + result + sessionId).
 - `src/run-store.ts` — run history at `~/.codex-workflow/runs/<runId>.json` (incl. `args`/`result`) → powers `runs`/`show`.
 - `src/workflow-tool.ts` — Claude-compatible `{script|name|scriptPath|resumeFromRunId}` input shape,
-  `WorkflowRegistry` (dir discovery — **library/opt-in only; the CLI doesn't use it**), and
+  `WorkflowRegistry` (dir discovery for `.js`/`.mjs`/`.ts`/`.mts` workflows), and
   `buildWorkflowResolver` (resolves `workflow()` refs: `{scriptPath}` or a path-like string → file;
-  a bare name → registry, when one is provided).
-- `src/controller.ts` — facade wiring runner + registry + journal + task manager. The CLI passes
-  `workflowDirs: []` (no discovery); the library default still scans `.claude/workflows`,
-  `~/.claude/workflows` via `defaultWorkflowDirs` for embedders who want name lookup.
+  a bare name → registry, when one is provided). File refs resolve relative to the run `cwd`.
+- `src/controller.ts` — facade wiring runner + registry + journal + task manager. Defaults scan
+  `.claude/workflows` and `~/.claude/workflows` via `defaultWorkflowDirs`.
 - `src/task-manager.ts` — async launch/wait/cancel (library-level; the CLI runs foreground).
-- `src/cli.ts` + `src/cli/` — `parseArgs`-based CLI (`run`/`serve`/`validate`/`runs`/`show`/`doctor`),
+- `src/cli.ts` + `src/cli/` — `parseArgs`-based CLI
+  (`run`/`list`/`serve`/`validate`/`runs`/`show`/`doctor`),
   `progress.ts` (TTY status-line renderer), `commands.ts` (command impls + runner factory).
-  **`run` is path-only** — it takes a workflow file path, not a name; there is no `list` command.
+  `run` accepts a workflow file path or a bare registered name; path-like missing targets report file
+  not found rather than falling through to name lookup.
 - `src/web/` + `web/` — **local web viewer** (zero-dep Node `http`, vanilla SPA, claude.ai-styled).
   `server.ts` serves a JSON API (`/api/runs`, `/api/runs/:id` → run-aggregator view, `…/agents/:key`
   → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`)
@@ -111,12 +116,15 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
 - **Codex requires strict JSON Schema.** OpenAI structured output rejects schemas without
   `additionalProperties:false` + all keys in `required` on every object. The runner sends a
   strictified copy (`toStrictJsonSchema`), but the runtime validates results against the **original
-  (loose)** schema. When touching schema handling, keep these two separate.
+  (loose)** schema. Optional fields are made nullable in the strict copy and stripped back out before
+  loose-schema validation. When touching schema handling, keep these two separate.
+- **`agentType` is prompt context only.** Claude's built-in agent definitions/tool bundles are not
+  loaded; full equivalence would require a separate agent registry surface.
 - **Web search + network are always enabled** for agents (no flag to disable — set by design in
   `buildAgentRunner`).
-- **Model resolution:** `agent({model})` > runner/`--model` > Codex's own default (e.g. `~/.codex/config.toml`).
-  We only set `threadOptions.model` when explicitly given. `meta.phases[].model` is parsed but **not**
-  auto-applied to that phase's agents (known gap).
+- **Model resolution:** `agent({model})` > current `meta.phases[].model` > runner/`--model` >
+  Codex's own default (e.g. `~/.codex/config.toml`). We only set `threadOptions.model` when one of
+  those workflow/runner layers explicitly provides it.
 - **Build layout:** `tsconfig.json` uses `rootDir: "src"` so output is `dist/index.js` / `dist/cli.js`
   (the `bin`). Tests are excluded from emit and typechecked separately via `tsconfig.test.json`.
 - **Observability layers** when debugging a run: the **web viewer** (`serve`, or auto-started by `run`)

@@ -9,7 +9,9 @@ const state = {
   selectedRunId: null,
   runData: null,
   drawerKey: null,
-  expandedPhase: null,
+  expandedPhase: null, // phase title, not index; live updates can insert/reorder phase groups
+  agentFilter: "",
+  lastFocus: null,
   liveAgents: new Map(), // key -> {key, label, phase, state} for in-flight/just-finished agents
   liveLogs: [], // log lines seen via SSE (record.logs is only persisted at completion)
   refetchTimer: null,
@@ -84,8 +86,10 @@ function renderRunList() {
 async function selectRun(runId, push = true) {
   state.selectedRunId = runId;
   state.expandedPhase = null;
+  state.agentFilter = "";
   state.liveAgents.clear();
   state.liveLogs = [];
+  closeSidebar();
   renderRunList();
   if (push && location.pathname !== `/runs/${runId}`) history.pushState({ runId }, "", `/runs/${runId}`);
   el("empty-state").hidden = true;
@@ -114,11 +118,15 @@ function seedLiveFromBuffer(buffer) {
   }
 }
 
-function renderRunView(data) {
+function renderRunView(data, options = {}) {
   const { record, view } = data;
+  const restorePhase = options.preserveExpanded ? state.expandedPhase : null;
   state.expandedPhase = null;
   const desc = record.description ? `<p class="rv-desc">${escapeHtml(record.description)}</p>` : "";
   const stats = view.stats;
+  const phases = mergedPhases();
+  const visibleAgentCount = phases.reduce((sum, phase) => sum + phase.agents.length, 0);
+  const duration = stats.durationMs ?? (record.status === "running" && record.startedAt ? Date.now() - record.startedAt : undefined);
   const root = el("run-view");
   root.innerHTML = `
     <div class="rv-head">
@@ -128,22 +136,41 @@ function renderRunView(data) {
         <span class="pill ${record.status}"><span class="status-dot ${record.status}"></span>${record.status}</span>
       </div>
       ${desc}
-      <div class="rv-runid">${escapeHtml(record.runId)}${record.scriptPath ? " · " + escapeHtml(record.scriptPath) : ""}</div>
+      ${renderRunMeta(record)}
     </div>
 
     <div class="rv-stats">
-      <div class="stat"><div class="stat-val">${fmtNum(stats.agentCount)}</div><div class="stat-label">Agents</div></div>
-      <div class="stat"><div class="stat-val">${fmtDuration(stats.durationMs)}</div><div class="stat-label">Duration</div></div>
-      <div class="stat"><div class="stat-val">${view.phases.length}</div><div class="stat-label">Phases</div></div>
+      <div class="stat"><div class="stat-val">${fmtNum(Math.max(stats.agentCount ?? 0, visibleAgentCount))}</div><div class="stat-label">Agents</div></div>
+      <div class="stat"><div class="stat-val">${fmtDuration(duration)}</div><div class="stat-label">Duration</div></div>
+      <div class="stat"><div class="stat-val">${phases.length}</div><div class="stat-label">Phases</div></div>
       ${stats.cacheHits ? `<div class="stat"><div class="stat-val">${fmtNum(stats.cacheHits)}</div><div class="stat-label">Cache hits</div></div>` : ""}
     </div>
 
     ${renderInputSection(record)}
-    <div id="flow-section">${renderFlowSection(mergedPhases())}</div>
+    <div id="flow-section">${renderFlowSection(phases)}</div>
     ${renderLogs(record)}
     ${renderResultSection(record)}
   `;
-  el("live-dot").classList.toggle("active", record.status === "running");
+  setLiveActive(record.status === "running");
+  if (restorePhase && phases.some((phase) => phase.title === restorePhase)) {
+    requestAnimationFrame(() => expandPhase(restorePhase));
+  }
+}
+
+function renderRunMeta(record) {
+  const chips = [
+    `<button class="meta-chip" data-copy="${escapeHtml(record.runId)}" title="Copy run id"><span class="meta-label">run</span><span class="meta-value">${escapeHtml(record.runId)}</span></button>`,
+  ];
+  if (record.scriptPath) {
+    chips.push(
+      `<button class="meta-chip" data-copy="${escapeHtml(record.scriptPath)}" title="Copy script path"><span class="meta-label">script</span><span class="meta-value">${escapeHtml(record.scriptPath)}</span></button>`,
+    );
+  }
+  return `<div class="rv-meta-row">${chips.join("")}</div>`;
+}
+
+function setLiveActive(active) {
+  document.querySelectorAll(".live-dot").forEach((node) => node.classList.toggle("active", active));
 }
 
 // During a run, record.logs is empty (only persisted at completion) — fall back to the live log
@@ -163,7 +190,7 @@ function renderLogs(record) {
 
 function renderInputSection(record) {
   if (record.args === undefined || record.args === null) return "";
-  return `<div class="section-label">Input <span class="hint">— arguments passed to the workflow</span></div>
+  return `<div class="section-label">Input</div>
     <div class="result-card">${renderResultValue(record.args, 0)}</div>`;
 }
 
@@ -177,7 +204,7 @@ function renderResultSection(record) {
     return `<div class="section-label">Result</div>
       <div class="result-card"><div class="muted-note">No final result was recorded for this run.</div></div>`;
   }
-  return `<div class="section-label">Result <span class="hint">— the workflow's final output</span></div>
+  return `<div class="section-label">Result</div>
     <div class="result-card">${renderResultValue(r, 0)}
       <details class="result-raw"><summary>Raw JSON</summary><div class="json-block">${highlightJson(r)}</div></details>
     </div>`;
@@ -193,6 +220,7 @@ function renderResultValue(v, depth) {
     if (v.every((x) => x === null || typeof x !== "object")) {
       return `<ul class="result-list">${v.map((x) => `<li>${escapeHtml(String(x))}</li>`).join("")}</ul>`;
     }
+    if (canRenderObjectTable(v)) return renderObjectTable(v);
     return `<div class="result-items">${v.map((x) => `<div class="result-subcard">${renderResultValue(x, depth + 1)}</div>`).join("")}</div>`;
   }
   // plain object → labeled fields. Adaptive: runs of short scalar fields tile into a multi-column
@@ -233,6 +261,32 @@ function isCompact(v) {
 
 function formatScalar(v) {
   return v === null || v === undefined ? "—" : String(v);
+}
+
+function canRenderObjectTable(items) {
+  if (!items.length || items.length > 200) return false;
+  const keys = new Set();
+  for (const item of items) {
+    if (!isPlainObject(item)) return false;
+    for (const [key, value] of Object.entries(item)) {
+      keys.add(key);
+      if (keys.size > 8 || !isCompact(value)) return false;
+    }
+  }
+  return keys.size > 0;
+}
+
+function renderObjectTable(items) {
+  const keys = [...new Set(items.flatMap((item) => Object.keys(item)))];
+  const head = keys.map((key) => `<th>${escapeHtml(humanizeKey(key))}</th>`).join("");
+  const rows = items
+    .map((item) => `<tr>${keys.map((key) => `<td>${escapeHtml(formatScalar(item[key]))}</td>`).join("")}</tr>`)
+    .join("");
+  return `<div class="result-table-wrap"><table class="result-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 // camelCase / snake_case key → spaced label, e.g. "sourcesFetched" -> "sources Fetched".
@@ -285,7 +339,8 @@ function renderFlowSection(phases) {
       const total = p.agents.length;
       const done = p.agents.filter((a) => a.status !== "running").length;
       const badge = done < total ? `${done}/${total}` : `${total}`;
-      const node = `<button class="flow-phase${done < total ? " in-progress" : ""}" data-phase-idx="${i}">
+      const active = p.title === state.expandedPhase ? " active" : "";
+      const node = `<button class="flow-phase${done < total ? " in-progress" : ""}${active}" data-phase-title="${escapeHtml(p.title)}" aria-expanded="${active ? "true" : "false"}">
         <span class="fp-dot"></span>
         <span class="fp-name">${escapeHtml(p.title)}</span>
         <span class="fp-count">${badge}</span>
@@ -294,7 +349,7 @@ function renderFlowSection(phases) {
       return i < phases.length - 1 ? node + `<span class="flow-link"></span>` : node;
     })
     .join("");
-  return `<div class="section-label">Pipeline <span class="hint">— click a phase to expand its agents</span></div>
+  return `<div class="section-label">Pipeline</div>
     <div class="flow" id="flow">
       <div class="flow-rail">${rail}</div>
       <div class="flow-expansion" id="flow-expansion" hidden></div>
@@ -302,7 +357,13 @@ function renderFlowSection(phases) {
 }
 
 function renderFan(p) {
-  const nodes = p.agents
+  const query = state.agentFilter.trim().toLowerCase();
+  const filtered = query
+    ? p.agents.filter((a) => `${a.label} ${a.resultPreview || ""}`.toLowerCase().includes(query))
+    : p.agents;
+  const visible = filtered.slice(0, 180);
+  const compact = p.agents.length > 48 ? " compact" : "";
+  const nodes = visible
     .map(
       (a, i) => `<button class="flow-node ${a.status}${a.live ? " pending" : ""}" ${a.live ? "" : `data-key="${escapeHtml(a.key)}"`} title="${escapeHtml(a.resultPreview || a.label)}" style="animation-delay:${Math.min(i * 12, 300)}ms">
         <span class="fn-dot ${a.status}"></span>
@@ -316,38 +377,52 @@ function renderFan(p) {
       <span class="fh-name">${escapeHtml(p.title)}</span>
       <span class="fh-count">${p.agents.length} agent${p.agents.length === 1 ? "" : "s"}</span>
     </div>
-    <div class="fan-grid">${nodes}</div>`;
+    <div class="fan-main">
+      <div class="fan-toolbar">
+        <input class="agent-filter" type="search" value="${escapeHtml(state.agentFilter)}" placeholder="Filter agents" autocomplete="off" />
+        <span class="fan-summary">${fmtNum(filtered.length)} shown${filtered.length !== p.agents.length ? ` / ${fmtNum(p.agents.length)}` : ""}</span>
+      </div>
+      <div class="fan-grid${compact}">${nodes || '<div class="muted-note">No matching agents.</div>'}</div>
+      ${filtered.length > visible.length ? `<div class="fan-note">Showing first ${visible.length}; refine the filter to narrow this phase.</div>` : ""}
+    </div>`;
 }
 
-function togglePhase(idx) {
-  if (state.expandedPhase === idx) {
+function togglePhase(title) {
+  if (state.expandedPhase === title) {
     state.expandedPhase = null;
+    state.agentFilter = "";
     const exp = el("flow-expansion");
     exp.hidden = true;
     exp.innerHTML = "";
     document.querySelectorAll(".flow-phase").forEach((b) => b.classList.remove("active"));
     return;
   }
-  expandPhase(idx);
+  state.agentFilter = "";
+  expandPhase(title);
 }
 
-function expandPhase(idx) {
+function expandPhase(title) {
   const phases = mergedPhases();
-  if (!phases || !phases[idx]) return;
-  state.expandedPhase = idx;
-  document.querySelectorAll(".flow-phase").forEach((b, i) => b.classList.toggle("active", i === idx));
+  const phase = phases.find((p) => p.title === title);
+  if (!phase) return;
+  state.expandedPhase = title;
+  document.querySelectorAll(".flow-phase").forEach((b) => {
+    const active = b.dataset.phaseTitle === title;
+    b.classList.toggle("active", active);
+    b.setAttribute("aria-expanded", active ? "true" : "false");
+  });
   const exp = el("flow-expansion");
-  exp.innerHTML = renderFan(phases[idx]);
+  exp.innerHTML = renderFan(phase);
   exp.hidden = false;
-  positionPointer(idx);
+  positionPointer(title);
   // Synchronous draw (getBoundingClientRect forces layout); a deferred pass catches font/wrap reflow.
   drawFan();
   requestAnimationFrame(drawFan);
 }
 
 // Aligns the expansion panel's pointer triangle under the active phase node.
-function positionPointer(idx) {
-  const btn = document.querySelectorAll(".flow-phase")[idx];
+function positionPointer(title) {
+  const btn = [...document.querySelectorAll(".flow-phase")].find((node) => node.dataset.phaseTitle === title);
   const flow = el("flow");
   const exp = el("flow-expansion");
   if (!btn || !flow || !exp) return;
@@ -363,6 +438,10 @@ function drawFan() {
   const svg = exp.querySelector(".fan-svg");
   const hub = exp.querySelector(".fan-hub");
   if (!svg || !hub) return;
+  if (exp.querySelectorAll(".flow-node").length > 80 || matchMedia("(max-width: 720px)").matches) {
+    svg.innerHTML = "";
+    return;
+  }
   const base = exp.getBoundingClientRect();
   svg.setAttribute("width", String(base.width));
   svg.setAttribute("height", String(base.height));
@@ -389,13 +468,14 @@ function refreshFlow() {
   const phases = mergedPhases();
   section.innerHTML = renderFlowSection(phases);
   state.expandedPhase = null;
-  if (open != null && phases[open]) expandPhase(open);
+  if (open != null && phases.some((phase) => phase.title === open)) expandPhase(open);
 }
 
 /* ----------------------------- Drawer (agent detail) ----------------------------- */
 
 async function openDrawer(key) {
   state.drawerKey = key;
+  state.lastFocus = document.activeElement;
   const drawer = el("drawer");
   const scrim = el("drawer-scrim");
   scrim.hidden = false;
@@ -432,6 +512,7 @@ async function openDrawer(key) {
       <div class="panel" data-panel="session"><div class="loading" id="session-loading">Linking Codex session</div></div>
     </div>
   `;
+  requestAnimationFrame(() => el("drawer-close")?.focus());
 }
 
 function renderResult(result) {
@@ -503,6 +584,21 @@ function closeDrawer() {
   el("drawer").hidden = true;
   el("drawer-scrim").hidden = true;
   state.drawerKey = null;
+  if (state.lastFocus && typeof state.lastFocus.focus === "function") state.lastFocus.focus();
+  state.lastFocus = null;
+}
+
+function openSidebar() {
+  el("sidebar").classList.add("open");
+  el("sidebar-scrim").hidden = false;
+  el("mobile-menu")?.setAttribute("aria-expanded", "true");
+}
+
+function closeSidebar() {
+  el("sidebar")?.classList.remove("open");
+  const scrim = el("sidebar-scrim");
+  if (scrim) scrim.hidden = true;
+  el("mobile-menu")?.setAttribute("aria-expanded", "false");
 }
 
 /* ----------------------------- JSON highlight ----------------------------- */
@@ -594,8 +690,8 @@ function scheduleRefetch() {
     try {
       const data = await fetchJSON(`/api/runs/${encodeURIComponent(state.selectedRunId)}`);
       state.runData = data;
-      // Re-render the pipeline flow (completed + running agents) without disturbing an open drawer.
-      refreshFlow();
+      // Re-render the whole run view so status, elapsed duration, stats, logs, result, and flow stay fresh.
+      renderRunView(data, { preserveExpanded: true });
     } catch {
       /* ignore transient errors during a live run */
     }
@@ -605,6 +701,14 @@ function scheduleRefetch() {
 /* ----------------------------- Events / routing ----------------------------- */
 
 document.addEventListener("click", (e) => {
+  const menu = e.target.closest("#mobile-menu");
+  if (menu) return openSidebar();
+
+  if (e.target.id === "sidebar-scrim") return closeSidebar();
+
+  const copy = e.target.closest("[data-copy]");
+  if (copy) return copyText(copy);
+
   const runBtn = e.target.closest(".run-item");
   if (runBtn) return selectRun(runBtn.dataset.run);
 
@@ -612,7 +716,7 @@ document.addEventListener("click", (e) => {
   if (node) return node.dataset.key ? openDrawer(node.dataset.key) : undefined; // live nodes have no detail yet
 
   const phase = e.target.closest(".flow-phase");
-  if (phase) return togglePhase(Number(phase.dataset.phaseIdx));
+  if (phase) return togglePhase(phase.dataset.phaseTitle);
 
   if (e.target.closest("#drawer-close") || e.target.id === "drawer-scrim") return closeDrawer();
 
@@ -625,7 +729,30 @@ document.addEventListener("click", (e) => {
 });
 
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !el("drawer").hidden) closeDrawer();
+  if (e.key === "Escape") {
+    if (!el("drawer").hidden) return closeDrawer();
+    if (el("sidebar").classList.contains("open")) return closeSidebar();
+  }
+  if (e.key === "Tab" && !el("drawer").hidden) trapDrawerFocus(e);
+});
+
+document.addEventListener("input", (e) => {
+  const filter = e.target.closest(".agent-filter");
+  if (!filter) return;
+  state.agentFilter = filter.value;
+  if (state.expandedPhase) {
+    const title = state.expandedPhase;
+    const phases = mergedPhases();
+    const phase = phases.find((p) => p.title === title);
+    const exp = el("flow-expansion");
+    if (phase && exp && !exp.hidden) {
+      exp.innerHTML = renderFan(phase);
+      const next = exp.querySelector(".agent-filter");
+      next?.focus();
+      next?.setSelectionRange(next.value.length, next.value.length);
+      drawFan();
+    }
+  }
 });
 
 el("run-search").addEventListener("input", (e) => {
@@ -647,6 +774,34 @@ window.addEventListener("resize", () => {
     drawFan();
   });
 });
+
+async function copyText(button) {
+  const text = button.dataset.copy || "";
+  try {
+    await navigator.clipboard.writeText(text);
+    button.classList.add("copied");
+    setTimeout(() => button.classList.remove("copied"), 900);
+  } catch {
+    // Clipboard access can be unavailable on some local browser contexts; keep the UI unchanged.
+  }
+}
+
+function trapDrawerFocus(event) {
+  const drawer = el("drawer");
+  const focusable = [...drawer.querySelectorAll('button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])')].filter(
+    (node) => !node.disabled && node.offsetParent !== null,
+  );
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
 
 /* ----------------------------- Boot ----------------------------- */
 

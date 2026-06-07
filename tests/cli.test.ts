@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,6 +76,35 @@ test("CLI validate / run --json / runs / show end-to-end (no tokens)", async () 
     const show = await runCli(["show", output.runId, "--cwd", dir], dir);
     assert.equal(show.code, 0, show.stderr);
     assert.match(show.stdout, /status: completed/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI list discovers project workflows by name, including TypeScript files", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-list-"));
+  try {
+    const workflowDir = path.join(dir, ".claude", "workflows");
+    await mkdir(workflowDir, { recursive: true });
+    await writeFile(
+      path.join(workflowDir, "named_demo.ts"),
+      `export const meta = {
+  name: 'named_demo',
+  description: 'Named workflow',
+  phases: [{ title: 'Named' }],
+} as const
+return 'listed'
+`,
+      "utf8",
+    );
+
+    const listed = await runCli(["list", "--json", "--cwd", dir], dir);
+    assert.equal(listed.code, 0, listed.stderr);
+    const workflows = JSON.parse(listed.stdout) as Array<{ name: string; source: string; path: string }>;
+    const found = workflows.find((workflow) => workflow.name === "named_demo");
+    assert.ok(found);
+    assert.equal(found.source, "project");
+    assert.equal(found.path, path.join(workflowDir, "named_demo.ts"));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
