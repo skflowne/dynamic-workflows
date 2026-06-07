@@ -58,6 +58,29 @@ test("buildRunView groups agents by phase in declared order, then appends extras
   assert.equal(scope.hasSchema, true);
 });
 
+test("buildRunView orders by declaredPhases and pre-renders empty declared phases", () => {
+  // The script only called phase() for Scope/Verify/Synthesize; Search & Fetch were set via agent
+  // `phase:` options, so record.phases is misordered. declaredPhases (meta.phases) is authoritative.
+  const record: RunRecord = {
+    ...RECORD,
+    declaredPhases: ["Scope", "Search", "Fetch", "Verify", "Synthesize"],
+    phases: ["Scope", "Verify", "Synthesize"],
+  };
+  const entries = [
+    entry({ key: "scope", createdAt: 1, options: { label: "scope", phase: "Scope" } }),
+    entry({ key: "search", createdAt: 2, options: { label: "search", phase: "Search" } }),
+    entry({ key: "fetch", createdAt: 3, options: { label: "fetch", phase: "Fetch" } }),
+    entry({ key: "verify", createdAt: 4, options: { label: "v0", phase: "Verify" } }),
+    // Synthesize intentionally has no agent yet — declared-but-empty must still render (pending).
+  ];
+
+  const view = buildRunView(record, entries);
+
+  assert.deepEqual(view.phases.map((p) => p.title), ["Scope", "Search", "Fetch", "Verify", "Synthesize"]);
+  assert.equal(view.phases.find((p) => p.title === "Synthesize")?.agents.length, 0);
+  assert.equal(view.stats.phaseCounts.Synthesize, 0);
+});
+
 test("buildRunView derives killed status and result previews", () => {
   const entries = [
     entry({ key: "k", options: { label: "killer", phase: "Verify" }, result: { refuted: true, evidence: "contradicted" } }),

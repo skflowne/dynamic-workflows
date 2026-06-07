@@ -18,6 +18,8 @@ export interface RunRecord {
   cacheHits?: number;
   /** Count of agents that failed after exhausting retries. */
   failureCount?: number;
+  /** Declared pipeline (meta.phases titles, in order) — the canonical phase order for the viewer. */
+  declaredPhases?: string[];
   phases?: string[];
   logs?: string[];
   error?: string;

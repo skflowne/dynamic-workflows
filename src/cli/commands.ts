@@ -77,6 +77,10 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   const runId = flags.resume ?? `wf_${randomId()}`;
   input.resumeFromRunId = runId;
 
+  // Surface the declared pipeline (meta.phases, in order) so the viewer can order and pre-render the
+  // phases before any agent runs — independent of which phases the script actually enters via phase().
+  const declaredPhases = await readDeclaredPhases(input);
+
   const startedAt = Date.now();
   const baseRecord: RunRecord = {
     runId,
@@ -84,6 +88,7 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
     status: "running",
     source: input.name ? "named" : input.scriptPath ? "scriptPath" : "inline",
     startedAt,
+    ...(declaredPhases ? { declaredPhases } : {}),
     ...(input.args !== undefined ? { args: input.args } : {}),
     ...(input.scriptPath ? { scriptPath: path.resolve(String(input.scriptPath)) } : {}),
   };
@@ -467,6 +472,18 @@ function agentAttemptsFlag(raw: string | undefined): { agentMaxAttempts?: number
 
 function looksLikeWorkflowPath(target: string): boolean {
   return target.includes("/") || target.includes("\\") || /\.(m?[jt]s)$/.test(target);
+}
+
+/** Parses meta.phases titles for the declared pipeline order. Best-effort (CLI runs are path-based). */
+async function readDeclaredPhases(input: WorkflowInput): Promise<string[] | undefined> {
+  try {
+    const script = input.scriptPath ? await readFile(String(input.scriptPath), "utf8") : input.script;
+    if (!script) return undefined;
+    const phases = parseWorkflowScript(script).meta.phases;
+    return phases?.length ? phases.map((phase) => phase.title) : undefined;
+  } catch {
+    return undefined; // fall back to executed-phase order
+  }
 }
 
 function assertOneOf(value: string, allowed: string[], flag: string): string {

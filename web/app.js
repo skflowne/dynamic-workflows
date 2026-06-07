@@ -356,14 +356,17 @@ function renderFlowSection(phases) {
   const rail = phases
     .map((p, i) => {
       // While agents are still in flight, show completed/total (x/y); otherwise just the count.
+      // A declared phase with no agents yet is "pending" — pre-rendered so the whole pipeline is
+      // visible before it runs (its agent nodes can't be: their count/labels are decided at runtime).
       const total = p.agents.length;
       const done = p.agents.filter((a) => a.status !== "running").length;
-      const badge = done < total ? `${done}/${total}` : `${total}`;
+      const pending = total === 0;
+      const badge = pending ? "" : done < total ? `${done}/${total}` : `${total}`;
       const active = p.title === state.expandedPhase ? " active" : "";
-      const node = `<button class="flow-phase${done < total ? " in-progress" : ""}${active}" data-phase-title="${escapeHtml(p.title)}" aria-expanded="${active ? "true" : "false"}">
+      const node = `<button class="flow-phase${done < total ? " in-progress" : ""}${pending ? " pending" : ""}${active}" data-phase-title="${escapeHtml(p.title)}" aria-expanded="${active ? "true" : "false"}">
         <span class="fp-dot"></span>
         <span class="fp-name">${escapeHtml(p.title)}</span>
-        <span class="fp-count">${badge}</span>
+        ${pending ? "" : `<span class="fp-count">${badge}</span>`}
         <span class="fp-chev">▾</span>
       </button>`;
       return i < phases.length - 1 ? node + `<span class="flow-link"></span>` : node;

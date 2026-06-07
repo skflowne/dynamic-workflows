@@ -174,6 +174,9 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 .flow-phase .fp-name { font-family: var(--serif); font-size: 16px; font-weight: 500; }
 .flow-phase .fp-count { font-family: var(--mono); font-size: 12px; color: var(--ink-2); background: var(--paper); padding: 1px 8px; border-radius: 999px; }
 .flow-phase.in-progress .fp-count { background: var(--amber-soft); color: var(--amber); }
+/* Declared-but-not-yet-run phase: pre-rendered, muted until its first agent appears. */
+.flow-phase.pending { opacity: 0.5; }
+.flow-phase.pending .fp-dot { background: var(--muted); }
 .flow-phase .fp-chev { color: var(--muted); font-size: 11px; transition: transform 0.18s; }
 .flow-phase.active .fp-chev { transform: rotate(180deg); color: var(--clay); }
 /* connector line between phases */

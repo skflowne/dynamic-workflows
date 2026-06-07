@@ -47,10 +47,15 @@ export function buildRunView(record: RunRecord, entries: WorkflowJournalEntry[])
     .map(toAgentView)
     .sort((a, b) => a.createdAt - b.createdAt);
 
-  // Seed declared phases first (preserves the pipeline order), then bucket each agent; any phase an
-  // agent references that wasn't declared — or no phase at all — lands in an appended group.
+  // Seed the declared pipeline first so phases render in their authoritative meta.phases order — NOT
+  // the order phase() happened to be called (a workflow may set a phase via an agent's `phase:` option
+  // without ever calling phase(), which would otherwise sort it last). Prefer the declared pipeline;
+  // fall back to the executed-phase list for older records. Then bucket each agent; any phase an agent
+  // references that wasn't declared lands in an appended group.
+  const declared = record.declaredPhases ?? record.phases ?? [];
+  const declaredSet = new Set(declared);
   const byPhase = new Map<string, AgentView[]>();
-  for (const title of record.phases ?? []) byPhase.set(title, []);
+  for (const title of declared) byPhase.set(title, []);
   for (const agent of agents) {
     const phase = agent.phase ?? UNGROUPED;
     if (!byPhase.has(phase)) byPhase.set(phase, []);
@@ -60,7 +65,9 @@ export function buildRunView(record: RunRecord, entries: WorkflowJournalEntry[])
   const phases: PhaseView[] = [];
   const phaseCounts: Record<string, number> = {};
   for (const [title, list] of byPhase) {
-    if (list.length === 0) continue; // declared-but-empty phases still show in the pipeline via record.phases
+    // Keep declared phases even when empty so the pipeline pre-renders them (pending); drop only
+    // undeclared phases that ended up with no agents.
+    if (list.length === 0 && !declaredSet.has(title)) continue;
     phases.push({ title, agents: list });
     phaseCounts[title] = list.length;
   }
