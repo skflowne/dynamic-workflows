@@ -23,7 +23,7 @@ npm run test:deepresearch   # runs the real Claude deep-research gist against a 
 npx tsx --test tests/nested-workflow.test.ts
 
 # CLI smoke (token-free fake runner — see env flags below):
-CODEX_WORKFLOW_FAKE_AGENT=1 node dist/cli.js run hello --args '{"name":"Ada"}'
+CODEX_WORKFLOW_FAKE_AGENT=1 node dist/cli.js run examples/hello.js --args '{"name":"Ada"}'
 node dist/cli.js doctor          # checks Bun, Codex CLI, ~/.codex/auth.json, workflow dirs, viewer
 node dist/cli.js serve --port 4173   # local web viewer (overview + per-step + full Codex session)
 ```
@@ -80,12 +80,16 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   `--resume`. Files at `~/.codex-workflow/journal/<runId>/<hash>.json` (prompt + options + result + sessionId).
 - `src/run-store.ts` — run history at `~/.codex-workflow/runs/<runId>.json` (incl. `args`/`result`) → powers `runs`/`show`.
 - `src/workflow-tool.ts` — Claude-compatible `{script|name|scriptPath|resumeFromRunId}` input shape,
-  `WorkflowRegistry` (dir discovery), and `buildWorkflowResolver` (resolves `workflow()` refs).
-- `src/controller.ts` — facade wiring runner + registry + journal + task manager; default discovery
-  dirs are `.claude/workflows`, `~/.claude/workflows` (CLI adds `~/.codex/workflows`).
+  `WorkflowRegistry` (dir discovery — **library/opt-in only; the CLI doesn't use it**), and
+  `buildWorkflowResolver` (resolves `workflow()` refs: `{scriptPath}` or a path-like string → file;
+  a bare name → registry, when one is provided).
+- `src/controller.ts` — facade wiring runner + registry + journal + task manager. The CLI passes
+  `workflowDirs: []` (no discovery); the library default still scans `.claude/workflows`,
+  `~/.claude/workflows` via `defaultWorkflowDirs` for embedders who want name lookup.
 - `src/task-manager.ts` — async launch/wait/cancel (library-level; the CLI runs foreground).
-- `src/cli.ts` + `src/cli/` — `parseArgs`-based CLI (`run`/`serve`/`list`/`validate`/`runs`/`show`/
-  `doctor`), `progress.ts` (TTY status-line renderer), `commands.ts` (command impls + runner factory).
+- `src/cli.ts` + `src/cli/` — `parseArgs`-based CLI (`run`/`serve`/`validate`/`runs`/`show`/`doctor`),
+  `progress.ts` (TTY status-line renderer), `commands.ts` (command impls + runner factory).
+  **`run` is path-only** — it takes a workflow file path, not a name; there is no `list` command.
 - `src/web/` + `web/` — **local web viewer** (zero-dep Node `http`, vanilla SPA, claude.ai-styled).
   `server.ts` serves a JSON API (`/api/runs`, `/api/runs/:id` → run-aggregator view, `…/agents/:key`
   → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`)

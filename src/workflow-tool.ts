@@ -130,21 +130,32 @@ export async function runWorkflowTool<T = unknown>(
 }
 
 /**
- * Builds the resolver used by the in-script `workflow()` primitive: `{ scriptPath }` reads the file,
- * a bare string name is looked up in the registry.
+ * Builds the resolver used by the in-script `workflow()` primitive: `{ scriptPath }` reads the file;
+ * a **path-like string** (contains a separator or ends in `.js`/`.ts`/`.mjs`) is loaded as a file;
+ * any other bare string is looked up by name in the registry (when one is provided).
  */
 export function buildWorkflowResolver(registry: WorkflowRegistry | undefined): WorkflowResolver {
   return async (ref: WorkflowRef) => {
-    if (typeof ref === "object" && ref && "scriptPath" in ref) {
-      const resolvedPath = path.resolve(ref.scriptPath);
+    const scriptPath =
+      typeof ref === "object" && ref && "scriptPath" in ref
+        ? ref.scriptPath
+        : typeof ref === "string" && looksLikePath(ref)
+          ? ref
+          : undefined;
+    if (scriptPath !== undefined) {
+      const resolvedPath = path.resolve(scriptPath);
       const script = await readWorkflowFile(resolvedPath);
       return { script, name: parseWorkflowScript(script).meta.name };
     }
     const name = String(ref);
     const found = await registry?.resolve(name);
-    if (!found) throw new WorkflowInputError(`workflow("${name}") not found in the registry`);
+    if (!found) throw new WorkflowInputError(`workflow("${name}") not found — pass a path (e.g. workflow("./other.js")) or register it`);
     return { script: found.script, name: found.name };
   };
+}
+
+function looksLikePath(ref: string): boolean {
+  return ref.includes("/") || ref.includes("\\") || /\.(m?[jt]s)$/.test(ref);
 }
 
 export async function resolveWorkflowInput(

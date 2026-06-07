@@ -7,12 +7,11 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { CodexSdkAgentRunner, type CodexSdkAgentRunnerOptions } from "../runners/codex-sdk.js";
 import type { SandboxMode, ThreadOptions } from "@openai/codex-sdk";
-import { WorkflowController, defaultWorkflowDirs } from "../controller.js";
+import { WorkflowController } from "../controller.js";
 import { WorkflowInputError } from "../errors.js";
 import { parseWorkflowScript } from "../parser.js";
 import { FileRunStore, type RunRecord } from "../run-store.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner, WorkflowProgressEvent } from "../types.js";
-import { WorkflowRegistry, type WorkflowRegistryDirectory } from "../workflow-tool.js";
 import { ProgressRenderer, type ProgressMode } from "./progress.js";
 import { createWebServer } from "../web/server.js";
 import {
@@ -56,7 +55,7 @@ const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
 const APPROVAL_MODES = ["never", "on-request", "on-failure", "untrusted"];
 const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
 
-/** `codex-workflow run <file|name>` */
+/** `codex-workflow run <file>` */
 export async function runCommand(target: string | undefined, flags: RunFlags): Promise<number> {
   if (!target) {
     process.stderr.write("error: `run` requires a workflow file path or registered name\n");
@@ -69,10 +68,8 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   const renderer = new ProgressRenderer(mode);
 
   // Runtime data (runs/journal/links) lives in the global data dir so it's shared across projects;
-  // `cwd` stays the project dir (where Codex agents run and workflows are discovered).
+  // `cwd` stays the project dir (where Codex agents run).
   const dataDir = workflowDataDir();
-  const workflowDirs = cliWorkflowDirs(cwd);
-  const registry = new WorkflowRegistry(workflowDirs);
   const runner = buildAgentRunner(cwd, flags);
   const runStore = new FileRunStore(runsDir(dataDir));
 
@@ -83,9 +80,9 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   const startedAt = Date.now();
   const baseRecord: RunRecord = {
     runId,
-    name: typeof input.name === "string" ? input.name : path.basename(String(input.scriptPath ?? "inline")),
+    name: path.basename(String(input.scriptPath ?? "inline")),
     status: "running",
-    source: input.scriptPath ? "scriptPath" : "named",
+    source: "scriptPath",
     startedAt,
     ...(input.args !== undefined ? { args: input.args } : {}),
     ...(input.scriptPath ? { scriptPath: path.resolve(String(input.scriptPath)) } : {}),
@@ -116,8 +113,9 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   const controller = new WorkflowController({
     cwd,
     runner,
-    registry,
     onProgress,
+    // Path-only CLI: no name discovery. `workflow()` nests by path/{scriptPath}, not by name.
+    workflowDirs: [],
     persistDir: runsDir(dataDir),
     journalDir: journalDir(dataDir),
     ...numericFlag("concurrency", flags.concurrency),
@@ -161,35 +159,6 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
     process.stderr.write(`\nworkflow failed: ${message}\n`);
     return 1;
   }
-}
-
-/** `codex-workflow list` */
-export async function listCommand(flags: { cwd?: string; json?: boolean }): Promise<number> {
-  const cwd = path.resolve(flags.cwd ?? process.cwd());
-  const registry = new WorkflowRegistry(cliWorkflowDirs(cwd));
-  const workflows = await registry.list();
-
-  if (flags.json) {
-    process.stdout.write(
-      `${JSON.stringify(
-        workflows.map((w) => ({ name: w.name, description: w.meta.description, whenToUse: w.meta.whenToUse, source: w.source, path: w.path })),
-        null,
-        2,
-      )}\n`,
-    );
-    return 0;
-  }
-
-  if (workflows.length === 0) {
-    process.stdout.write("No workflows found. Add scripts to .claude/workflows/, ~/.claude/workflows/, or ~/.codex/workflows/.\n");
-    return 0;
-  }
-  for (const w of workflows) {
-    process.stdout.write(`${w.name}  ${dim(`(${w.source})`)}\n`);
-    process.stdout.write(`  ${w.meta.description}\n`);
-    if (w.meta.whenToUse) process.stdout.write(`  ${dim(`when: ${w.meta.whenToUse}`)}\n`);
-  }
-  return 0;
 }
 
 /** `codex-workflow validate <file>` */
@@ -328,8 +297,7 @@ export async function serveCommand(flags: RunFlags): Promise<number> {
 }
 
 /** `codex-workflow doctor` */
-export async function doctorCommand(flags: { cwd?: string }): Promise<number> {
-  const cwd = path.resolve(flags.cwd ?? process.cwd());
+export async function doctorCommand(_flags: { cwd?: string }): Promise<number> {
   let ok = true;
   const line = (good: boolean, label: string, hint?: string) => {
     if (!good) ok = false;
@@ -345,11 +313,6 @@ export async function doctorCommand(flags: { cwd?: string }): Promise<number> {
   const authPath = path.join(os.homedir(), ".codex", "auth.json");
   const auth = await pathExists(authPath);
   line(auth, "Codex auth (~/.codex/auth.json)", "Run `codex login` to authenticate.");
-
-  for (const { dir } of cliWorkflowDirs(cwd)) {
-    const exists = await pathExists(dir);
-    process.stdout.write(`${exists ? green("✓") : dim("·")} workflow dir: ${dir}${exists ? "" : dim(" (not present)")}\n`);
-  }
 
   const dataDir = workflowDataDir();
   process.stdout.write(`${green("✓")} data dir: ${dataDir}\n`);
@@ -375,28 +338,18 @@ function readPkgVersion(): string {
 
 // --- helpers ------------------------------------------------------------------------------------
 
-function cliWorkflowDirs(cwd: string): WorkflowRegistryDirectory[] {
-  return [
-    ...defaultWorkflowDirs(cwd, os.homedir()),
-    { dir: path.join(os.homedir(), ".codex", "workflows"), source: "user" },
-  ];
-}
-
 async function buildRunInput(
   target: string,
   cwd: string,
   flags: RunFlags,
-): Promise<{ name?: string; scriptPath?: string; args?: unknown; resumeFromRunId?: string }> {
+): Promise<{ scriptPath?: string; args?: unknown; resumeFromRunId?: string }> {
   const args = await parseArgsValue(flags.args, cwd);
+  // Path-only: `run` takes a path to a workflow file (absolute or relative). No name lookup.
   const asPath = path.resolve(cwd, target);
   if (await isFile(asPath)) {
     return { scriptPath: asPath, ...(args !== undefined ? { args } : {}) };
   }
-  // Looks like a path but does not exist → surface a clear file error rather than a name lookup.
-  if (target.includes("/") || target.includes(path.sep) || /\.(m?[jt]s)$/.test(target)) {
-    throw new WorkflowInputError(`workflow file not found: ${target}`);
-  }
-  return { name: target, ...(args !== undefined ? { args } : {}) };
+  throw new WorkflowInputError(`workflow file not found: ${target} — run takes a path to a .js/.ts/.mjs workflow file`);
 }
 
 async function parseArgsValue(raw: string | undefined, cwd: string): Promise<unknown> {

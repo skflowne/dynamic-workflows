@@ -10,7 +10,7 @@ orchestration primitives — `agent()`, `parallel()`, `pipeline()`, `workflow()`
 thread** via `@openai/codex-sdk`. The script body itself executes unrestricted under **Bun**.
 
 ```bash
-codex-workflow run deep-research --args '"what changed in the API?"'   # auto-starts the viewer
+codex-workflow run examples/deep-research.js --args '"what changed in the API?"'   # auto-starts the viewer
 ```
 
 The CLI binary is named `codex-workflow`.
@@ -45,14 +45,15 @@ codex-workflow doctor
 ## CLI
 
 ```text
-codex-workflow run <file|name> [options]   Run a workflow (foreground, live progress)
+codex-workflow run <file> [options]        Run a workflow file (foreground, live progress)
 codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
-codex-workflow list [--json]               List discovered workflows
 codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
 codex-workflow runs [--json]               List recorded run history
 codex-workflow show <runId> [--json]       Show a recorded run
-codex-workflow doctor                      Check Bun, Codex CLI, auth, workflow dirs, viewer
+codex-workflow doctor                      Check Bun, Codex CLI, auth, and the viewer
 ```
+
+`run` takes a **path** to a workflow file (absolute or relative) — there is no name-based lookup.
 
 Run options:
 
@@ -74,7 +75,6 @@ Web search + network access are **always enabled** for agents.
 | `--json` | Machine-readable output to stdout (suppresses progress) |
 | `--quiet` / `--no-progress` | Reduce / plainify progress output |
 
-Workflows are discovered from `./.claude/workflows`, `~/.claude/workflows`, and `~/.codex/workflows`.
 Run history, the per-agent journal, and session links are recorded in a **global** data dir,
 `~/.codex-workflow/` (override with `CODEX_WORKFLOW_HOME`), so runs from every project are shared by
 one store and one viewer.
@@ -83,20 +83,21 @@ one store and one viewer.
 
 ```bash
 # Validate, then run a bundled example without spending tokens:
-codex-workflow validate .claude/workflows/hello.js
-CODEX_WORKFLOW_FAKE_AGENT=1 codex-workflow run hello --args '{"name":"Ada"}'
+codex-workflow validate examples/hello.js
+CODEX_WORKFLOW_FAKE_AGENT=1 codex-workflow run examples/hello.js --args '{"name":"Ada"}'
 
 # Real run, JSON result piped to jq:
-codex-workflow run hello --args '{"name":"Ada"}' --json | jq .result
+codex-workflow run examples/hello.js --args '{"name":"Ada"}' --json | jq .result
 ```
 
-`.claude/workflows/nested-demo.js` demonstrates the `workflow()` nesting primitive.
+`examples/nested-demo.js` demonstrates the `workflow()` nesting primitive (nesting by path).
 
 ### `examples/`
 
-Sample scripts you run by **path** (`codex-workflow run examples/<file>`); unlike `.claude/workflows/`,
-they are not registered for name lookup or `list`.
+Sample scripts you run by **path** (`codex-workflow run examples/<file>`).
 
+- `hello.js` — minimal `agent()` + `parallel()` demo.
+- `nested-demo.js` — `workflow()` nesting by path (`workflow('examples/hello.js', …)`); run from the repo root.
 - `complex-chain.js`, `live-check.js` — small original demos.
 - `deep-research.js` — Claude Code's built-in `deep-research` workflow (fan-out → fetch → 3-vote
   verify → synthesize); runnable here as-is.
@@ -150,9 +151,10 @@ return { findings: findings.flat().filter(Boolean) }
 - `parallel(thunks)` — run `() => …` thunks concurrently; a thrown thunk resolves to `null`.
 - `pipeline(items, stage1, stage2, …)` — run each item through all stages independently (no barrier);
   stages receive `(prevResult, originalItem, index)`; a throwing stage drops the item to `null`.
-- `workflow(nameOrRef, args?)` — run another workflow inline (one level deep), sharing this run's
-  concurrency limiter, agent-count cap, token budget, journal, and abort signal. Accepts a registered
-  name or `{ scriptPath }`.
+- `workflow(ref, args?)` — run another workflow inline (one level deep), sharing this run's
+  concurrency limiter, agent-count cap, token budget, journal, and abort signal. `ref` is a path to a
+  workflow file — a path-like string (`'./other.js'`) or `{ scriptPath }`, resolved relative to the
+  current working directory.
 - `phase(title)`, `log(message)`, `args`, `budget` (`total`, `spent()`, `remaining()` — shared across
   the root and nested workflows).
 
@@ -177,12 +179,14 @@ const controller = new WorkflowController({
   concurrency: 8,
 });
 
-const output = await controller.run({ name: "deep-research", args: "What changed?" });
+const output = await controller.run({ scriptPath: "examples/deep-research.js", args: "What changed?" });
+// or inline: controller.run({ script, args })
 // background: controller.launch() -> taskId, controller.wait(taskId), controller.cancel(taskId)
 ```
 
-`runWorkflow`, `runWorkflowTool`, `WorkflowRegistry`, `FileWorkflowJournal`, `FileRunStore`,
-`buildWorkflowResolver`, and `ScriptedAgentRunner` are also exported.
+`runWorkflow`, `runWorkflowTool`, `FileWorkflowJournal`, `FileRunStore`, and `ScriptedAgentRunner` are
+also exported. `WorkflowRegistry` / `buildWorkflowResolver` remain available for embedders who want
+opt-in name-based discovery (the CLI itself is path-only).
 
 ## Architecture
 

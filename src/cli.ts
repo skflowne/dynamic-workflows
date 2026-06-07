@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
   doctorCommand,
-  listCommand,
   runCommand,
   runsCommand,
   serveCommand,
@@ -39,13 +38,12 @@ const OPTIONS = {
 const HELP = `codex-workflow — run Claude-compatible dynamic workflows, backed by Codex.
 
 Usage:
-  codex-workflow run <file|name> [options]   Run a workflow (foreground, live progress)
+  codex-workflow run <file> [options]        Run a workflow file (foreground, live progress)
   codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
-  codex-workflow list [--json]               List discovered workflows
   codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
   codex-workflow runs [--json]               List recorded run history
   codex-workflow show <runId> [--json]       Show a recorded run
-  codex-workflow doctor                      Check Bun, Codex CLI, auth, and workflow dirs
+  codex-workflow doctor                      Check Bun, Codex CLI, auth, and the viewer
 
 Run options:
   --args <json|@file.json>   Arguments passed to the workflow as \`args\`
@@ -74,7 +72,7 @@ Viewer options (run / serve):
 
 Workflows are open TS/JS executed under Bun; each agent() spawns a Codex thread.
 Web search + network access are always enabled for agents.
-Discovered from: ./.claude/workflows, ~/.claude/workflows, ~/.codex/workflows.
+Pass run a path to a workflow file (e.g. examples/deep-research.js).
 `;
 
 async function main(): Promise<number> {
@@ -106,8 +104,6 @@ async function main(): Promise<number> {
       return runCommand(target, flags);
     case "serve":
       return serveCommand(flags);
-    case "list":
-      return listCommand(flags);
     case "validate":
       return validateCommand(target, flags);
     case "runs":

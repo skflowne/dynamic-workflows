@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -41,12 +41,10 @@ function runCli(args: string[], cwd: string): Promise<CliResult> {
   });
 }
 
-test("CLI validate / run --json / runs / list end-to-end (no tokens)", async () => {
+test("CLI validate / run --json / runs / show end-to-end (no tokens)", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-"));
   try {
-    const wfDir = path.join(dir, ".claude", "workflows");
-    await mkdir(wfDir, { recursive: true });
-    const wfPath = path.join(wfDir, "cli_demo.js");
+    const wfPath = path.join(dir, "cli_demo.js");
     await writeFile(wfPath, WORKFLOW, "utf8");
 
     // validate
@@ -54,14 +52,8 @@ test("CLI validate / run --json / runs / list end-to-end (no tokens)", async () 
     assert.equal(validate.code, 0, validate.stderr);
     assert.match(validate.stdout, /valid workflow: cli_demo/);
 
-    // list (by --json) finds the project workflow
-    const list = await runCli(["list", "--json", "--cwd", dir], dir);
-    assert.equal(list.code, 0, list.stderr);
-    const listed = JSON.parse(list.stdout) as Array<{ name: string }>;
-    assert.ok(listed.some((w) => w.name === "cli_demo"));
-
-    // run by name with --json
-    const run = await runCli(["run", "cli_demo", "--args", '{"who":"Ada"}', "--json", "--cwd", dir], dir);
+    // run by path with --json
+    const run = await runCli(["run", wfPath, "--args", '{"who":"Ada"}', "--json", "--cwd", dir], dir);
     assert.equal(run.code, 0, run.stderr);
     const output = JSON.parse(run.stdout) as {
       status: string;
