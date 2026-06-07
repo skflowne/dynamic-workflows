@@ -105,3 +105,52 @@ test("web server exposes runs, run view, agent detail, and the linked Codex sess
     await rm(sessionsDir, { recursive: true, force: true });
   }
 });
+
+test("broadcast pushes live progress events to SSE subscribers (in-process path)", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-web-sse-"));
+  const server = createWebServer({ cwd, version: "9.9.9" });
+  const ac = new AbortController();
+  try {
+    const runId = "wf_sse";
+    // A run record so the /events replay endpoint resolves (it 404s on unknown runs).
+    const record: RunRecord = { runId, name: "sse", status: "running", source: "scriptPath", startedAt: START };
+    await mkdir(path.join(cwd, ".codex-workflow", "runs"), { recursive: true });
+    await writeFile(path.join(cwd, ".codex-workflow", "runs", `${runId}.json`), JSON.stringify(record), "utf8");
+
+    const bound = await server.listen(0);
+    // Open the SSE stream; once the fetch resolves the subscriber is registered server-side.
+    const res = await fetch(`${bound.url}/api/stream`, { signal: ac.signal });
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+
+    server.broadcast({ runId, type: "progress", event: { kind: "log", message: "hello-sse" } });
+
+    let buf = "";
+    let received: any;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const start = buf.indexOf("data: ");
+      const end = start >= 0 ? buf.indexOf("\n\n", start) : -1;
+      if (start >= 0 && end > start) {
+        received = JSON.parse(buf.slice(start + 6, end));
+        break;
+      }
+    }
+
+    assert.ok(received, "expected an SSE data event");
+    assert.equal(received.runId, runId);
+    assert.equal(received.event.message, "hello-sse");
+
+    // The same event is buffered for late subscribers (replay).
+    const events = await get(`${bound.url}/api/runs/${runId}/events`);
+    assert.equal(events.json.length, 1);
+    assert.equal(events.json[0].event.message, "hello-sse");
+  } finally {
+    ac.abort();
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

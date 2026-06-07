@@ -78,7 +78,7 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   loose Claude schemas into OpenAI-strict form before sending (see gotchas).
 - `src/runners/scripted.ts` — deterministic test runner.
 - `src/paths.ts` — resolves the **global data dir** (`~/.codex-workflow`, override `CODEX_WORKFLOW_HOME`)
-  holding `runs/`, `journal/`, `links/`, `web.json`. Shared across projects; the CLI passes these into
+  holding `runs/`, `journal/`, `links/`. Shared across projects; the CLI passes these into
   the controller/store/server (`cwd` stays the project dir — where agents run & workflows are discovered).
 - `src/journal.ts` — per-agent result cache keyed by `{prompt, options, runId}` hash → enables
   `--resume`. Files at `~/.codex-workflow/journal/<runId>/<hash>.json` (prompt + options + result + sessionId).
@@ -97,16 +97,18 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   not found rather than falling through to name lookup.
 - `src/web/` + `web/` — **local web viewer** (zero-dep Node `http`, vanilla SPA, claude.ai-styled).
   `server.ts` serves a JSON API (`/api/runs`, `/api/runs/:id` → run-aggregator view, `…/agents/:key`
-  → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`)
-  + `POST /api/ingest`. `run-aggregator.ts` groups journal entries into phase buckets;
-  `session-parser.ts` turns a rollout `.jsonl` into a timeline (messages/reasoning/web-search/tool
-  calls/usage); `session-linker.ts` maps each agent → its rollout file (exact via the journal's new
-  `sessionId`, else heuristic content-match within the run's time window, cached in
-  `~/.codex-workflow/links/`); `launcher.ts` manages the detached background server (`~/.codex-workflow/web.json`).
-  `run` auto-starts/reuses the server (unless `--json`/`--no-web`) and best-effort-POSTs its
-  `onProgress` events for live SSE. Static `web/` assets are NOT compiled by tsc; the server resolves
-  them at `<moduleDir>/../../web` (project-root `web/` under both `dist/` and `tsx`).
-  **Session linkage requires `originator: "codex_sdk_ts"`** rollouts (set by the SDK runner).
+  → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`),
+  and exposes an in-process `broadcast(event)` for liveness. `run-aggregator.ts` groups journal entries
+  into phase buckets; `session-parser.ts` turns a rollout `.jsonl` into a timeline
+  (messages/reasoning/web-search/tool calls/usage); `session-linker.ts` maps each agent → its rollout
+  file (exact via the journal's new `sessionId`, else heuristic content-match within the run's time
+  window, cached in `~/.codex-workflow/links/`); `launcher.ts` is just free-port + open-browser helpers.
+  **The viewer runs in-process: `run` (unless `--json`/`--no-web`) binds its own server on a random
+  port, pushes `onProgress` events via `broadcast()`, and (when stdout is a TTY) keeps it live after
+  the run until Ctrl-C; non-interactive runs close it immediately. `serve` is the standalone
+  browse-history viewer (foreground; no daemon/`web.json`).** Static `web/` assets are NOT compiled by
+  tsc; the server resolves them at `<moduleDir>/../../web` (project-root `web/` under both `dist/` and
+  `tsx`). **Session linkage requires `originator: "codex_sdk_ts"`** rollouts (set by the SDK runner).
 
 ## Critical invariants / non-obvious gotchas
 
@@ -127,8 +129,9 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   those workflow/runner layers explicitly provides it.
 - **Build layout:** `tsconfig.json` uses `rootDir: "src"` so output is `dist/index.js` / `dist/cli.js`
   (the `bin`). Tests are excluded from emit and typechecked separately via `tsconfig.test.json`.
-- **Observability layers** when debugging a run: the **web viewer** (`serve`, or auto-started by `run`)
-  → overview + per-step + linked Codex session; workflow logs/stats → `show <runId>`; per-subagent
+- **Observability layers** when debugging a run: the **web viewer** (in-process per `run` on a random
+  port, or `serve` to browse history) → overview + per-step + linked Codex session; workflow logs/stats
+  → `show <runId>`; per-subagent
   prompt+result → `~/.codex-workflow/journal/<runId>/*.json`; full subagent trace (reasoning, web
   searches, tool calls) → `~/.codex/sessions/<date>/rollout-*.jsonl` (`codex resume <sessionUUID>`).
 - `AGENTS.md` is a symlink to this file (Codex reads `AGENTS.md`).

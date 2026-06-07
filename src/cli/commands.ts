@@ -14,17 +14,8 @@ import { FileRunStore, type RunRecord } from "../run-store.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner, WorkflowProgressEvent } from "../types.js";
 import { WorkflowRegistry, type WorkflowInput } from "../workflow-tool.js";
 import { ProgressRenderer, type ProgressMode } from "./progress.js";
-import { createWebServer } from "../web/server.js";
-import {
-  clearServerState,
-  ensureBackgroundServer,
-  openBrowser,
-  pickPort,
-  postIngest,
-  readServerState,
-  writeServerState,
-  healthCheck,
-} from "../web/launcher.js";
+import { createWebServer, type WorkflowWebServer } from "../web/server.js";
+import { openBrowser, pickPort } from "../web/launcher.js";
 import { workflowDataDir, runsDir, journalDir } from "../paths.js";
 
 const exec = promisify(execFile);
@@ -50,7 +41,6 @@ export interface RunFlags {
   open?: boolean;
   "no-open"?: boolean;
   "no-web"?: boolean;
-  daemon?: boolean;
 }
 
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
@@ -97,25 +87,30 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   };
   await runStore.save(baseRecord);
 
-  // Background viewer: auto-start a reusable server (skipped for --json machine output and --no-web).
-  // All viewer I/O is best-effort — a missing server must never affect the run itself.
+  // In-process viewer: each run binds its own server on a random (OS-assigned) port and broadcasts
+  // progress straight into it — no detached daemon, no shared singleton (skipped for --json machine
+  // output and --no-web). All viewer I/O is best-effort: a failed viewer must never break the run.
   const webEnabled = !json && flags["no-web"] !== true;
+  let server: WorkflowWebServer | undefined;
   let viewerUrl: string | undefined;
   if (webEnabled) {
     try {
-      const { url } = await ensureBackgroundServer(dataDir);
-      viewerUrl = url;
-      process.stderr.write(`${dim("▸")} Viewer: ${bold(`${url}/runs/${runId}`)}\n`);
-      if (flags.open) openBrowser(`${url}/runs/${runId}`);
-      postIngest(url, { runId, type: "run-meta", record: baseRecord });
+      server = createWebServer({ dataDir, version: readPkgVersion() });
+      const bound = await server.listen(0);
+      viewerUrl = bound.url;
+      process.stderr.write(`${dim("▸")} Viewer: ${bold(`${bound.url}/runs/${runId}`)}\n`);
+      if (flags.open) openBrowser(`${bound.url}/runs/${runId}`);
+      server.broadcast({ runId, type: "run-meta", record: baseRecord });
     } catch (error) {
+      server = undefined;
+      viewerUrl = undefined;
       process.stderr.write(`${yellow("!")} viewer unavailable: ${error instanceof Error ? error.message : String(error)}\n`);
     }
   }
 
   const onProgress = (event: WorkflowProgressEvent): void => {
     renderer.handle(event);
-    if (viewerUrl) postIngest(viewerUrl, { runId, type: "progress", event });
+    server?.broadcast({ runId, type: "progress", event });
   };
 
   const controller = new WorkflowController({
@@ -149,7 +144,7 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
       result: output.result,
       ...(output.scriptPath ? { scriptPath: output.scriptPath } : {}),
     });
-    if (viewerUrl) postIngest(viewerUrl, { runId, type: "run-finished", status: "completed" });
+    server?.broadcast({ runId, type: "run-finished", status: "completed" });
 
     if (json) {
       process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
@@ -157,15 +152,41 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
       printRunSummary(output.workflowName, output.runId, output.stats);
       process.stdout.write(`${stringifyResult(output.result)}\n`);
     }
-    return 0;
+    return finishViewer(server, viewerUrl, runId, 0);
   } catch (error) {
     renderer.finish();
     const message = error instanceof Error ? error.message : String(error);
     await runStore.save({ ...baseRecord, status: "failed", completedAt: Date.now(), error: message });
-    if (viewerUrl) postIngest(viewerUrl, { runId, type: "run-finished", status: "failed", error: message });
+    server?.broadcast({ runId, type: "run-finished", status: "failed", error: message });
     process.stderr.write(`\nworkflow failed: ${message}\n`);
-    return 1;
+    return finishViewer(server, viewerUrl, runId, 1);
   }
+}
+
+/**
+ * After a run prints its result, decide the in-process viewer's fate: when stdout is a TTY, keep it
+ * live (the open socket holds the foreground process up) and exit on Ctrl-C; otherwise (piped/scripted)
+ * close it and return immediately. Returns the exit code (or a never-resolving promise while lingering).
+ */
+function finishViewer(
+  server: WorkflowWebServer | undefined,
+  viewerUrl: string | undefined,
+  runId: string,
+  exitCode: number,
+): Promise<number> | number {
+  if (!server) return exitCode;
+  if (process.stdout.isTTY !== true) {
+    return server.close().then(() => exitCode);
+  }
+  const deepUrl = `${viewerUrl}/runs/${runId}`;
+  process.stderr.write(`${dim("▸")} Viewer still live at ${bold(deepUrl)} ${dim("— press Ctrl-C to stop")}\n`);
+  const shutdown = () => {
+    void server.close().finally(() => process.exit(exitCode));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  // Never resolves; the listening server keeps the foreground process alive until a signal arrives.
+  return new Promise<number>(() => {});
 }
 
 /** `codex-workflow validate <file>` */
@@ -293,10 +314,13 @@ export async function showCommand(runId: string | undefined, flags: { cwd?: stri
   return 0;
 }
 
-/** `codex-workflow serve` — start the local web viewer (foreground; blocks until signalled). */
+/**
+ * `codex-workflow serve` — the standalone viewer for browsing the full run history (foreground;
+ * blocks until signalled). Distinct from `run`'s in-process per-run viewer: this is a plain server
+ * with no daemon/`web.json` state. Prefers port 4173 for a stable URL, or `--port` to pin one.
+ */
 export async function serveCommand(flags: RunFlags): Promise<number> {
   const dataDir = workflowDataDir();
-  const daemon = flags.daemon === true;
 
   let requestedPort: number | undefined;
   if (flags.port !== undefined) {
@@ -304,16 +328,6 @@ export async function serveCommand(flags: RunFlags): Promise<number> {
     if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
       process.stderr.write("error: --port must be an integer 0–65535\n");
       return 2;
-    }
-  }
-
-  // Reuse an already-running viewer rather than double-binding (foreground invocations only).
-  if (!daemon) {
-    const existing = await readServerState(dataDir);
-    if (existing && (await healthCheck(existing.url))) {
-      process.stdout.write(`${green("✓")} Viewer already running at ${bold(existing.url)}\n`);
-      if (flags["no-open"] !== true) openBrowser(existing.url);
-      return 0;
     }
   }
 
@@ -326,15 +340,12 @@ export async function serveCommand(flags: RunFlags): Promise<number> {
     process.stderr.write(`error: could not start viewer on port ${port}: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
-  await writeServerState(dataDir, { pid: process.pid, port: bound.port, url: bound.url, startedAt: Date.now() });
 
-  if (!daemon) {
-    process.stdout.write(`${green("✓")} Viewer running at ${bold(bound.url)}  ${dim("(Ctrl-C to stop)")}\n`);
-    if (flags["no-open"] !== true) openBrowser(bound.url);
-  }
+  process.stdout.write(`${green("✓")} Viewer running at ${bold(bound.url)}  ${dim("(Ctrl-C to stop)")}\n`);
+  if (flags["no-open"] !== true) openBrowser(bound.url);
 
   const shutdown = () => {
-    void clearServerState(dataDir).finally(() => server.close().finally(() => process.exit(0)));
+    void server.close().finally(() => process.exit(0));
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
@@ -363,12 +374,7 @@ export async function doctorCommand(_flags: { cwd?: string }): Promise<number> {
 
   const dataDir = workflowDataDir();
   process.stdout.write(`${green("✓")} data dir: ${dataDir}\n`);
-
-  const viewer = await readServerState(dataDir);
-  const viewerUp = viewer ? await healthCheck(viewer.url) : false;
-  process.stdout.write(
-    `${viewerUp ? green("✓") : dim("·")} viewer server: ${viewerUp ? viewer!.url : dim("not running (auto-starts on `run`, or `codex-workflow serve`)")}\n`,
-  );
+  process.stdout.write(`${dim("·")} viewer: ${dim("starts in-process per `run` (random port); `codex-workflow serve` browses history")}\n`);
 
   process.stdout.write(ok ? `\n${green("Ready.")}\n` : `\n${yellow("Some checks failed — see hints above.")}\n`);
   return ok ? 0 : 1;

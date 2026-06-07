@@ -122,12 +122,17 @@ A local web viewer (zero runtime dependencies — Node's `http` + a vanilla SPA)
 - **Input & Result** — the workflow's `args` and final return value, rendered top and bottom.
 - **Live** — the page streams updates over SSE (logs, phase progress, status) with no refresh.
 
-```bash
-codex-workflow serve            # foreground; opens http://127.0.0.1:4173
-```
+`run` **auto-starts a viewer in-process on a random port** (unless `--json` or `--no-web`) and prints
+its URL, so you can watch that run live. The server lives for the duration of the run; when you're in a
+terminal it then **stays up until you press Ctrl-C** so you can inspect the result, and exits
+immediately when the output is piped/scripted. Each `run` is its own ephemeral server — there is no
+shared resident daemon.
 
-`run` also **auto-starts the viewer in the background** (unless `--json` or `--no-web`) and prints its
-URL, so you can watch a run live. The server is shared across projects and persists until stopped.
+To browse **all** past runs, start the standalone viewer (foreground; Ctrl-C to stop):
+
+```bash
+codex-workflow serve            # opens http://127.0.0.1:4173 (or --port N)
+```
 
 ## Workflow API
 

@@ -32,7 +32,6 @@ const OPTIONS = {
   open: { type: "boolean" },
   "no-open": { type: "boolean" },
   "no-web": { type: "boolean" },
-  daemon: { type: "boolean" },
   help: { type: "boolean", short: "h" },
   version: { type: "boolean", short: "v" },
 } as const;
@@ -65,11 +64,14 @@ Run options:
   --quiet                    Suppress progress output
   --no-progress              Plain (non-TTY) progress lines
 
-Viewer options (run / serve):
-  --port <n>                 Viewer port (serve; default 4173 or a free port)
-  --open                     Open the viewer in the browser
+Viewer:
+  run starts an in-process viewer on a random port (lives for the run; stays up
+  after it finishes in a terminal until Ctrl-C). serve is a standalone viewer for
+  browsing all past runs.
+  --port <n>                 Viewer port for \`serve\` (default 4173 or a free port)
+  --open                     Open the run's viewer in the browser (run)
   --no-open                  Do not open a browser (serve)
-  --no-web                   Do not auto-start the viewer during \`run\`
+  --no-web                   Do not start the viewer during \`run\`
 
   -h, --help                 Show this help
   -v, --version              Show version

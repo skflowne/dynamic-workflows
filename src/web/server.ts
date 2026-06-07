@@ -10,8 +10,9 @@ import { parseCodexSessionFile } from "./session-parser.js";
 
 /**
  * Zero-dependency HTTP server for the workflow viewer. Serves the static SPA from `web/`, a JSON API
- * over the run-store + journal + linked Codex sessions, a global SSE stream for liveness, and an
- * `/api/ingest` endpoint the `run` process posts progress events to. Binds 127.0.0.1 only.
+ * over the run-store + journal + linked Codex sessions, and a global SSE stream for liveness. The
+ * `run` command runs this server in-process and pushes progress events straight into it via
+ * {@link WorkflowWebServer.broadcast} (no HTTP round-trip). Binds 127.0.0.1 only.
  */
 
 export interface WebServerOptions {
@@ -23,7 +24,7 @@ export interface WebServerOptions {
   webDir?: string;
 }
 
-interface LiveEvent {
+export interface LiveEvent {
   runId: string;
   [key: string]: unknown;
 }
@@ -33,6 +34,8 @@ const MAX_BUFFER = 2000;
 export interface WorkflowWebServer {
   server: http.Server;
   listen(port: number, host?: string): Promise<{ port: number; url: string }>;
+  /** Push a live progress event into the in-memory buffer + every SSE subscriber (in-process). */
+  broadcast(event: LiveEvent): void;
   close(): Promise<void>;
 }
 
@@ -68,18 +71,6 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://localhost");
     const segments = url.pathname.split("/").filter(Boolean);
-
-    if (req.method === "POST" && url.pathname === "/api/ingest") {
-      const body = await readBody(req);
-      try {
-        const parsed = JSON.parse(body) as LiveEvent;
-        if (parsed && typeof parsed.runId === "string") broadcast(parsed);
-      } catch {
-        // ignore malformed ingest — liveness is best-effort
-      }
-      res.writeHead(204).end();
-      return;
-    }
 
     if (req.method !== "GET" && req.method !== "HEAD") {
       sendJson(res, 405, { error: "method not allowed" });
@@ -187,6 +178,7 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
         });
       });
     },
+    broadcast,
     close() {
       return new Promise((resolve) => {
         for (const res of subscribers) res.end();
@@ -236,18 +228,6 @@ async function isFile(p: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function readBody(req: http.IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 8_000_000) req.destroy();
-    });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
 }
 
 function sendJson(res: http.ServerResponse, status: number, value: unknown): void {
