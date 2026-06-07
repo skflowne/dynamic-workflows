@@ -4,6 +4,7 @@ import { parseArgs } from "node:util";
 import {
   doctorCommand,
   listCommand,
+  resumeCommand,
   runCommand,
   runsCommand,
   serveCommand,
@@ -20,7 +21,6 @@ const OPTIONS = {
   "max-agents": { type: "string" },
   "agent-retries": { type: "string" },
   "agent-timeout": { type: "string" },
-  resume: { type: "string" },
   cwd: { type: "string" },
   sandbox: { type: "string" },
   approval: { type: "string" },
@@ -42,6 +42,7 @@ const HELP = `codex-workflow — run Claude-compatible dynamic workflows, backed
 
 Usage:
   codex-workflow run <file|name> [options]   Run a workflow file or registered name
+  codex-workflow resume <runId> [options]    Re-run a recorded run, reusing its cached agents
   codex-workflow list [--json]               List workflows from .claude/workflows and ~/.claude/workflows
   codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
   codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
@@ -57,7 +58,6 @@ Run options:
   --max-agents <n>           Hard cap on total agent() calls (default 1000)
   --agent-retries <n>        Retries per agent on transient failure (default 2; agent() returns null when exhausted)
   --agent-timeout <ms>       Per-agent total-duration timeout in ms (0 disables; default 900000)
-  --resume <runId>           Reuse a prior run's journal cache
   --cwd <dir>                Working directory for agents (default: cwd)
   --sandbox <mode>           read-only | workspace-write | danger-full-access
   --approval <policy>        never | on-request | on-failure | untrusted
@@ -84,6 +84,8 @@ Workflows are open TS/JS executed under Bun; each agent() spawns a Codex thread.
 Web search + network access are always enabled for agents.
 Pass run a path to a workflow file (e.g. examples/deep-research.js).
 Bare names resolve from .claude/workflows and ~/.claude/workflows.
+resume restores the workflow's script path / name and args from the run record
+(reusing completed agents from its journal); --args and other flags override.
 `;
 
 async function main(): Promise<number> {
@@ -113,6 +115,8 @@ async function main(): Promise<number> {
   switch (command) {
     case "run":
       return runCommand(target, flags);
+    case "resume":
+      return resumeCommand(target, flags);
     case "list":
       return listCommand(flags);
     case "serve":

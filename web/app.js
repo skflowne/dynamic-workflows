@@ -15,6 +15,7 @@ const state = {
   liveAgents: new Map(), // key -> {key, label, phase, state} for in-flight/just-finished agents
   liveLogs: [], // log lines seen via SSE (record.logs is only persisted at completion)
   refetchTimer: null,
+  backstopTimer: null, // low-frequency poll while a running run is open (self-heals missed live events)
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -118,15 +119,13 @@ function seedLiveFromBuffer(buffer) {
   }
 }
 
-function renderRunView(data, options = {}) {
+function renderRunView(data) {
   const { record, view } = data;
-  const restorePhase = options.preserveExpanded ? state.expandedPhase : null;
   state.expandedPhase = null;
   const desc = record.description ? `<p class="rv-desc">${escapeHtml(record.description)}</p>` : "";
   const stats = view.stats;
   const phases = mergedPhases();
   const visibleAgentCount = phases.reduce((sum, phase) => sum + phase.agents.length, 0);
-  const duration = stats.durationMs ?? (record.status === "running" && record.startedAt ? Date.now() - record.startedAt : undefined);
   // When a real result exists it's the answer — show it above the logs, which become secondary.
   const hasResult = record.result !== undefined && record.result !== null;
   const root = el("run-view");
@@ -136,12 +135,7 @@ function renderRunView(data, options = {}) {
       <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
         <h1 class="rv-title">${escapeHtml(record.name)}</h1>
         <span class="pill ${record.status}"><span class="status-dot ${record.status}"></span>${record.status}</span>
-        <span class="rv-stats">
-          <span class="rv-stat"><b>${fmtNum(Math.max(stats.agentCount ?? 0, visibleAgentCount))}</b> agents</span>
-          <span class="rv-stat-sep">·</span>
-          <span class="rv-stat"><b>${fmtDuration(duration)}</b></span>
-          ${stats.cacheHits ? `<span class="rv-stat-sep">·</span><span class="rv-stat"><b>${fmtNum(stats.cacheHits)}</b> cache hits</span>` : ""}
-        </span>
+        <span class="rv-stats">${renderHeadStats(record, stats, visibleAgentCount)}</span>
       </div>
       ${desc}
       ${renderRunMeta(record)}
@@ -152,9 +146,16 @@ function renderRunView(data, options = {}) {
     ${hasResult ? renderResultSection(record) + renderLogs(record) : renderLogs(record) + renderResultSection(record)}
   `;
   setLiveActive(record.status === "running");
-  if (restorePhase && phases.some((phase) => phase.title === restorePhase)) {
-    requestAnimationFrame(() => expandPhase(restorePhase));
-  }
+}
+
+// The agents / duration / cache-hits run inside `.rv-stats`. Extracted so the live-tick path can
+// refresh just this box in place (no animation here) instead of re-rendering the whole head.
+function renderHeadStats(record, stats, visibleAgentCount) {
+  const duration = stats.durationMs ?? (record.status === "running" && record.startedAt ? Date.now() - record.startedAt : undefined);
+  return `<span class="rv-stat"><b>${fmtNum(Math.max(stats.agentCount ?? 0, visibleAgentCount))}</b> agents</span>
+    <span class="rv-stat-sep">·</span>
+    <span class="rv-stat"><b>${fmtDuration(duration)}</b></span>
+    ${stats.cacheHits ? `<span class="rv-stat-sep">·</span><span class="rv-stat"><b>${fmtNum(stats.cacheHits)}</b> cache hits</span>` : ""}`;
 }
 
 function renderRunMeta(record) {
@@ -171,6 +172,13 @@ function renderRunMeta(record) {
 
 function setLiveActive(active) {
   document.querySelectorAll(".live-dot").forEach((node) => node.classList.toggle("active", active));
+  // While a run is live, keep a backstop poll running (see pollRunning); stop it once it's terminal.
+  if (active) {
+    if (!state.backstopTimer) state.backstopTimer = setInterval(pollRunning, 3000);
+  } else if (state.backstopTimer) {
+    clearInterval(state.backstopTimer);
+    state.backstopTimer = null;
+  }
 }
 
 // During a run, record.logs is empty (only persisted at completion) — fall back to the live log
@@ -351,30 +359,37 @@ function mergedPhases() {
   return phases;
 }
 
-function renderFlowSection(phases) {
-  if (!phases.length) return `<div class="muted-note">No agents recorded yet.</div>`;
-  const rail = phases
-    .map((p, i) => {
-      // While agents are still in flight, show completed/total (x/y); otherwise just the count.
-      // A declared phase with no agents yet is "pending" — pre-rendered so the whole pipeline is
-      // visible before it runs (its agent nodes can't be: their count/labels are decided at runtime).
-      const total = p.agents.length;
-      const done = p.agents.filter((a) => a.status !== "running").length;
-      const pending = total === 0;
-      const badge = pending ? "" : done < total ? `${done}/${total}` : `${total}`;
-      const active = p.title === state.expandedPhase ? " active" : "";
-      const node = `<button class="flow-phase${done < total ? " in-progress" : ""}${pending ? " pending" : ""}${active}" data-phase-title="${escapeHtml(p.title)}" aria-expanded="${active ? "true" : "false"}">
+// While agents are still in flight, a phase shows completed/total (x/y); otherwise just the count.
+// A declared phase with no agents yet is "pending".
+function phaseBadge(p) {
+  const total = p.agents.length;
+  const done = p.agents.filter((a) => a.status !== "running").length;
+  const pending = total === 0;
+  return { total, done, pending, inProgress: done < total, badge: pending ? "" : done < total ? `${done}/${total}` : `${total}` };
+}
+
+function railNodeHtml(p) {
+  const { pending, inProgress, badge } = phaseBadge(p);
+  const active = p.title === state.expandedPhase ? " active" : "";
+  return `<button class="flow-phase${inProgress ? " in-progress" : ""}${pending ? " pending" : ""}${active}" data-phase-title="${escapeHtml(p.title)}" aria-expanded="${active ? "true" : "false"}">
         <span class="fp-dot"></span>
         <span class="fp-name">${escapeHtml(p.title)}</span>
         ${pending ? "" : `<span class="fp-count">${badge}</span>`}
         <span class="fp-chev">▾</span>
       </button>`;
-      return i < phases.length - 1 ? node + `<span class="flow-link"></span>` : node;
-    })
-    .join("");
+}
+
+// A pending phase is pre-rendered so the whole pipeline is visible before it runs (its agent nodes
+// can't be: their count/labels are decided at runtime).
+function renderRailNodes(phases) {
+  return phases.map((p, i) => (i < phases.length - 1 ? railNodeHtml(p) + `<span class="flow-link"></span>` : railNodeHtml(p))).join("");
+}
+
+function renderFlowSection(phases) {
+  if (!phases.length) return `<div class="muted-note">No agents recorded yet.</div>`;
   return `<div class="section-label">Pipeline</div>
     <div class="flow" id="flow">
-      <div class="flow-rail">${rail}</div>
+      <div class="flow-rail">${renderRailNodes(phases)}</div>
       <div class="flow-expansion" id="flow-expansion" hidden></div>
     </div>`;
 }
@@ -387,15 +402,28 @@ function filterAgents(p) {
   return { filtered, visible: filtered.slice(0, 180) };
 }
 
+// Every node carries `data-key` (so the live-tick reconciler can locate it); live (not-yet-journaled)
+// nodes get `data-live` instead of being keyless — that flag, not the absence of a key, is what makes
+// them non-clickable. nodeClassName / nodeInner are shared by the HTML and DOM-creation paths so the
+// two never drift.
+function nodeClassName(a) {
+  return `flow-node ${a.status}${a.live ? " pending" : ""}`;
+}
+
+function nodeTitle(a) {
+  return a.resultPreview || a.label;
+}
+
+function nodeInner(a) {
+  return `<span class="fn-dot ${a.status}"></span><span class="fn-label">${escapeHtml(a.label)}</span>`;
+}
+
+function fanNodeHtml(a, delayMs) {
+  return `<button class="${nodeClassName(a)}" data-key="${escapeHtml(a.key)}"${a.live ? ' data-live="1"' : ""} title="${escapeHtml(nodeTitle(a))}"${delayMs != null ? ` style="animation-delay:${delayMs}ms"` : ""}>${nodeInner(a)}</button>`;
+}
+
 function fanNodesHtml(visible) {
-  const nodes = visible
-    .map(
-      (a, i) => `<button class="flow-node ${a.status}${a.live ? " pending" : ""}" ${a.live ? "" : `data-key="${escapeHtml(a.key)}"`} title="${escapeHtml(a.resultPreview || a.label)}" style="animation-delay:${Math.min(i * 12, 300)}ms">
-        <span class="fn-dot ${a.status}"></span>
-        <span class="fn-label">${escapeHtml(a.label)}</span>
-      </button>`,
-    )
-    .join("");
+  const nodes = visible.map((a, i) => fanNodeHtml(a, Math.min(i * 12, 300))).join("");
   return nodes || '<div class="muted-note">No matching agents.</div>';
 }
 
@@ -426,8 +454,10 @@ function renderFan(p) {
     </div>`;
 }
 
-// Live filter update: rebuild only the grid/summary/note, never the <input>. Recreating the input
-// mid-keystroke would abort an in-progress IME composition (Chinese/Japanese/Korean never commits).
+// Live filter update: reconcile the grid in place (never the <input> — recreating it mid-keystroke
+// would abort an in-progress IME composition so Chinese/Japanese/Korean never commits), and update
+// the summary/note. Reconciling (vs innerHTML rebuild) keeps surviving nodes from re-firing their
+// entrance animation on every keystroke.
 function applyAgentFilter() {
   if (!state.expandedPhase) return;
   const phase = mergedPhases().find((p) => p.title === state.expandedPhase);
@@ -437,12 +467,12 @@ function applyAgentFilter() {
   const summary = exp.querySelector(".fan-summary");
   if (summary) summary.innerHTML = fanSummaryHtml(filtered, phase);
   const grid = exp.querySelector(".fan-grid");
-  if (grid) grid.innerHTML = fanNodesHtml(visible);
+  const layoutChanged = reconcileFanGrid(grid, visible);
   const note = exp.querySelector(".fan-note");
   const noteHtml = fanNoteHtml(filtered, visible);
   if (note) note.remove();
   if (noteHtml && grid) grid.insertAdjacentHTML("afterend", noteHtml);
-  drawFan();
+  if (layoutChanged) drawFan();
 }
 
 function togglePhase(title) {
@@ -518,15 +548,193 @@ function drawFan() {
   svg.innerHTML = paths;
 }
 
-// Re-render the flow (merged journal + live agents) and restore the open phase + its fan.
-function refreshFlow() {
-  const section = el("flow-section");
-  if (!section) return;
-  const open = state.expandedPhase;
+/* ---- Incremental live update: patch head stats + flow IN PLACE, keyed by agent key, instead of
+   tearing down and re-animating the whole view on every 350ms refetch tick. ---- */
+
+// Builds a fresh fan-node element. New nodes get the default 0ms animation-delay so a genuinely new
+// agent fades in once (desirable) — only re-creation re-fires the animation, which we now avoid for
+// existing nodes.
+function createFanNode(a) {
+  const node = document.createElement("button");
+  node.className = nodeClassName(a);
+  node.dataset.key = a.key;
+  if (a.live) node.dataset.live = "1";
+  node.title = nodeTitle(a);
+  node.innerHTML = nodeInner(a);
+  return node;
+}
+
+// Patches an existing fan node in place — flips status classes / dot / label and live→clickable —
+// without recreating the element, so the `rise` animation does NOT replay.
+function updateFanNode(node, a) {
+  const cls = nodeClassName(a);
+  if (node.className !== cls) node.className = cls;
+  if (a.live) node.dataset.live = "1";
+  else if (node.dataset.live) delete node.dataset.live;
+  const title = nodeTitle(a);
+  if (node.title !== title) node.title = title;
+  const dot = node.querySelector(".fn-dot");
+  const dotCls = `fn-dot ${a.status}`;
+  if (dot && dot.className !== dotCls) dot.className = dotCls;
+  const label = node.querySelector(".fn-label");
+  if (label && label.textContent !== a.label) label.textContent = a.label;
+}
+
+// Reconcile the fan grid's node elements against `visible` IN PLACE, keyed by agent key: update
+// survivors, create new nodes, drop gone ones, and fix order. Returns true iff node membership/order
+// changed (→ the SVG fan-out needs a redraw; a pure status flip leaves every node's position intact).
+function reconcileFanGrid(grid, visible) {
+  if (!grid) return false;
+  if (visible.length === 0) {
+    const had = grid.querySelector(".flow-node");
+    grid.innerHTML = '<div class="muted-note">No matching agents.</div>';
+    return Boolean(had);
+  }
+  const placeholder = grid.querySelector(".muted-note");
+  if (placeholder) placeholder.remove();
+
+  const existing = new Map();
+  for (const node of grid.querySelectorAll(".flow-node")) existing.set(node.dataset.key, node);
+
+  let layoutChanged = false;
+  visible.forEach((a, i) => {
+    let node = existing.get(a.key);
+    if (node) {
+      updateFanNode(node, a);
+      existing.delete(a.key);
+    } else {
+      node = createFanNode(a);
+      layoutChanged = true;
+    }
+    const current = grid.children[i];
+    if (current !== node) {
+      grid.insertBefore(node, current || null);
+      layoutChanged = true;
+    }
+  });
+  for (const node of existing.values()) {
+    node.remove();
+    layoutChanged = true;
+  }
+  return layoutChanged;
+}
+
+// Patches a rail phase button's badge + in-progress/pending classes in place. Leaves `active`
+// untouched — that's owned by expand/collapse.
+function updateRailNode(btn, p) {
+  const { pending, inProgress, badge } = phaseBadge(p);
+  btn.classList.toggle("in-progress", inProgress);
+  btn.classList.toggle("pending", pending);
+  let count = btn.querySelector(".fp-count");
+  if (pending) {
+    if (count) count.remove();
+  } else {
+    if (!count) {
+      count = document.createElement("span");
+      count.className = "fp-count";
+      btn.insertBefore(count, btn.querySelector(".fp-chev"));
+    }
+    if (count.textContent !== badge) count.textContent = badge;
+  }
+}
+
+// Reconcile the pipeline rail. Same phase set/order → patch each badge in place; a changed set
+// (rare: a new phase title appears mid-run) → rebuild just `.flow-rail` (cheap, no entrance
+// animation), leaving the sibling expansion panel alone.
+function patchRail(phases) {
+  const rail = el("flow")?.querySelector(".flow-rail");
+  if (!rail) return;
+  const current = [...rail.querySelectorAll(".flow-phase")];
+  const newTitles = phases.map((p) => p.title);
+  const sameSet = current.length === newTitles.length && current.every((b, i) => b.dataset.phaseTitle === newTitles[i]);
+  if (!sameSet) {
+    rail.innerHTML = renderRailNodes(phases);
+    if (state.expandedPhase) {
+      const btn = [...rail.querySelectorAll(".flow-phase")].find((b) => b.dataset.phaseTitle === state.expandedPhase);
+      if (btn) {
+        btn.classList.add("active");
+        btn.setAttribute("aria-expanded", "true");
+      }
+    }
+    return;
+  }
+  const byTitle = new Map(current.map((b) => [b.dataset.phaseTitle, b]));
+  for (const p of phases) {
+    const btn = byTitle.get(p.title);
+    if (btn) updateRailNode(btn, p);
+  }
+}
+
+// Reconcile the currently-open fan: hub count, summary, note, the keyed node grid, and the
+// compact-grid threshold. Only redraws the SVG when node layout actually changed.
+function patchOpenFan(phases) {
+  if (!state.expandedPhase) return;
+  const exp = el("flow-expansion");
+  if (!exp || exp.hidden) return;
+  const phase = phases.find((p) => p.title === state.expandedPhase);
+  if (!phase) {
+    togglePhase(state.expandedPhase); // the expanded phase vanished (shouldn't happen mid-run) — collapse
+    return;
+  }
+  const hubCount = exp.querySelector(".fan-hub .fh-count");
+  if (hubCount) hubCount.textContent = `${phase.agents.length} agent${phase.agents.length === 1 ? "" : "s"}`;
+
+  const { filtered, visible } = filterAgents(phase);
+  const summary = exp.querySelector(".fan-summary");
+  if (summary) summary.innerHTML = fanSummaryHtml(filtered, phase);
+
+  const grid = exp.querySelector(".fan-grid");
+  let layoutChanged = reconcileFanGrid(grid, visible);
+  if (grid) {
+    const wantCompact = phase.agents.length > 48; // mirrors renderFan(): compact grid past 48 nodes
+    if (grid.classList.contains("compact") !== wantCompact) {
+      grid.classList.toggle("compact", wantCompact);
+      layoutChanged = true;
+    }
+  }
+
+  const note = exp.querySelector(".fan-note");
+  const noteHtml = fanNoteHtml(filtered, visible);
+  if (note) note.remove();
+  if (noteHtml && grid) grid.insertAdjacentHTML("afterend", noteHtml);
+
+  if (layoutChanged) {
+    drawFan();
+    requestAnimationFrame(drawFan);
+  }
+}
+
+// Reconcile the whole flow section incrementally. Falls back to a one-shot full render only when the
+// section hasn't been built yet (e.g. the first paint had zero agents).
+function patchFlow(phases) {
+  if (!el("flow")) {
+    const section = el("flow-section");
+    if (section) section.innerHTML = renderFlowSection(phases);
+    return;
+  }
+  patchRail(phases);
+  patchOpenFan(phases);
+}
+
+// Live-tick entry point (replaces a full renderRunView on every refetch): refresh the head stats +
+// status pill + flow IN PLACE. Logs are appended live in applyProgress; result/finish counts are
+// handled by the run-finished full render — so this path deliberately touches neither.
+function patchRunView(data) {
+  state.runData = data;
+  const { record, view } = data;
   const phases = mergedPhases();
-  section.innerHTML = renderFlowSection(phases);
-  state.expandedPhase = null;
-  if (open != null && phases.some((phase) => phase.title === open)) expandPhase(open);
+  const visibleAgentCount = phases.reduce((sum, p) => sum + p.agents.length, 0);
+  const statsBox = $(".rv-stats");
+  if (statsBox) statsBox.innerHTML = renderHeadStats(record, view.stats, visibleAgentCount);
+  // Repaint the pill only on an actual status change — re-rendering it every tick would restart the
+  // running-dot blink so it never animates.
+  const pill = $(".rv-head .pill");
+  if (pill && !pill.classList.contains(record.status)) {
+    pill.className = `pill ${record.status}`;
+    pill.innerHTML = `<span class="status-dot ${record.status}"></span>${escapeHtml(record.status)}`;
+  }
+  setLiveActive(record.status === "running");
+  patchFlow(phases);
 }
 
 /* ----------------------------- Drawer (agent detail) ----------------------------- */
@@ -747,13 +955,34 @@ function scheduleRefetch() {
     if (!state.selectedRunId) return;
     try {
       const data = await fetchJSON(`/api/runs/${encodeURIComponent(state.selectedRunId)}`);
-      state.runData = data;
-      // Re-render the whole run view so status, elapsed duration, stats, logs, result, and flow stay fresh.
-      renderRunView(data, { preserveExpanded: true });
+      // Incremental: patch head stats + flow in place (keyed by agent key) — never tear down and
+      // re-animate the whole agent fan on every tick.
+      patchRunView(data);
     } catch {
       /* ignore transient errors during a live run */
     }
   }, 350);
+}
+
+// Backstop poll: while a running run is open, refetch on a low-frequency timer so the view self-heals
+// if a live event was missed — e.g. a standalone `serve` that raced the producer deleting the events
+// file and never saw `run-finished`. Push (the SSE tailer) keeps it snappy; this only guarantees
+// eventual consistency. Correctness rides on the disk record/journal, never on event delivery.
+async function pollRunning() {
+  if (!state.selectedRunId) return;
+  let data;
+  try {
+    data = await fetchJSON(`/api/runs/${encodeURIComponent(state.selectedRunId)}`);
+  } catch {
+    return; // transient — try again on the next tick
+  }
+  if (data.record.status === "running") {
+    patchRunView(data);
+  } else {
+    // Finished without us hearing run-finished — do the full finish render (result + final counts).
+    selectRun(state.selectedRunId, false);
+    loadRuns();
+  }
 }
 
 /* ----------------------------- Events / routing ----------------------------- */
@@ -771,7 +1000,7 @@ document.addEventListener("click", (e) => {
   if (runBtn) return selectRun(runBtn.dataset.run);
 
   const node = e.target.closest(".flow-node");
-  if (node) return node.dataset.key ? openDrawer(node.dataset.key) : undefined; // live nodes have no detail yet
+  if (node) return node.dataset.live ? undefined : openDrawer(node.dataset.key); // live nodes have no detail yet
 
   const phase = e.target.closest(".flow-phase");
   if (phase) return togglePhase(phase.dataset.phaseTitle);

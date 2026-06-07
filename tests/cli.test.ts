@@ -81,6 +81,50 @@ test("CLI validate / run --json / runs / show end-to-end (no tokens)", async () 
   }
 });
 
+test("CLI resume re-runs a recorded run by id, restoring args and reusing the journal cache", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-"));
+  try {
+    const wfPath = path.join(dir, "cli_demo.js");
+    await writeFile(wfPath, WORKFLOW, "utf8");
+
+    // Initial run with args — agents run fresh (no cache).
+    const run = await runCli(["run", wfPath, "--args", '{"who":"Ada"}', "--json", "--cwd", dir], dir);
+    assert.equal(run.code, 0, run.stderr);
+    const first = JSON.parse(run.stdout) as {
+      runId: string;
+      result: { who: string };
+      stats: { agentCount: number; cacheHits: number };
+    };
+    assert.equal(first.result.who, "Ada");
+    assert.equal(first.stats.cacheHits, 0);
+
+    // Resume by id ONLY — no file path, no --args. args is restored from the record and every agent
+    // is served from the journal (cacheHits === agentCount).
+    const resumed = await runCli(["resume", first.runId, "--json", "--cwd", dir], dir);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    const second = JSON.parse(resumed.stdout) as {
+      runId: string;
+      result: { who: string };
+      stats: { agentCount: number; cacheHits: number };
+    };
+    assert.equal(second.runId, first.runId);
+    assert.equal(second.result.who, "Ada");
+    assert.equal(second.stats.cacheHits, second.stats.agentCount);
+
+    // --args overrides the recorded args.
+    const overridden = await runCli(["resume", first.runId, "--args", '{"who":"Grace"}', "--json", "--cwd", dir], dir);
+    assert.equal(overridden.code, 0, overridden.stderr);
+    assert.equal((JSON.parse(overridden.stdout) as { result: { who: string } }).result.who, "Grace");
+
+    // Unknown run id → clean error, exit 1.
+    const missing = await runCli(["resume", "wf_does-not-exist", "--cwd", dir], dir);
+    assert.equal(missing.code, 1);
+    assert.match(missing.stderr, /not found/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("CLI list discovers project workflows by name, including TypeScript files", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-list-"));
   try {

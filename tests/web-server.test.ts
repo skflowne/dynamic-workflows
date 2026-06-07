@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, mkdir, writeFile, utimes, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, appendFile, utimes, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createWebServer } from "../src/web/server.js";
+import { RunEventLog, runEventsPath } from "../src/web/event-log.js";
 import type { RunRecord } from "../src/run-store.js";
 import type { WorkflowJournalEntry } from "../src/types.js";
 
@@ -150,6 +151,92 @@ test("broadcast pushes live progress events to SSE subscribers (in-process path)
     assert.equal(events.json[0].event.message, "hello-sse");
   } finally {
     ac.abort();
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("server tails a run's events file: initial scan, fs.watch, and drainRun", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-tail-"));
+  const dataDir = path.join(cwd, ".codex-workflow");
+  const server = createWebServer({ cwd, version: "9.9.9" });
+  try {
+    const runId = "wf_tail";
+    const runsDirPath = path.join(dataDir, "runs");
+    await mkdir(runsDirPath, { recursive: true });
+    const record: RunRecord = { runId, name: "tail", status: "running", source: "scriptPath", startedAt: START };
+    await writeFile(path.join(runsDirPath, `${runId}.json`), JSON.stringify(record), "utf8");
+
+    // One event present BEFORE the server starts — the initial scan in listen() must ingest it.
+    const eventsPath = runEventsPath(dataDir, runId);
+    const line = (event: object) => `${JSON.stringify(event)}\n`;
+    await writeFile(eventsPath, line({ runId, type: "progress", event: { type: "log", message: "before" } }), "utf8");
+
+    const bound = await server.listen(0);
+    const base = bound.url;
+
+    const detail = await get(`${base}/api/runs/${runId}`);
+    assert.equal(detail.json.live.length, 1, "initial scan should ingest the pre-existing event");
+    assert.equal(detail.json.live[0].event.message, "before");
+
+    // Append while running — fs.watch should tail it (poll the replay buffer with a deadline).
+    await appendFile(eventsPath, line({ runId, type: "progress", event: { type: "log", message: "during" } }), "utf8");
+    const deadline = Date.now() + 3000;
+    let events: any[] = [];
+    while (Date.now() < deadline) {
+      events = (await get(`${base}/api/runs/${runId}/events`)).json;
+      if (events.length >= 2) break;
+    }
+    assert.equal(events.length, 2, "fs.watch should have tailed the appended line");
+    assert.equal(events[1].event.message, "during");
+
+    // drainRun ingests a freshly-appended line deterministically, without depending on fs.watch.
+    await appendFile(eventsPath, line({ runId, type: "run-finished", status: "completed" }), "utf8");
+    await server.drainRun(runId);
+    events = (await get(`${base}/api/runs/${runId}/events`)).json;
+    assert.equal(events.length, 3);
+    assert.equal(events[2].type, "run-finished");
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+// Regression guard for the in-process viewer: the producer (RunEventLog) and the server live in the
+// SAME process, exactly as `run` does. A held-open append stream's writes don't fire fs.watch on
+// macOS, which silently broke live updates — so this drives events through the REAL producer API
+// (not appendFile) and asserts the same-process server still tails them live.
+test("in-process: server tails events written through the real RunEventLog", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-inproc-"));
+  const dataDir = path.join(cwd, ".codex-workflow");
+  const server = createWebServer({ cwd, version: "9.9.9" });
+  const runId = "wf_inproc";
+  const log = new RunEventLog(runEventsPath(dataDir, runId));
+  try {
+    const runsDirPath = path.join(dataDir, "runs");
+    await mkdir(runsDirPath, { recursive: true });
+    const record: RunRecord = { runId, name: "inproc", status: "running", source: "scriptPath", startedAt: START };
+    await writeFile(path.join(runsDirPath, `${runId}.json`), JSON.stringify(record), "utf8");
+
+    await log.open();
+    log.append({ runId, type: "run-meta", record });
+    const bound = await server.listen(0);
+
+    // Emit progress through the producer API only — no manual file writes.
+    log.append({ runId, type: "progress", event: { type: "agent", key: "a1", label: "scope", phase: "Scope", state: "started" } });
+    log.append({ runId, type: "progress", event: { type: "log", message: "hello-inproc" } });
+
+    const deadline = Date.now() + 4000;
+    let events: any[] = [];
+    while (Date.now() < deadline) {
+      events = (await get(`${bound.url}/api/runs/${runId}/events`)).json;
+      if (events.length >= 3) break;
+    }
+    assert.equal(events.length, 3, "same-process server must tail RunEventLog appends (watch or poll)");
+    assert.equal(events[2].event.message, "hello-inproc");
+  } finally {
+    await log.close();
+    await log.remove();
     await server.close();
     await rm(cwd, { recursive: true, force: true });
   }

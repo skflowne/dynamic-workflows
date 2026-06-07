@@ -46,6 +46,7 @@ codex-workflow doctor
 
 ```text
 codex-workflow run <file|name> [options]   Run a workflow file or registered name
+codex-workflow resume <runId> [options]    Re-run a recorded run, reusing its cached agents
 codex-workflow list [--json]               List workflows from .claude/workflows and ~/.claude/workflows
 codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
 codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
@@ -58,6 +59,12 @@ codex-workflow doctor                      Check Bun, Codex CLI, auth, and the v
 project `.claude/workflows` and user `~/.claude/workflows`; file-like targets (`./x.js`, `x.ts`,
 etc.) are treated as paths and report a file-not-found error if missing.
 
+`resume <runId>` re-runs a previously recorded run: it reconstructs the script path / registered name
+**and** the original `args` straight from the run record, and reuses every completed `agent()` call
+from that run's journal cache (only failed/unrun agents re-execute). Pressing Ctrl-C during a run
+cancels it cleanly and prints the `resume` command to pick it back up. The run options below also
+apply to `resume` — pass `--args` (or any flag) there to override what was recorded.
+
 Run options:
 
 | Flag | Meaning |
@@ -67,7 +74,6 @@ Run options:
 | `--concurrency <n>` | Max concurrent agents (capped at 16) |
 | `--budget <tokens>` | Token budget (estimate) shared across the run |
 | `--max-agents <n>` | Hard cap on total `agent()` calls (default 1000) |
-| `--resume <runId>` | Reuse a prior run's journal cache |
 | `--cwd <dir>` | Working directory for agents |
 | `--sandbox <mode>` | `read-only` \| `workspace-write` \| `danger-full-access` |
 | `--approval <policy>` | `never` \| `on-request` \| `on-failure` \| `untrusted` |
@@ -176,7 +182,7 @@ Claude blocks `Date.now()` / `Math.random()` / `new Date()` inside workflow scri
 deterministic. **codex-workflow runs scripts as open, unrestricted TS/JS under Bun** — a Claude
 workflow is a runnable subset, and you may additionally use anything Bun/Node provide (imports, the
 filesystem, `Bun`, etc.). Resume is therefore *best-effort*: completed `agent()` calls are cached in a
-journal keyed by prompt+options+runId and reused on `--resume`, but non-deterministic script logic is
+journal keyed by prompt+options+runId and reused on `resume`, but non-deterministic script logic is
 not snapshotted.
 
 Codex structured output also requires stricter JSON Schema than Claude. The runner sends a strict

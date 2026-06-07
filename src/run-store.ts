@@ -1,5 +1,6 @@
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { AgentFailure } from "./types.js";
 import type { WorkflowSourceKind } from "./workflow-tool.js";
 
 export type RunRecordStatus = "running" | "completed" | "failed" | "cancelled";
@@ -18,6 +19,12 @@ export interface RunRecord {
   cacheHits?: number;
   /** Count of agents that failed after exhausting retries. */
   failureCount?: number;
+  /**
+   * Detail of agents that failed after exhausting retries. Failed agents are deliberately NOT
+   * journaled (so `--resume` re-attempts them), so this is the only place their detail is persisted —
+   * promoted here from the in-memory run result so the viewer can render them as historical nodes.
+   */
+  failures?: AgentFailure[];
   /** Declared pipeline (meta.phases titles, in order) — the canonical phase order for the viewer. */
   declaredPhases?: string[];
   phases?: string[];
@@ -77,10 +84,11 @@ export class FileRunStore {
   }
 
   private recordPath(runId: string): string {
-    return path.join(this.dir, `${sanitizeId(runId)}.json`);
+    return path.join(this.dir, `${sanitizeRunId(runId)}.json`);
   }
 }
 
-function sanitizeId(runId: string): string {
+/** Maps a runId to a filesystem-safe basename, shared by the record file and its live-events file. */
+export function sanitizeRunId(runId: string): string {
   return runId.replace(/[^A-Za-z0-9_.-]/g, "_");
 }

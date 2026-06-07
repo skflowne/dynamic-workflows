@@ -230,6 +230,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 /* live placeholder: dashed, muted, not clickable-looking */
 .flow-node.pending { cursor: default; border-style: dashed; border-color: var(--amber); background: var(--amber-soft); }
 .flow-node.pending .fn-label { color: var(--ink-2); font-style: italic; }
+.flow-node.failed { border-color: var(--red); background: var(--red-soft); }
 .flow-node .fn-label { font-size: 12.5px; font-weight: 520; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 

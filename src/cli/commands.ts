@@ -8,13 +8,14 @@ import { promisify } from "node:util";
 import { CodexSdkAgentRunner, type CodexSdkAgentRunnerOptions } from "../runners/codex-sdk.js";
 import type { SandboxMode, ThreadOptions } from "@openai/codex-sdk";
 import { defaultWorkflowDirs, WorkflowController } from "../controller.js";
-import { WorkflowInputError } from "../errors.js";
+import { WorkflowAbortError, WorkflowInputError } from "../errors.js";
 import { parseWorkflowScript } from "../parser.js";
 import { FileRunStore, type RunRecord } from "../run-store.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner, WorkflowProgressEvent } from "../types.js";
 import { WorkflowRegistry, type WorkflowInput } from "../workflow-tool.js";
 import { ProgressRenderer, type ProgressMode } from "./progress.js";
 import { createWebServer, type WorkflowWebServer } from "../web/server.js";
+import { RunEventLog, runEventsPath } from "../web/event-log.js";
 import { openBrowser, pickPort } from "../web/launcher.js";
 import { workflowDataDir, runsDir, journalDir } from "../paths.js";
 
@@ -28,7 +29,6 @@ export interface RunFlags {
   "max-agents"?: string;
   "agent-retries"?: string;
   "agent-timeout"?: string;
-  resume?: string;
   cwd?: string;
   sandbox?: string;
   approval?: string;
@@ -57,6 +57,61 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   }
 
   const cwd = path.resolve(flags.cwd ?? process.cwd());
+  let input: WorkflowInput;
+  try {
+    input = await buildRunInput(target, cwd, flags);
+  } catch (error) {
+    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+  return executeRun(input, `wf_${randomId()}`, cwd, flags);
+}
+
+/**
+ * `codex-workflow resume <runId>` — re-run a recorded run, reusing its journal cache. Reconstructs the
+ * workflow input (script path / registered name + the original `args`) straight from the saved run record,
+ * so the user need not re-type the file path or `--args`. CLI flags (`--args`, `--model`, …) still override.
+ */
+export async function resumeCommand(runId: string | undefined, flags: RunFlags): Promise<number> {
+  if (!runId) {
+    process.stderr.write("error: `resume` requires a runId\n");
+    return 2;
+  }
+  const cwd = path.resolve(flags.cwd ?? process.cwd());
+  const record = await new FileRunStore(runsDir(workflowDataDir())).get(runId);
+  if (!record) {
+    process.stderr.write(`error: run ${runId} not found (see \`codex-workflow runs\`)\n`);
+    return 1;
+  }
+
+  let input: WorkflowInput;
+  if (record.source === "named") {
+    input = { name: record.name };
+  } else if (record.scriptPath) {
+    input = { scriptPath: record.scriptPath };
+  } else {
+    process.stderr.write(`error: run ${runId} was an inline workflow with no saved script — cannot resume from the CLI\n`);
+    return 1;
+  }
+
+  // --args overrides the recorded args; without it, executeRun inherits the run record's stored args.
+  let override: unknown;
+  try {
+    override = await parseArgsValue(flags.args, cwd);
+  } catch (error) {
+    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+  if (override !== undefined) input.args = override;
+
+  return executeRun(input, runId, cwd, flags);
+}
+
+/**
+ * Shared run engine behind `run` and `resume`: sets up the journal-resume run id, the run record, the
+ * in-process viewer, Ctrl-C handling, and the controller, then executes and persists the outcome.
+ */
+async function executeRun(input: WorkflowInput, runId: string, cwd: string, flags: RunFlags): Promise<number> {
   const json = flags.json === true;
   const mode: ProgressMode = json || flags.quiet ? "silent" : flags["no-progress"] ? "plain" : "pretty";
   const renderer = new ProgressRenderer(mode);
@@ -67,15 +122,17 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   const runner = buildAgentRunner(cwd, flags);
   const runStore = new FileRunStore(runsDir(dataDir));
 
-  let input: WorkflowInput;
-  try {
-    input = await buildRunInput(target, cwd, flags);
-  } catch (error) {
-    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
-  }
-  const runId = flags.resume ?? `wf_${randomId()}`;
   input.resumeFromRunId = runId;
+
+  // A re-run (resume) inherits the recorded run's args unless this invocation overrides them. The
+  // workflow script is the deterministic orchestrator and is re-executed from the top on resume; it
+  // needs its original inputs to reproduce the same agent() calls (same prompts → same journal cache
+  // keys → cache hits). Inheriting here means the stored args are never silently dropped — and are
+  // re-persisted into the record below, so they survive every subsequent resume.
+  if (input.args === undefined) {
+    const prior = await runStore.get(runId);
+    if (prior?.args !== undefined) input.args = prior.args;
+  }
 
   // Surface the declared pipeline (meta.phases, in order) so the viewer can order and pre-render the
   // phases before any agent runs — independent of which phases the script actually enters via phase().
@@ -94,9 +151,17 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
   };
   await runStore.save(baseRecord);
 
-  // In-process viewer: each run binds its own server on a random (OS-assigned) port and broadcasts
-  // progress straight into it — no detached daemon, no shared singleton (skipped for --json machine
-  // output and --no-web). All viewer I/O is best-effort: a failed viewer must never break the run.
+  // Live-event bus: every progress event is appended to `runs/<id>.events.jsonl` as the single
+  // cross-process liveness transport. Any server — this run's in-process viewer AND a standalone
+  // `serve` — tails that file and fans events to its SSE clients. The file is deleted once the run
+  // ends (its durable content is promoted into the run record). Best-effort: never breaks the run.
+  const eventLog = new RunEventLog(runEventsPath(dataDir, runId));
+  await eventLog.open();
+  eventLog.append({ runId, type: "run-meta", record: baseRecord });
+
+  // In-process viewer: each run binds its own server on a random (OS-assigned) port (skipped for
+  // --json machine output and --no-web). It tails the events file like any other server. All viewer
+  // I/O is best-effort: a failed viewer must never break the run.
   const webEnabled = !json && flags["no-web"] !== true;
   let server: WorkflowWebServer | undefined;
   let viewerUrl: string | undefined;
@@ -107,7 +172,6 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
       viewerUrl = bound.url;
       process.stderr.write(`${dim("▸")} Viewer: ${bold(`${bound.url}/runs/${runId}`)}\n`);
       if (flags.open) openBrowser(`${bound.url}/runs/${runId}`);
-      server.broadcast({ runId, type: "run-meta", record: baseRecord });
     } catch (error) {
       server = undefined;
       viewerUrl = undefined;
@@ -117,13 +181,47 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
 
   const onProgress = (event: WorkflowProgressEvent): void => {
     renderer.handle(event);
-    server?.broadcast({ runId, type: "progress", event });
+    eventLog.append({ runId, type: "progress", event });
+  };
+
+  // Terminal handshake: append the run-finished event, flush+close the stream, let this process's own
+  // server drain it to EOF (so its SSE clients get run-finished regardless of fs.watch timing), then
+  // delete the now-redundant file. A remote `serve` self-heals via the client's backstop poll.
+  const finishEvents = async (event: Record<string, unknown>): Promise<void> => {
+    eventLog.append({ runId, ...event });
+    await eventLog.close();
+    await server?.drainRun(runId);
+    await eventLog.remove();
+  };
+
+  // Ctrl-C handling: the first signal aborts the workflow (the runtime winds down in-flight Codex
+  // threads, then controller.run() rejects with WorkflowAbortError → the cancel branch below). A second
+  // signal during winddown force-quits. Handlers are removed before finishViewer so the lingering-viewer
+  // gets its own clean SIGINT handler.
+  const abort = new AbortController();
+  let interrupted = false;
+  const onInterrupt = (): void => {
+    if (interrupted) {
+      process.stderr.write(`\n${yellow("⊘")} Force quit.\n`);
+      process.exit(130);
+    }
+    interrupted = true;
+    abort.abort();
+    renderer.finish();
+    process.stderr.write(`\n${yellow("⊘")} Interrupting — winding down running agents (Ctrl-C again to force quit)…\n`);
+  };
+  process.on("SIGINT", onInterrupt);
+  process.on("SIGTERM", onInterrupt);
+  const clearInterruptHandlers = (): void => {
+    process.off("SIGINT", onInterrupt);
+    process.off("SIGTERM", onInterrupt);
   };
 
   const controller = new WorkflowController({
     cwd,
     runner,
     onProgress,
+    signal: abort.signal,
     persistDir: runsDir(dataDir),
     journalDir: journalDir(dataDir),
     ...numericFlag("concurrency", flags.concurrency),
@@ -136,6 +234,7 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
 
   try {
     const output = await controller.run(input);
+    clearInterruptHandlers();
     renderer.finish();
     await runStore.save({
       ...baseRecord,
@@ -148,12 +247,15 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
       agentCount: output.stats.agentCount,
       cacheHits: output.stats.cacheHits,
       failureCount: output.stats.failures.length,
+      // Promote failure detail into the record — the events file (its only other home) is about to be
+      // deleted, and failed agents are never journaled, so this is where the viewer reads them from.
+      ...(output.stats.failures.length ? { failures: output.stats.failures } : {}),
       phases: output.stats.phases,
       logs: output.stats.logs,
       result: output.result,
       ...(output.scriptPath ? { scriptPath: output.scriptPath } : {}),
     });
-    server?.broadcast({ runId, type: "run-finished", status: "completed" });
+    await finishEvents({ type: "run-finished", status: "completed" });
 
     if (json) {
       process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
@@ -163,10 +265,19 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
     }
     return finishViewer(server, viewerUrl, runId, 0);
   } catch (error) {
+    clearInterruptHandlers();
     renderer.finish();
+    if (interrupted || error instanceof WorkflowAbortError) {
+      await runStore.save({ ...baseRecord, status: "cancelled", completedAt: Date.now() });
+      await finishEvents({ type: "run-finished", status: "cancelled" });
+      process.stderr.write(`\n${yellow("⊘")} Cancelled ${dim(`(${runId})`)} — partial progress saved.\n`);
+      process.stderr.write(`${dim(`  Resume (reuse completed agents): codex-workflow resume ${runId}`)}\n`);
+      if (server) await server.close();
+      return 130;
+    }
     const message = error instanceof Error ? error.message : String(error);
     await runStore.save({ ...baseRecord, status: "failed", completedAt: Date.now(), error: message });
-    server?.broadcast({ runId, type: "run-finished", status: "failed", error: message });
+    await finishEvents({ type: "run-finished", status: "failed", error: message });
     process.stderr.write(`\nworkflow failed: ${message}\n`);
     return finishViewer(server, viewerUrl, runId, 1);
   }
@@ -314,7 +425,7 @@ export async function showCommand(runId: string | undefined, flags: { cwd?: stri
   if (record.scriptPath) process.stdout.write(`  script: ${record.scriptPath}\n`);
   if (record.durationMs !== undefined) process.stdout.write(`  duration: ${(record.durationMs / 1000).toFixed(1)}s\n`);
   if (record.agentCount !== undefined) process.stdout.write(`  agents: ${record.agentCount} (cache hits: ${record.cacheHits ?? 0})\n`);
-  if (record.failureCount) process.stdout.write(`  ${yellow(`failed agents: ${record.failureCount}`)} (use --resume ${record.runId} to re-attempt)\n`);
+  if (record.failureCount) process.stdout.write(`  ${yellow(`failed agents: ${record.failureCount}`)} (use \`resume ${record.runId}\` to re-attempt)\n`);
   if (record.phases?.length) process.stdout.write(`  phases: ${record.phases.join(" → ")}\n`);
   if (record.error) process.stdout.write(`  ${red(`error: ${record.error}`)}\n`);
   if (record.logs?.length) {
@@ -532,10 +643,10 @@ function printRunSummary(
   );
   if (scriptPath) {
     process.stderr.write(`${dim(`  Iterate: edit ${scriptPath} then re-run`)}\n`);
-    process.stderr.write(`${dim(`  Resume (reuse cached agents): codex-workflow run ${scriptPath} --resume ${runId}`)}\n`);
   }
+  process.stderr.write(`${dim(`  Resume (reuse completed agents): codex-workflow resume ${runId}`)}\n`);
   if (failed > 0) {
-    process.stderr.write(`${dim(`  ${failed} agent(s) failed — --resume ${runId} will re-attempt them.`)}\n`);
+    process.stderr.write(`${dim(`  ${failed} agent(s) failed — \`resume ${runId}\` will re-attempt them.`)}\n`);
   }
   process.stderr.write("\n");
 }

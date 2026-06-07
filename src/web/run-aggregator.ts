@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import type { RunRecord } from "../run-store.js";
-import type { WorkflowJournalEntry } from "../types.js";
+import type { AgentFailure, WorkflowJournalEntry } from "../types.js";
 
 /**
  * Turns a {@link RunRecord} + its journal entries into the shape the web overview renders: agents
@@ -9,7 +9,7 @@ import type { WorkflowJournalEntry } from "../types.js";
  * Pure and synchronous so it's trivially unit-testable; the I/O lives in {@link readJournalEntries}.
  */
 
-export type AgentStatus = "confirmed" | "killed" | "ok";
+export type AgentStatus = "confirmed" | "killed" | "ok" | "failed";
 
 export interface AgentView {
   key: string;
@@ -43,9 +43,15 @@ const UNGROUPED = "Other";
 const PREVIEW_CHARS = 220;
 
 export function buildRunView(record: RunRecord, entries: WorkflowJournalEntry[]): RunView {
-  const agents = entries
-    .map(toAgentView)
-    .sort((a, b) => a.createdAt - b.createdAt);
+  const journalAgents = entries.map(toAgentView);
+  // Failed agents are not journaled (so --resume re-attempts them); fold their detail in from the
+  // record so the flow shows them as historical "failed" nodes. Skip any whose key is somehow already
+  // present, and order by ordinal-after-start so they interleave roughly when they happened.
+  const seen = new Set(journalAgents.map((a) => a.key));
+  const failureAgents = (record.failures ?? [])
+    .filter((failure) => !seen.has(failure.key))
+    .map((failure) => failureToAgentView(failure, record.startedAt));
+  const agents = [...journalAgents, ...failureAgents].sort((a, b) => a.createdAt - b.createdAt);
 
   // Seed the declared pipeline first so phases render in their authoritative meta.phases order — NOT
   // the order phase() happened to be called (a workflow may set a phase via an agent's `phase:` option
@@ -95,6 +101,20 @@ function toAgentView(entry: WorkflowJournalEntry): AgentView {
     hasSchema: Boolean(entry.options.schema),
     hasSession: Boolean(entry.sessionId),
     ...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
+  };
+}
+
+function failureToAgentView(failure: AgentFailure, startedAt: number): AgentView {
+  return {
+    key: failure.key,
+    label: failure.label,
+    ...(failure.phase ? { phase: failure.phase } : {}),
+    // No real timestamp (failures aren't journaled); derive an ordering key from the 1-based ordinal.
+    createdAt: (startedAt ?? 0) + failure.index,
+    status: "failed",
+    resultPreview: preview(failure.error),
+    hasSchema: false,
+    hasSession: false,
   };
 }
 

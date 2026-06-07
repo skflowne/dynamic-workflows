@@ -22,6 +22,8 @@ export class ProgressRenderer {
   private completed = 0;
   private failed = 0;
   private statusActive = false;
+  /** Phases already given a header — so a phase carried only on agent `{phase}` options is shown once. */
+  private readonly seenPhases = new Set<string>();
   private readonly color: boolean;
 
   constructor(
@@ -35,8 +37,8 @@ export class ProgressRenderer {
     if (this.mode === "silent") return;
     switch (event.type) {
       case "phase":
-        this.print("");
-        this.print(this.paint(`▸ ${event.title}`, "bold"));
+        // An explicit phase() call always prints (so loop-style workflows show each re-entry).
+        this.printPhaseHeader(event.title);
         break;
       case "log":
         this.print(this.paint(`  ${event.message}`, "dim"));
@@ -47,7 +49,18 @@ export class ProgressRenderer {
     }
   };
 
+  private printPhaseHeader(title: string): void {
+    this.print("");
+    this.print(this.paint(`▸ ${title}`, "bold"));
+    this.seenPhases.add(title);
+  }
+
   private handleAgent(event: Extract<WorkflowProgressEvent, { type: "agent" }>): void {
+    // Phases set via an agent's `{phase}` option (inside parallel()/pipeline(), where phase() would
+    // race) never emit a phase event — surface them here, once, so the header tracks real progress
+    // instead of being stuck on the last phase() call.
+    if (event.phase && !this.seenPhases.has(event.phase)) this.printPhaseHeader(event.phase);
+
     if (event.state === "started") {
       this.running++;
       this.renderStatus(event.label);

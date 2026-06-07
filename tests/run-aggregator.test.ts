@@ -91,3 +91,27 @@ test("buildRunView derives killed status and result previews", () => {
   assert.equal(a.status, "killed");
   assert.ok(a.resultPreview.includes("refuted"));
 });
+
+test("buildRunView folds record.failures in as failed nodes bucketed by phase", () => {
+  // A failed agent is never journaled, so it only reaches the view via record.failures.
+  const entries = [entry({ key: "ok1", createdAt: 2, options: { label: "scope", phase: "Scope" } })];
+  const record: RunRecord = {
+    ...RECORD,
+    phases: ["Scope", "Verify"],
+    failureCount: 1,
+    failures: [{ label: "v0:claim", phase: "Verify", index: 3, key: "boom", attempts: 3, error: "Codex turn timed out" }],
+  };
+
+  const view = buildRunView(record, entries);
+
+  const verify = view.phases.find((p) => p.title === "Verify");
+  assert.ok(verify);
+  assert.equal(verify.agents.length, 1);
+  const failed = verify.agents[0];
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.key, "boom");
+  assert.equal(failed.hasSession, false);
+  assert.ok(failed.resultPreview.includes("timed out"));
+  // It also appears in the flat list, ordered by its ordinal-after-start (start 1000 + index 3).
+  assert.ok(view.agents.some((a) => a.key === "boom"));
+});

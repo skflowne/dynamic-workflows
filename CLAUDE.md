@@ -74,7 +74,7 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   → `n+1`). Schema-validation failures are retryable too. On exhaustion it records the failure on
   `state.failures` and returns `null` — so the Claude `.filter(Boolean)` idiom works. Abort/cap/budget
   errors are thrown *before* the loop and never become `null`. Failed agents are **not journaled**, so
-  `--resume` re-attempts them. Failures surface as `WorkflowRunResult.failures` / `WorkflowOutput.stats.failures`.
+  `resume` re-attempts them. Failures surface as `WorkflowRunResult.failures` / `WorkflowOutput.stats.failures`.
 - **`budget.spent()` uses real output tokens** when the runner reports them (Codex `turn.usage.output_tokens`
   via `onMeta`), falling back to `estimateTokens` (len/4) only when unavailable. Cache hits cost 0.
 - **`WorkflowAgentCapError`** (distinct from `WorkflowBudgetExceededError`) fires at the `maxAgents`
@@ -99,7 +99,7 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   holding `runs/`, `journal/`, `links/`. Shared across projects; the CLI passes these into
   the controller/store/server (`cwd` stays the project dir — where agents run & workflows are discovered).
 - `src/journal.ts` — per-agent result cache keyed by `{prompt, options, runId}` hash → enables
-  `--resume`. Files at `~/.codex-workflow/journal/<runId>/<hash>.json` (prompt + options + result + sessionId).
+  `resume`. Files at `~/.codex-workflow/journal/<runId>/<hash>.json` (prompt + options + result + sessionId).
 - `src/run-store.ts` — run history at `~/.codex-workflow/runs/<runId>.json` (incl. `args`/`result`) → powers `runs`/`show`.
 - `src/workflow-tool.ts` — Claude-compatible `{script|name|scriptPath|resumeFromRunId}` input shape,
   `WorkflowRegistry` (dir discovery for `.js`/`.mjs`/`.ts`/`.mts` workflows), and
@@ -109,10 +109,12 @@ aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
   `.claude/workflows` and `~/.claude/workflows` via `defaultWorkflowDirs`.
 - `src/task-manager.ts` — async launch/wait/cancel (library-level; the CLI runs foreground).
 - `src/cli.ts` + `src/cli/` — `parseArgs`-based CLI
-  (`run`/`list`/`serve`/`validate`/`runs`/`show`/`doctor`),
+  (`run`/`resume`/`list`/`serve`/`validate`/`runs`/`show`/`doctor`),
   `progress.ts` (TTY status-line renderer), `commands.ts` (command impls + runner factory).
   `run` accepts a workflow file path or a bare registered name; path-like missing targets report file
-  not found rather than falling through to name lookup.
+  not found rather than falling through to name lookup. `run` and `resume` share `executeRun()`:
+  `resume <runId>` reconstructs the input (script path / name + `args`) from the run record and reuses
+  the journal cache; Ctrl-C aborts the in-flight run, marks it `cancelled`, and prints the `resume` hint.
 - `src/web/` + `web/` — **local web viewer** (zero-dep Node `http`, vanilla SPA, claude.ai-styled).
   `server.ts` serves a JSON API (`/api/runs`, `/api/runs/:id` → run-aggregator view, `…/agents/:key`
   → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`),
