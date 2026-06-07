@@ -1,4 +1,4 @@
-export { WorkflowAbortError, WorkflowBudgetExceededError, WorkflowInputError } from "./errors.js";
+export { WorkflowAbortError, WorkflowAgentCapError, WorkflowBudgetExceededError, WorkflowInputError } from "./errors.js";
 export {
   cloneJournalResult,
   FileWorkflowJournal,

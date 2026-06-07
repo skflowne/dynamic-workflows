@@ -113,6 +113,7 @@ function controllerRunOptions(options: WorkflowControllerOptions): WorkflowContr
   const runOptions: WorkflowControllerRunOptions = {};
   if (options.concurrency !== undefined) runOptions.concurrency = options.concurrency;
   if (options.maxAgents !== undefined) runOptions.maxAgents = options.maxAgents;
+  if (options.agentMaxAttempts !== undefined) runOptions.agentMaxAttempts = options.agentMaxAttempts;
   if (options.tokenBudget !== undefined) runOptions.tokenBudget = options.tokenBudget;
   if (options.signal !== undefined) runOptions.signal = options.signal;
   if (options.onProgress !== undefined) runOptions.onProgress = options.onProgress;

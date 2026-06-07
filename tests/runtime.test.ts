@@ -3,7 +3,14 @@ import test from "node:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { FileWorkflowJournal, InMemoryWorkflowJournal, runWorkflow, ScriptedAgentRunner } from "../src/index.js";
+import {
+  FileWorkflowJournal,
+  InMemoryWorkflowJournal,
+  runWorkflow,
+  ScriptedAgentRunner,
+  WorkflowAgentCapError,
+} from "../src/index.js";
+import type { WorkflowAgentMeta, WorkflowAgentRunner } from "../src/index.js";
 
 test("runWorkflow executes agent, parallel, pipeline, phase, log, and args", async () => {
   const cwdDir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cwd-"));
@@ -299,4 +306,89 @@ return { inherited, explicit }
     inherited: "phase-model",
     explicit: "explicit-model",
   });
+});
+
+test("runWorkflow retries a transient agent failure then succeeds", async () => {
+  let attempts = 0;
+  const runner = new ScriptedAgentRunner(() => {
+    attempts++;
+    if (attempts < 3) throw new Error(`transient ${attempts}`);
+    return "recovered";
+  });
+
+  const result = await runWorkflow<{ value: unknown }>(
+    `export const meta = { name: 'retry_ok', description: 'Retry then succeed' }
+const value = await agent('flaky', { label: 'flaky' })
+return { value }
+`,
+    { runner, agentMaxAttempts: 3 },
+  );
+
+  assert.equal(attempts, 3);
+  assert.equal(result.result.value, "recovered");
+  assert.equal(result.failures.length, 0);
+});
+
+test("runWorkflow returns null and records a failure after exhausting retries", async () => {
+  let attempts = 0;
+  const runner = new ScriptedAgentRunner(() => {
+    attempts++;
+    throw new Error("always fails");
+  });
+
+  const result = await runWorkflow<{ value: unknown }>(
+    `export const meta = { name: 'retry_exhausted', description: 'Exhaust retries' }
+const value = await agent('doomed', { label: 'doomed' })
+return { value }
+`,
+    { runner, agentMaxAttempts: 2 },
+  );
+
+  assert.equal(attempts, 2);
+  assert.equal(result.result.value, null);
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.failures[0]?.label, "doomed");
+  assert.equal(result.failures[0]?.attempts, 2);
+  assert.match(result.failures[0]?.error ?? "", /always fails/);
+});
+
+test("budget uses runner-reported output tokens and cache hits cost nothing", async () => {
+  // A runner that reports a fixed real token count via onMeta on every live run.
+  const runner: WorkflowAgentRunner = {
+    async run(call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      onMeta?.({ outputTokens: 100 });
+      return call.prompt;
+    },
+  };
+
+  const result = await runWorkflow<{ spent: number }>(
+    `export const meta = { name: 'budget_real', description: 'Real token budget' }
+const a = await agent('same', { label: 'x' })
+const b = await agent('same', { label: 'x' })
+return { a, b, spent: budget.spent() }
+`,
+    { runner, journal: new InMemoryWorkflowJournal() },
+  );
+
+  // First call is live (+100 real tokens); the second is an identical cache hit (+0, not the
+  // length/4 estimate). Total stays 100 — proving real usage feeds spent and cache hits are free.
+  assert.equal(result.result.spent, 100);
+  assert.equal(result.cacheHits, 1);
+});
+
+test("the agent cap error carries the Claude-style 'remaining() returns Infinity' guidance", async () => {
+  // In-process, the cap throws WorkflowAgentCapError; once it crosses the Bun-child IPC boundary the
+  // type is flattened to a message-only error, so the distinctive guidance text is the contract.
+  assert.ok(new WorkflowAgentCapError("x") instanceof Error);
+  const runner = new ScriptedAgentRunner((call) => call.prompt);
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'cap_type', description: 'Cap error type' }
+return Promise.all([0, 1, 2].map((n) => agent('p' + n, { label: 'p' + n })))
+`,
+        { runner, concurrency: 1, maxAgents: 2 },
+      ),
+    /agent\(\) call cap reached \(2\)[\s\S]*remaining\(\) returns Infinity/,
+  );
 });

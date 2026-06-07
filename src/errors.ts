@@ -12,6 +12,13 @@ export class WorkflowBudgetExceededError extends Error {
   }
 }
 
+export class WorkflowAgentCapError extends Error {
+  constructor(message = "Workflow agent() call cap reached") {
+    super(message);
+    this.name = "WorkflowAgentCapError";
+  }
+}
+
 export class WorkflowAbortError extends Error {
   constructor(message = "Workflow aborted") {
     super(message);

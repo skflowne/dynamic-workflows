@@ -16,6 +16,8 @@ export interface RunRecord {
   durationMs?: number;
   agentCount?: number;
   cacheHits?: number;
+  /** Count of agents that failed after exhausting retries. */
+  failureCount?: number;
   phases?: string[];
   logs?: string[];
   error?: string;

@@ -77,13 +77,18 @@ maybeTest("deep-research salvages confirmed claims when synthesize returns null"
   assert.ok(runner.calls.some((call) => call.options.label === "synthesize"));
 });
 
-maybeTest("deep-research keeps running when one fetch agent throws", async () => {
+maybeTest("deep-research drops a failed fetch (null) instead of mislabeling it unreliable", async () => {
   const script = readFileSync(fixturePath, "utf8");
   const runner = new ScriptedAgentRunner(createDeepResearchStub({ mode: "fetch-throw-once" }));
-  const result = await runWorkflow<any>(script, { args: "Fetch throw scenario", runner });
+  // Claude parity: a failed agent() returns null (it does not throw), so the fixture DROPS the source
+  // via `.filter(Boolean)` rather than routing it through `.catch()` and labeling it "unreliable" (see
+  // the fixture's own comment). agentMaxAttempts:1 makes the single stub throw terminal so we observe
+  // the null path: one of three angle sources fails → two survive, the failure is recorded, run completes.
+  const result = await runWorkflow<any>(script, { args: "Fetch throw scenario", runner, agentMaxAttempts: 1 });
 
-  assert.ok(result.result.stats.sourcesFetched >= 3);
-  assert.ok(result.result.sources.some((source: any) => source.quality === "unreliable"));
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.result.sources.filter((source: any) => source.quality === "unreliable").length, 0);
+  assert.ok(result.result.stats.sourcesFetched >= 2);
   assert.ok(result.result.findings.length >= 1);
 });
 

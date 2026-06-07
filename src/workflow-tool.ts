@@ -5,6 +5,7 @@ import { WorkflowInputError } from "./errors.js";
 import { parseWorkflowScript } from "./parser.js";
 import { runWorkflow } from "./runtime.js";
 import type {
+  AgentFailure,
   WorkflowAgentRunner,
   WorkflowMeta,
   WorkflowRef,
@@ -38,6 +39,7 @@ export interface WorkflowOutput<T = unknown> {
     durationMs: number;
     phases: string[];
     logs: string[];
+    failures: AgentFailure[];
   };
 }
 
@@ -230,6 +232,7 @@ function workflowOutput<T>(
       durationMs: result.durationMs,
       phases: result.phases,
       logs: result.logs,
+      failures: result.failures,
     },
   };
 }

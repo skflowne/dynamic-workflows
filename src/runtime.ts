@@ -4,12 +4,14 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Ajv } from "ajv/dist/ajv.js";
-import { WorkflowAbortError, WorkflowBudgetExceededError, WorkflowInputError } from "./errors.js";
+import { WorkflowAbortError, WorkflowAgentCapError, WorkflowBudgetExceededError, WorkflowInputError } from "./errors.js";
 import { cloneJournalResult, journalEntryFromCall, workflowAgentCacheKey } from "./journal.js";
 import { parseWorkflowScript } from "./parser.js";
 import type {
+  AgentFailure,
   JsonSchema,
   WorkflowMeta,
+  WorkflowAgentMeta,
   WorkflowAgentOptions,
   WorkflowRef,
   WorkflowRunOptions,
@@ -26,6 +28,7 @@ interface RuntimeState {
   nextAgentIndex: number;
   cacheHits: number;
   spent: number;
+  failures: AgentFailure[];
 }
 
 interface ChildRequestMessage {
@@ -71,6 +74,8 @@ interface RunContext {
   state: RuntimeState;
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
   maxAgents: number;
+  /** Total attempts per agent (1 = no retry). */
+  agentMaxAttempts: number;
   tokenBudget: number | null | undefined;
   bunPath: string;
   cwd: string;
@@ -132,6 +137,7 @@ export async function runWorkflow<T = unknown>(
       durationMs: Date.now() - started,
       runId,
       cacheHits: ctx.state.cacheHits,
+      failures: ctx.state.failures,
     };
   } finally {
     if (ctx.inFlight.size > 0) {
@@ -143,7 +149,7 @@ export async function runWorkflow<T = unknown>(
 }
 
 function createRunContext(options: WorkflowRunOptions, runId: string): RunContext {
-  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, nextAgentIndex: 0, cacheHits: 0, spent: 0 };
+  const state: RuntimeState = { logs: [], phases: [], agentCount: 0, nextAgentIndex: 0, cacheHits: 0, spent: 0, failures: [] };
   const limiter = createLimiter(resolveConcurrency(options.concurrency));
   const internalAbort = new AbortController();
   const agentSignal = options.signal ? anySignal([internalAbort.signal, options.signal]) : internalAbort.signal;
@@ -169,6 +175,7 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
     state,
     limiter,
     maxAgents: options.maxAgents ?? 1000,
+    agentMaxAttempts: Math.max(1, Math.trunc(options.agentMaxAttempts ?? 3)),
     tokenBudget: options.tokenBudget,
     bunPath: options.bunPath ?? process.env.BUN_PATH ?? "bun",
     cwd: options.cwd ?? process.cwd(),
@@ -188,8 +195,8 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
     const taskPrompt = requireString(prompt, "agent prompt");
     const agentOptions = normalizeAgentOptions(rawOptions);
     if (state.agentCount >= ctx.maxAgents) {
-      throw new WorkflowBudgetExceededError(
-        `Workflow agent() call cap reached (${ctx.maxAgents}). Add a hard iteration cap to the loop, or pass a token budget.`,
+      throw new WorkflowAgentCapError(
+        `Workflow agent() call cap reached (${ctx.maxAgents}). This usually means a loop using budget.remaining() never terminates because no token budget was set — remaining() returns Infinity when budget.total is null. Add a hard iteration cap to the loop, or pass a token budget.`,
       );
     }
     if (ctx.tokenBudget !== null && ctx.tokenBudget !== undefined && remainingBudget(ctx.tokenBudget, state) <= 0) {
@@ -213,54 +220,78 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
 
     return limiter(async () => {
       options.onProgress?.(agentProgress(label, assignedPhase, "started", { index, key: cacheKey }));
-      try {
-        throwIfUserAborted();
-        const cached = await options.journal?.get(call.runId, cacheKey);
-        if (cached) {
-          const result = cloneJournalResult(cached);
-          state.cacheHits++;
-          state.spent += estimateTokens(result);
-          options.onProgress?.(
-            agentProgress(label, assignedPhase, "cached", {
-              result,
-              index,
-              key: cacheKey,
-              ...(cached.sessionId ? { sessionId: cached.sessionId } : {}),
-            }),
-          );
-          return result;
-        }
 
+      throwIfUserAborted();
+      const cached = await options.journal?.get(call.runId, cacheKey);
+      if (cached) {
+        const result = cloneJournalResult(cached);
+        state.cacheHits++;
+        // Cache hits cost no new tokens, so they do not move `spent`.
+        options.onProgress?.(
+          agentProgress(label, assignedPhase, "cached", {
+            result,
+            index,
+            key: cacheKey,
+            ...(cached.sessionId ? { sessionId: cached.sessionId } : {}),
+          }),
+        );
+        return result;
+      }
+
+      const maxAttempts = ctx.agentMaxAttempts;
+      let lastMessage = "";
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         if (ctx.internalAbort.signal.aborted) throw new WorkflowAbortError();
+        throwIfUserAborted();
+
         let sessionId: string | undefined;
-        const onMeta = (meta: { sessionId?: string }) => {
+        let outputTokens: number | undefined;
+        const onMeta = (meta: WorkflowAgentMeta) => {
           if (meta.sessionId) sessionId = meta.sessionId;
+          if (typeof meta.outputTokens === "number") outputTokens = meta.outputTokens;
+          if (meta.worktreePreserved && meta.worktreePath) {
+            emitLog(`agent ${label} worktree preserved at ${meta.worktreePath} (had changes)`);
+          }
         };
         const runPromise = Promise.resolve(options.runner.run(call, ctx.agentSignal, onMeta));
         inFlight.add(runPromise);
-        let raw: unknown;
         try {
-          raw = await runPromise;
+          const raw = await runPromise;
+          throwIfUserAborted();
+          const result = normalizeAgentResult(raw, agentOptions.schema);
+          await options.journal?.put(journalEntryFromCall(call, result, sessionId));
+          state.spent += outputTokens ?? estimateTokens(result);
+          options.onProgress?.(
+            agentProgress(label, assignedPhase, "completed", { result, index, key: cacheKey, ...(sessionId ? { sessionId } : {}) }),
+          );
+          return result;
+        } catch (error) {
+          if (error instanceof WorkflowAbortError || options.signal?.aborted || ctx.internalAbort.signal.aborted) {
+            throw error;
+          }
+          lastMessage = error instanceof Error ? error.message : String(error);
+          if (attempt < maxAttempts) {
+            emitLog(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${lastMessage}; retrying`);
+            await abortableDelay(retryBackoffMs(attempt), ctx.agentSignal);
+            continue;
+          }
         } finally {
           inFlight.delete(runPromise);
         }
-        throwIfUserAborted();
-        const result = normalizeAgentResult(raw, agentOptions.schema);
-        await options.journal?.put(journalEntryFromCall(call, result, sessionId));
-        state.spent += estimateTokens(result);
-        options.onProgress?.(
-          agentProgress(label, assignedPhase, "completed", { result, index, key: cacheKey, ...(sessionId ? { sessionId } : {}) }),
-        );
-        return result;
-      } catch (error) {
-        if (error instanceof WorkflowAbortError || options.signal?.aborted || ctx.internalAbort.signal.aborted) {
-          throw error;
-        }
-        const message = error instanceof Error ? error.message : String(error);
-        emitLog(`agent ${label} failed: ${message}`);
-        options.onProgress?.(agentProgress(label, assignedPhase, "failed", { error: message, index, key: cacheKey }));
-        throw error;
       }
+
+      // Retries exhausted: record the failure and return null so `.filter(Boolean)` works (Claude parity).
+      emitLog(`agent ${label} failed after ${maxAttempts} attempt(s): ${lastMessage}`);
+      state.failures.push({
+        label,
+        ...(assignedPhase !== undefined ? { phase: assignedPhase } : {}),
+        index,
+        key: cacheKey,
+        attempts: maxAttempts,
+        error: lastMessage,
+      });
+      options.onProgress?.(agentProgress(label, assignedPhase, "failed", { error: lastMessage, index, key: cacheKey }));
+      return null;
     });
   };
 
@@ -907,6 +938,27 @@ function defaultAgentLabel(phase: string | undefined, index: number): string {
 
 function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value ?? "").length / 4);
+}
+
+/** Exponential backoff between agent retries, capped at 5s. */
+function retryBackoffMs(attempt: number): number {
+  return Math.min(500 * 2 ** (attempt - 1), 5000);
+}
+
+/** Resolves after `ms`, or early if `signal` aborts (the loop re-checks abort on the next pass). */
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function remainingBudget(tokenBudget: number, state: RuntimeState): number {

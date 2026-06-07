@@ -85,6 +85,7 @@ export class WorkflowTaskManager {
             durationMs: result.durationMs,
             phases: result.phases,
             logs: result.logs,
+            failures: result.failures,
           },
         };
         task.status = "completed";

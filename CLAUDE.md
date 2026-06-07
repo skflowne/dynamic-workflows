@@ -68,14 +68,32 @@ Each run has an internal `AbortController` combined with the user signal via `Ab
 the workflow finishes (including early, with un-awaited fire-and-forget `agent()` calls), the parent
 aborts it and awaits in-flight runner promises so Codex threads stop cleanly.
 
+### Agent failure / retry / budget semantics (Claude parity)
+- **`agent()` retries then returns `null` (it does NOT throw on failure).** `ctx.runAgent` wraps the
+  runner + `normalizeAgentResult` in a retry loop (`agentMaxAttempts`, default 3; `--agent-retries n`
+  → `n+1`). Schema-validation failures are retryable too. On exhaustion it records the failure on
+  `state.failures` and returns `null` — so the Claude `.filter(Boolean)` idiom works. Abort/cap/budget
+  errors are thrown *before* the loop and never become `null`. Failed agents are **not journaled**, so
+  `--resume` re-attempts them. Failures surface as `WorkflowRunResult.failures` / `WorkflowOutput.stats.failures`.
+- **`budget.spent()` uses real output tokens** when the runner reports them (Codex `turn.usage.output_tokens`
+  via `onMeta`), falling back to `estimateTokens` (len/4) only when unavailable. Cache hits cost 0.
+- **`WorkflowAgentCapError`** (distinct from `WorkflowBudgetExceededError`) fires at the `maxAgents`
+  cap; its message names the `budget.remaining()`-Infinity loop trap. Note: error **type** is flattened
+  to message-only across the Bun-child IPC boundary — the message text is the observable contract.
+- **Per-agent timeout** (`agentTimeoutMs`, default 15min, `--agent-timeout`, 0 disables) aborts a single
+  hung Codex turn → surfaces as a retryable failure. This is a total-duration cap (non-streamed `thread.run`
+  can't detect stalls); it fills the gap left by the workflow idle watchdog being disarmed while awaiting an agent.
+
 ### Module map
 - `src/parser.ts` — TS-AST parse. `meta` **must be the first statement and a pure literal**.
   Rewrites top-level `import`/`export` into an async-function-safe body (dynamic imports; type-only
   and re-exports erased; anonymous `export default` bound to a name).
 - `src/runners/codex-sdk.ts` — real runner. `startThread()` **per `agent()` call** (never resumes →
   every agent is a fresh, independent Codex session). Maps `model`/`sandbox`/`approval`/reasoning;
-  `isolation:'worktree'` creates a real detached `git worktree`. **`toStrictJsonSchema()`** rewrites
-  loose Claude schemas into OpenAI-strict form before sending (see gotchas).
+  `isolation:'worktree'` creates a real detached `git worktree` (preserved for review if the agent left
+  changes, else force-removed). `buildPrompt()` injects the verbatim-return discipline (+ strict-JSON
+  contract when a schema is set). Reports `outputTokens` via `onMeta`; enforces `agentTimeoutMs`.
+  **`toStrictJsonSchema()`** rewrites loose Claude schemas into OpenAI-strict form before sending (see gotchas).
 - `src/runners/scripted.ts` — deterministic test runner.
 - `src/paths.ts` — resolves the **global data dir** (`~/.codex-workflow`, override `CODEX_WORKFLOW_HOME`)
   holding `runs/`, `journal/`, `links/`. Shared across projects; the CLI passes these into

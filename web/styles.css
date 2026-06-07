@@ -149,9 +149,11 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 .pill.running { background: var(--amber-soft); color: var(--amber); }
 .pill.cancelled { background: #ece9e0; color: var(--ink-2); }
 
-.rv-stats { display: flex; flex-wrap: wrap; gap: 26px; margin: 20px 0 26px; padding: 16px 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow-sm); }
-.stat .stat-val { font-family: var(--serif); font-size: 22px; font-weight: 500; }
-.stat .stat-label { font-size: 11.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+/* compact run stats, inline next to the title */
+.rv-stats { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.rv-stat { color: var(--ink-2); }
+.rv-stat b { font-family: var(--mono); font-weight: 600; color: var(--ink); }
+.rv-stat-sep { color: var(--muted); opacity: 0.6; }
 
 /* section label */
 .section-label { font-size: 12px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); font-weight: 600; margin: 28px 0 12px; }
@@ -199,7 +201,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 .fan-hub .fh-name { font-family: var(--serif); font-size: 19px; font-weight: 500; }
 .fan-hub .fh-count { font-size: 12px; color: var(--muted); }
 .fan-main { position: relative; z-index: 1; flex: 1; min-width: 0; }
-.fan-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.fan-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-bottom: 12px; }
 .agent-filter {
   width: min(320px, 100%); padding: 7px 10px; border: 1px solid var(--border);
   border-radius: var(--r-sm); background: var(--paper-2); color: var(--ink); font-family: var(--sans); font-size: 12.5px;
@@ -242,6 +244,8 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 .result-text { white-space: pre-wrap; word-break: break-word; color: var(--ink); margin: 2px 0; }
 .result-field { margin: 14px 0; }
 .result-field:first-child { margin-top: 0; }
+/* nested object/array value → indent so the added level reads clearly */
+.result-fieldval.nested { padding-left: 16px; }
 /* compact grid for runs of short scalar fields (e.g. a stats block) — light, borderless */
 .result-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 14px 28px; margin: 14px 0; }
 .result-cell { background: none; border: none; padding: 0; min-width: 0; }
@@ -365,7 +369,6 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
   .run-view { padding: 22px 16px 56px; }
   .empty-state { padding: 28px; }
   .rv-title { font-size: 25px; }
-  .rv-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding: 14px 16px; }
   .flow-rail { align-items: stretch; }
   .flow-link { display: none; }
   .flow-phase { width: 100%; justify-content: space-between; border-radius: var(--r); }

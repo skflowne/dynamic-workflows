@@ -127,6 +127,8 @@ function renderRunView(data, options = {}) {
   const phases = mergedPhases();
   const visibleAgentCount = phases.reduce((sum, phase) => sum + phase.agents.length, 0);
   const duration = stats.durationMs ?? (record.status === "running" && record.startedAt ? Date.now() - record.startedAt : undefined);
+  // When a real result exists it's the answer — show it above the logs, which become secondary.
+  const hasResult = record.result !== undefined && record.result !== null;
   const root = el("run-view");
   root.innerHTML = `
     <div class="rv-head">
@@ -134,22 +136,20 @@ function renderRunView(data, options = {}) {
       <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
         <h1 class="rv-title">${escapeHtml(record.name)}</h1>
         <span class="pill ${record.status}"><span class="status-dot ${record.status}"></span>${record.status}</span>
+        <span class="rv-stats">
+          <span class="rv-stat"><b>${fmtNum(Math.max(stats.agentCount ?? 0, visibleAgentCount))}</b> agents</span>
+          <span class="rv-stat-sep">·</span>
+          <span class="rv-stat"><b>${fmtDuration(duration)}</b></span>
+          ${stats.cacheHits ? `<span class="rv-stat-sep">·</span><span class="rv-stat"><b>${fmtNum(stats.cacheHits)}</b> cache hits</span>` : ""}
+        </span>
       </div>
       ${desc}
       ${renderRunMeta(record)}
     </div>
 
-    <div class="rv-stats">
-      <div class="stat"><div class="stat-val">${fmtNum(Math.max(stats.agentCount ?? 0, visibleAgentCount))}</div><div class="stat-label">Agents</div></div>
-      <div class="stat"><div class="stat-val">${fmtDuration(duration)}</div><div class="stat-label">Duration</div></div>
-      <div class="stat"><div class="stat-val">${phases.length}</div><div class="stat-label">Phases</div></div>
-      ${stats.cacheHits ? `<div class="stat"><div class="stat-val">${fmtNum(stats.cacheHits)}</div><div class="stat-label">Cache hits</div></div>` : ""}
-    </div>
-
     ${renderInputSection(record)}
     <div id="flow-section">${renderFlowSection(phases)}</div>
-    ${renderLogs(record)}
-    ${renderResultSection(record)}
+    ${hasResult ? renderResultSection(record) + renderLogs(record) : renderLogs(record) + renderResultSection(record)}
   `;
   setLiveActive(record.status === "running");
   if (restorePhase && phases.some((phase) => phase.title === restorePhase)) {
@@ -223,8 +223,9 @@ function renderResultValue(v, depth) {
     if (canRenderObjectTable(v)) return renderObjectTable(v);
     return `<div class="result-items">${v.map((x) => `<div class="result-subcard">${renderResultValue(x, depth + 1)}</div>`).join("")}</div>`;
   }
-  // plain object → labeled fields. Adaptive: runs of short scalar fields tile into a multi-column
-  // grid (e.g. a `stats` block of numbers); long fields (prose, arrays, nested objects) stay full-width.
+  // plain object → labeled fields. Adaptive: a run of *uniformly short* scalar fields tiles into a
+  // multi-column grid (e.g. a `stats` block of numbers). Anything with varying/longer content —
+  // URLs, prose, arrays, nested objects, or a lone scalar — renders as a full-width row instead.
   const entries = Object.entries(v);
   if (entries.length === 0) return `<span class="result-scalar">{}</span>`;
   if (depth > 3) return `<div class="json-block">${highlightJson(v)}</div>`;
@@ -232,6 +233,13 @@ function renderResultValue(v, depth) {
   let bucket = [];
   const flush = () => {
     if (!bucket.length) return;
+    if (bucket.length === 1) {
+      // a lone short field is not a stat block — render it full-width, not in a 1-column grid
+      const [k, val] = bucket[0];
+      out += `<div class="result-field"><div class="result-key">${escapeHtml(humanizeKey(k))}</div><div class="result-fieldval">${renderResultValue(val, depth + 1)}</div></div>`;
+      bucket = [];
+      return;
+    }
     out += `<div class="result-grid">${bucket
       .map(
         ([k, val]) => `<div class="result-cell"><div class="result-key">${escapeHtml(humanizeKey(k))}</div><div class="result-cellval">${escapeHtml(formatScalar(val))}</div></div>`,
@@ -244,7 +252,10 @@ function renderResultValue(v, depth) {
       bucket.push([k, val]);
     } else {
       flush();
-      out += `<div class="result-field"><div class="result-key">${escapeHtml(humanizeKey(k))}</div>${renderResultValue(val, depth + 1)}</div>`;
+      // Nested objects/arrays add a real hierarchy level → indent their value with a guide line.
+      // Plain (long) strings are still the field's own value, so they stay at the base margin.
+      const nested = val !== null && typeof val === "object";
+      out += `<div class="result-field"><div class="result-key">${escapeHtml(humanizeKey(k))}</div><div class="result-fieldval${nested ? " nested" : ""}">${renderResultValue(val, depth + 1)}</div></div>`;
     }
   }
   flush();
@@ -253,10 +264,19 @@ function renderResultValue(v, depth) {
 
 // A value is "compact" (grid-tileable) when it's a short scalar — number, boolean, or a brief
 // single-line string. Long strings / arrays / objects render full-width instead.
+// "Compact" = a short scalar that tiles cleanly in a narrow (~130px) stat-grid cell. Anything
+// that isn't — a URL, a longer string, prose — is left out so it renders as a full-width row
+// instead of being crammed into a column and wrapping into an unreadable vertical stack.
 function isCompact(v) {
   if (v === null) return true;
   if (typeof v === "number" || typeof v === "boolean") return true;
-  return typeof v === "string" && v.length <= 48 && !v.includes("\n");
+  if (typeof v !== "string" || v.includes("\n")) return false;
+  if (/^https?:\/\//i.test(v.trim())) return false; // URLs always get their own full-width row
+  // display width, not char count: CJK / fullwidth glyphs are ~2× wide, so a short-looking
+  // Chinese sentence still overflows a narrow stat cell — keep such prose out of the grid.
+  let width = 0;
+  for (const ch of v) width += ch.charCodeAt(0) > 0x2e7f ? 2 : 1;
+  return width <= 24;
 }
 
 function formatScalar(v) {
@@ -356,13 +376,15 @@ function renderFlowSection(phases) {
     </div>`;
 }
 
-function renderFan(p) {
+function filterAgents(p) {
   const query = state.agentFilter.trim().toLowerCase();
   const filtered = query
     ? p.agents.filter((a) => `${a.label} ${a.resultPreview || ""}`.toLowerCase().includes(query))
     : p.agents;
-  const visible = filtered.slice(0, 180);
-  const compact = p.agents.length > 48 ? " compact" : "";
+  return { filtered, visible: filtered.slice(0, 180) };
+}
+
+function fanNodesHtml(visible) {
   const nodes = visible
     .map(
       (a, i) => `<button class="flow-node ${a.status}${a.live ? " pending" : ""}" ${a.live ? "" : `data-key="${escapeHtml(a.key)}"`} title="${escapeHtml(a.resultPreview || a.label)}" style="animation-delay:${Math.min(i * 12, 300)}ms">
@@ -371,6 +393,20 @@ function renderFan(p) {
       </button>`,
     )
     .join("");
+  return nodes || '<div class="muted-note">No matching agents.</div>';
+}
+
+function fanSummaryHtml(filtered, p) {
+  return `${fmtNum(filtered.length)} shown${filtered.length !== p.agents.length ? ` / ${fmtNum(p.agents.length)}` : ""}`;
+}
+
+function fanNoteHtml(filtered, visible) {
+  return filtered.length > visible.length ? `<div class="fan-note">Showing first ${visible.length}; refine the filter to narrow this phase.</div>` : "";
+}
+
+function renderFan(p) {
+  const { filtered, visible } = filterAgents(p);
+  const compact = p.agents.length > 48 ? " compact" : "";
   return `<svg class="fan-svg" aria-hidden="true"></svg>
     <div class="fan-hub">
       <span class="fh-dot"></span>
@@ -379,12 +415,31 @@ function renderFan(p) {
     </div>
     <div class="fan-main">
       <div class="fan-toolbar">
+        <span class="fan-summary">${fanSummaryHtml(filtered, p)}</span>
         <input class="agent-filter" type="search" value="${escapeHtml(state.agentFilter)}" placeholder="Filter agents" autocomplete="off" />
-        <span class="fan-summary">${fmtNum(filtered.length)} shown${filtered.length !== p.agents.length ? ` / ${fmtNum(p.agents.length)}` : ""}</span>
       </div>
-      <div class="fan-grid${compact}">${nodes || '<div class="muted-note">No matching agents.</div>'}</div>
-      ${filtered.length > visible.length ? `<div class="fan-note">Showing first ${visible.length}; refine the filter to narrow this phase.</div>` : ""}
+      <div class="fan-grid${compact}">${fanNodesHtml(visible)}</div>
+      ${fanNoteHtml(filtered, visible)}
     </div>`;
+}
+
+// Live filter update: rebuild only the grid/summary/note, never the <input>. Recreating the input
+// mid-keystroke would abort an in-progress IME composition (Chinese/Japanese/Korean never commits).
+function applyAgentFilter() {
+  if (!state.expandedPhase) return;
+  const phase = mergedPhases().find((p) => p.title === state.expandedPhase);
+  const exp = el("flow-expansion");
+  if (!phase || !exp || exp.hidden) return;
+  const { filtered, visible } = filterAgents(phase);
+  const summary = exp.querySelector(".fan-summary");
+  if (summary) summary.innerHTML = fanSummaryHtml(filtered, phase);
+  const grid = exp.querySelector(".fan-grid");
+  if (grid) grid.innerHTML = fanNodesHtml(visible);
+  const note = exp.querySelector(".fan-note");
+  const noteHtml = fanNoteHtml(filtered, visible);
+  if (note) note.remove();
+  if (noteHtml && grid) grid.insertAdjacentHTML("afterend", noteHtml);
+  drawFan();
 }
 
 function togglePhase(title) {
@@ -740,19 +795,7 @@ document.addEventListener("input", (e) => {
   const filter = e.target.closest(".agent-filter");
   if (!filter) return;
   state.agentFilter = filter.value;
-  if (state.expandedPhase) {
-    const title = state.expandedPhase;
-    const phases = mergedPhases();
-    const phase = phases.find((p) => p.title === title);
-    const exp = el("flow-expansion");
-    if (phase && exp && !exp.hidden) {
-      exp.innerHTML = renderFan(phase);
-      const next = exp.querySelector(".agent-filter");
-      next?.focus();
-      next?.setSelectionRange(next.value.length, next.value.length);
-      drawFan();
-    }
-  }
+  applyAgentFilter();
 });
 
 el("run-search").addEventListener("input", (e) => {

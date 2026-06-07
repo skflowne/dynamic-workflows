@@ -26,6 +26,8 @@ export interface RunFlags {
   concurrency?: string;
   budget?: string;
   "max-agents"?: string;
+  "agent-retries"?: string;
+  "agent-timeout"?: string;
   resume?: string;
   cwd?: string;
   sandbox?: string;
@@ -121,6 +123,7 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
     journalDir: journalDir(dataDir),
     ...numericFlag("concurrency", flags.concurrency),
     ...numericFlag("maxAgents", flags["max-agents"]),
+    ...agentAttemptsFlag(flags["agent-retries"]),
     ...numericFlag("tokenBudget", flags.budget),
     ...numericFlag("workflowIdleTimeoutMs", flags["idle-timeout"]),
     ...(flags.bun ? { bunPath: flags.bun } : {}),
@@ -139,6 +142,7 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
       durationMs: output.stats.durationMs,
       agentCount: output.stats.agentCount,
       cacheHits: output.stats.cacheHits,
+      failureCount: output.stats.failures.length,
       phases: output.stats.phases,
       logs: output.stats.logs,
       result: output.result,
@@ -149,7 +153,7 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
     if (json) {
       process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
     } else {
-      printRunSummary(output.workflowName, output.runId, output.stats);
+      printRunSummary(output.workflowName, output.runId, output.stats, output.scriptPath);
       process.stdout.write(`${stringifyResult(output.result)}\n`);
     }
     return finishViewer(server, viewerUrl, runId, 0);
@@ -305,6 +309,7 @@ export async function showCommand(runId: string | undefined, flags: { cwd?: stri
   if (record.scriptPath) process.stdout.write(`  script: ${record.scriptPath}\n`);
   if (record.durationMs !== undefined) process.stdout.write(`  duration: ${(record.durationMs / 1000).toFixed(1)}s\n`);
   if (record.agentCount !== undefined) process.stdout.write(`  agents: ${record.agentCount} (cache hits: ${record.cacheHits ?? 0})\n`);
+  if (record.failureCount) process.stdout.write(`  ${yellow(`failed agents: ${record.failureCount}`)} (use --resume ${record.runId} to re-attempt)\n`);
   if (record.phases?.length) process.stdout.write(`  phases: ${record.phases.join(" → ")}\n`);
   if (record.error) process.stdout.write(`  ${red(`error: ${record.error}`)}\n`);
   if (record.logs?.length) {
@@ -426,6 +431,11 @@ function buildAgentRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
   if (flags.approval) options.approvalPolicy = assertOneOf(flags.approval, APPROVAL_MODES, "--approval") as ThreadOptions["approvalPolicy"];
   const reasoning = flags.reasoning ?? flags.reasoningEffort;
   if (reasoning) options.modelReasoningEffort = assertOneOf(reasoning, REASONING_EFFORTS, "--reasoning") as ThreadOptions["modelReasoningEffort"];
+  if (flags["agent-timeout"] !== undefined) {
+    const timeout = Number(flags["agent-timeout"]);
+    if (!Number.isFinite(timeout)) throw new WorkflowInputError(`--agent-timeout must be a number, got "${flags["agent-timeout"]}"`);
+    options.agentTimeoutMs = timeout;
+  }
   // Web search + network access are always enabled for agents.
   options.webSearchEnabled = true;
   options.networkAccessEnabled = true;
@@ -445,6 +455,14 @@ function numericFlag<K extends string>(key: K, raw: string | undefined): Partial
   const value = Number(raw);
   if (!Number.isFinite(value)) throw new WorkflowInputError(`${key} must be a number, got "${raw}"`);
   return { [key]: value } as Record<K, number>;
+}
+
+/** `--agent-retries <n>` → agentMaxAttempts = n + 1 (n retries means n+1 total attempts). */
+function agentAttemptsFlag(raw: string | undefined): { agentMaxAttempts?: number } {
+  if (raw === undefined) return {};
+  const retries = Number(raw);
+  if (!Number.isFinite(retries) || retries < 0) throw new WorkflowInputError(`--agent-retries must be a non-negative number, got "${raw}"`);
+  return { agentMaxAttempts: Math.trunc(retries) + 1 };
 }
 
 function looksLikeWorkflowPath(target: string): boolean {
@@ -484,10 +502,25 @@ async function tryExec(cmd: string, args: string[]): Promise<{ ok: boolean; out:
   }
 }
 
-function printRunSummary(name: string, runId: string, stats: { agentCount: number; cacheHits: number; durationMs: number; phases: string[] }): void {
+function printRunSummary(
+  name: string,
+  runId: string,
+  stats: { agentCount: number; cacheHits: number; durationMs: number; phases: string[]; failures: { label: string }[] },
+  scriptPath?: string,
+): void {
+  const failed = stats.failures.length;
+  const failedSuffix = failed > 0 ? `, ${yellow(`${failed} failed`)}` : "";
   process.stderr.write(
-    `\n${green("✓")} ${bold(name)} ${dim(`(${runId})`)} — ${stats.agentCount} agents, ${stats.cacheHits} cached, ${(stats.durationMs / 1000).toFixed(1)}s\n\n`,
+    `\n${green("✓")} ${bold(name)} ${dim(`(${runId})`)} — ${stats.agentCount} agents, ${stats.cacheHits} cached${failedSuffix}, ${(stats.durationMs / 1000).toFixed(1)}s\n`,
   );
+  if (scriptPath) {
+    process.stderr.write(`${dim(`  Iterate: edit ${scriptPath} then re-run`)}\n`);
+    process.stderr.write(`${dim(`  Resume (reuse cached agents): codex-workflow run ${scriptPath} --resume ${runId}`)}\n`);
+  }
+  if (failed > 0) {
+    process.stderr.write(`${dim(`  ${failed} agent(s) failed — --resume ${runId} will re-attempt them.`)}\n`);
+  }
+  process.stderr.write("\n");
 }
 
 function stringifyResult(result: unknown): string {

@@ -18,6 +18,8 @@ const OPTIONS = {
   concurrency: { type: "string" },
   budget: { type: "string" },
   "max-agents": { type: "string" },
+  "agent-retries": { type: "string" },
+  "agent-timeout": { type: "string" },
   resume: { type: "string" },
   cwd: { type: "string" },
   sandbox: { type: "string" },
@@ -53,6 +55,8 @@ Run options:
   --concurrency <n>          Max concurrent agents (capped at 16)
   --budget <tokens>          Token budget (estimate) shared across the run
   --max-agents <n>           Hard cap on total agent() calls (default 1000)
+  --agent-retries <n>        Retries per agent on transient failure (default 2; agent() returns null when exhausted)
+  --agent-timeout <ms>       Per-agent total-duration timeout in ms (0 disables; default 900000)
   --resume <runId>           Reuse a prior run's journal cache
   --cwd <dir>                Working directory for agents (default: cwd)
   --sandbox <mode>           read-only | workspace-write | danger-full-access

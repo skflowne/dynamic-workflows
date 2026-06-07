@@ -52,6 +52,26 @@ export interface WorkflowAgentCall {
 /** Metadata a runner can report back mid-run (e.g. the Codex session/thread id). */
 export interface WorkflowAgentMeta {
   sessionId?: string;
+  /** Real output tokens this agent spent, when the runner can report them (feeds `budget`). */
+  outputTokens?: number;
+  /** Path of an isolation worktree this agent ran in, reported when it is preserved for review. */
+  worktreePath?: string;
+  /** True when the worktree had changes and was kept on disk instead of being removed. */
+  worktreePreserved?: boolean;
+}
+
+/** A single agent that failed after exhausting its retries (collected onto the run result). */
+export interface AgentFailure {
+  label: string;
+  phase?: string;
+  /** 1-based ordinal assigned by the runtime. */
+  index: number;
+  /** Stable journal cache key for this agent. */
+  key: string;
+  /** Number of attempts made before giving up. */
+  attempts: number;
+  /** Last error message. */
+  error: string;
 }
 
 export interface WorkflowAgentRunner {
@@ -104,6 +124,8 @@ export interface WorkflowRunOptions {
   runId?: string;
   concurrency?: number;
   maxAgents?: number;
+  /** Total attempts per agent (1 = no retry). Defaults to 3. On exhaustion agent() returns null. */
+  agentMaxAttempts?: number;
   tokenBudget?: number | null;
   signal?: AbortSignal;
   onProgress?: (event: WorkflowProgressEvent) => void;
@@ -127,6 +149,8 @@ export interface WorkflowRunResult<T = unknown> {
   durationMs: number;
   runId: string;
   cacheHits: number;
+  /** Agents that failed after exhausting retries (each returned null to the script). */
+  failures: AgentFailure[];
 }
 
 export interface ParsedWorkflow {

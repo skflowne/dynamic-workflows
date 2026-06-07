@@ -1,6 +1,35 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { toStrictJsonSchema } from "../src/runners/codex-sdk.js";
+import { buildPrompt, toStrictJsonSchema } from "../src/runners/codex-sdk.js";
+import type { WorkflowAgentCall, WorkflowAgentOptions } from "../src/index.js";
+
+function makeCall(prompt: string, options: WorkflowAgentOptions = {}): WorkflowAgentCall {
+  return { prompt, options, index: 1, runId: "wf_test", cacheKey: "k" };
+}
+
+test("buildPrompt injects the verbatim-return discipline and stays prose-only without a schema", () => {
+  const prompt = buildPrompt(makeCall("do the thing"), undefined, false);
+  assert.match(prompt, /returned verbatim as this agent\(\) call's result/);
+  assert.match(prompt, /not a message to a human/);
+  assert.match(prompt, /do not add confirmations like "Done\."/);
+  assert.match(prompt, /Be concise/);
+  assert.doesNotMatch(prompt, /Structured output contract/);
+  assert.ok(prompt.includes("do the thing"));
+});
+
+test("buildPrompt adds the strict JSON contract when a schema is present", () => {
+  const prompt = buildPrompt(makeCall("extract", { schema: { type: "object" } }), undefined, false);
+  assert.match(prompt, /Structured output contract:/);
+  assert.match(prompt, /You MUST return ONLY JSON/);
+  assert.match(prompt, /If your output fails schema validation the call fails/);
+});
+
+test("buildPrompt describes worktree isolation as preserve-on-change", () => {
+  const prompt = buildPrompt(makeCall("edit", { isolation: "worktree" }), undefined, true);
+  assert.match(prompt, /isolated git worktree/);
+  assert.match(prompt, /preserved for review if you do/);
+  assert.doesNotMatch(prompt, /discarded when this agent finishes/);
+});
 
 test("toStrictJsonSchema enforces strict objects while preserving optional fields as nullable", () => {
   const strict = toStrictJsonSchema({
