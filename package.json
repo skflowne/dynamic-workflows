@@ -1,0 +1,58 @@
+{
+  "name": "codex-dynamic-workflows",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Claude Code-compatible dynamic workflows on OpenAI Codex, with a live visual run viewer.",
+  "license": "MIT",
+  "author": "six-ddc",
+  "homepage": "https://github.com/six-ddc/codex-dynamic-workflows#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/six-ddc/codex-dynamic-workflows.git"
+  },
+  "bugs": {
+    "url": "https://github.com/six-ddc/codex-dynamic-workflows/issues"
+  },
+  "keywords": [
+    "codex",
+    "claude-code",
+    "workflow",
+    "agents",
+    "orchestration",
+    "openai",
+    "cli"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "codex-workflow": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "web"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "serve": "npm run build && node dist/cli.js serve",
+    "test": "npm run build && npm run test:unit",
+    "test:unit": "tsx --test tests/**/*.test.ts",
+    "test:deepresearch": "DEEP_RESEARCH_WORKFLOW_PATH=/tmp/codex-workflow-research/gist/claude-code-deep-research-workflow.js tsx --test tests/deep-research-compat.test.ts",
+    "typecheck": "tsc -p tsconfig.test.json"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "^0.137.0",
+    "ajv": "^8.17.1",
+    "typescript": "^5.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.20.0"
+  }
+}

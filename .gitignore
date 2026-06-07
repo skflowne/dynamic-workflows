@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.cache/
+*.tsbuildinfo
+.DS_Store
+.codex-workflow/
+
+# Local research / reverse-engineering notes — not for publication.
+claude-workflow-research.md
+
+# Secrets / local env
+.env
+.env.*
+*.local

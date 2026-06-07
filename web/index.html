@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Workflow · Viewer</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23C96442'/%3E%3Cpath d='M9 21l5-11 5 11M11 17h6' stroke='white' stroke-width='2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <header class="sidebar-head">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true">✻</span>
+            <div class="brand-text">
+              <div class="brand-title">Codex Workflow</div>
+              <div class="brand-sub">run viewer</div>
+            </div>
+          </div>
+          <div class="live-dot" id="live-dot" title="live stream">
+            <span class="dot"></span><span class="live-label">live</span>
+          </div>
+        </header>
+        <div class="sidebar-search">
+          <input id="run-search" type="search" placeholder="Filter runs…" autocomplete="off" />
+        </div>
+        <nav class="run-list" id="run-list" aria-label="Run history"></nav>
+        <footer class="sidebar-foot" id="sidebar-foot"></footer>
+      </aside>
+
+      <main class="main" id="main">
+        <div class="empty-state" id="empty-state">
+          <div class="empty-mark">✻</div>
+          <h1>Select a run</h1>
+          <p>Pick a workflow run from the left to see its full overview, every step's progress, and the complete Codex session behind each agent.</p>
+        </div>
+        <section class="run-view" id="run-view" hidden></section>
+      </main>
+    </div>
+
+    <div class="drawer-scrim" id="drawer-scrim" hidden></div>
+    <aside class="drawer" id="drawer" hidden aria-label="Agent detail"></aside>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
