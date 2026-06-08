@@ -125,6 +125,45 @@ test("CLI resume re-runs a recorded run by id, restoring args and reusing the jo
   }
 });
 
+test("CLI resume failure preserves a prior completed run record", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-preserve-"));
+  try {
+    const wfPath = path.join(dir, "cli_demo.js");
+    await writeFile(wfPath, WORKFLOW, "utf8");
+
+    const run = await runCli(["run", wfPath, "--args", '{"who":"Ada"}', "--json", "--cwd", dir], dir);
+    assert.equal(run.code, 0, run.stderr);
+    const first = JSON.parse(run.stdout) as { runId: string; result: { who: string } };
+    assert.equal(first.result.who, "Ada");
+
+    await writeFile(
+      wfPath,
+      `export const meta = {
+  name: 'cli_demo',
+  description: 'CLI smoke workflow',
+  phases: [{ title: 'Work' }],
+}
+
+throw new Error('resume boom')
+`,
+      "utf8",
+    );
+
+    const resumed = await runCli(["resume", first.runId, "--json", "--cwd", dir], dir);
+    assert.equal(resumed.code, 1);
+    assert.match(resumed.stderr, /resume boom/);
+
+    const show = await runCli(["show", first.runId, "--json", "--cwd", dir], dir);
+    assert.equal(show.code, 0, show.stderr);
+    const record = JSON.parse(show.stdout) as { status: string; result: { who: string }; error?: string };
+    assert.equal(record.status, "completed");
+    assert.equal(record.result.who, "Ada");
+    assert.equal(record.error, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("CLI list discovers project workflows by name, including TypeScript files", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-list-"));
   try {

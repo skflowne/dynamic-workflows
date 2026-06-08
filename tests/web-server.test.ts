@@ -202,6 +202,51 @@ test("server tails a run's events file: initial scan, fs.watch, and drainRun", a
   }
 });
 
+test("web server overlays live resume state without overwriting the stored terminal record", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-live-overlay-"));
+  const dataDir = path.join(cwd, ".codex-workflow");
+  const server = createWebServer({ cwd, version: "9.9.9" });
+  try {
+    const runId = "wf_overlay";
+    const runsDirPath = path.join(dataDir, "runs");
+    await mkdir(runsDirPath, { recursive: true });
+    const stored: RunRecord = {
+      runId,
+      name: "overlay",
+      status: "completed",
+      source: "scriptPath",
+      startedAt: START,
+      completedAt: START + 1000,
+      result: { value: "old" },
+    };
+    await writeFile(path.join(runsDirPath, `${runId}.json`), JSON.stringify(stored), "utf8");
+
+    const eventsPath = runEventsPath(dataDir, runId);
+    const liveRecord: RunRecord = {
+      runId,
+      name: "overlay",
+      status: "running",
+      source: "scriptPath",
+      startedAt: START + 2000,
+    };
+    await writeFile(eventsPath, `${JSON.stringify({ runId, type: "run-meta", record: liveRecord })}\n`, "utf8");
+
+    const bound = await server.listen(0);
+    let detail = await get(`${bound.url}/api/runs/${runId}`);
+    assert.equal(detail.json.record.status, "running");
+    assert.equal(detail.json.record.result, undefined);
+
+    await appendFile(eventsPath, `${JSON.stringify({ runId, type: "run-finished", status: "failed", error: "boom" })}\n`);
+    await server.drainRun(runId);
+    detail = await get(`${bound.url}/api/runs/${runId}`);
+    assert.equal(detail.json.record.status, "completed");
+    assert.deepEqual(detail.json.record.result, { value: "old" });
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 // Regression guard for the in-process viewer: the producer (RunEventLog) and the server live in the
 // SAME process, exactly as `run` does. A held-open append stream's writes don't fire fs.watch on
 // macOS, which silently broke live updates — so this drives events through the REAL producer API

@@ -1,5 +1,6 @@
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import { atomicWriteFile } from "./atomic-file.js";
 import type { AgentFailure } from "./types.js";
 import type { WorkflowSourceKind } from "./workflow-tool.js";
 
@@ -44,8 +45,7 @@ export class FileRunStore {
   constructor(private readonly dir: string) {}
 
   async save(record: RunRecord): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
-    await writeFile(this.recordPath(record.runId), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+    await atomicWriteFile(this.recordPath(record.runId), `${JSON.stringify(record, null, 2)}\n`);
   }
 
   /** Merges a partial update into an existing record (no-op if the run is unknown). */

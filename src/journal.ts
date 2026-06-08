@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { atomicWriteFile } from "./atomic-file.js";
 import type { WorkflowAgentCall, WorkflowAgentOptions, WorkflowJournal, WorkflowJournalEntry } from "./types.js";
 
 export class InMemoryWorkflowJournal implements WorkflowJournal {
@@ -38,9 +39,7 @@ export class FileWorkflowJournal implements WorkflowJournal {
   }
 
   async put(entry: WorkflowJournalEntry): Promise<void> {
-    const dir = path.join(this.directory, entry.runId);
-    await mkdir(dir, { recursive: true });
-    await writeFile(this.entryPath(entry.runId, entry.key), JSON.stringify(entry, null, 2), "utf8");
+    await atomicWriteFile(this.entryPath(entry.runId, entry.key), JSON.stringify(entry, null, 2));
   }
 
   private entryPath(runId: string, key: string): string {

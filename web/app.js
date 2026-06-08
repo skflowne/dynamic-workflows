@@ -112,6 +112,15 @@ function seedLiveFromBuffer(buffer) {
   state.liveLogs = [];
   state.liveAgents.clear();
   for (const ev of buffer || []) {
+    if (ev.type === "run-meta") {
+      state.liveLogs = [];
+      state.liveAgents.clear();
+      continue;
+    }
+    if (ev.type === "run-finished") {
+      state.liveAgents.clear();
+      continue;
+    }
     if (ev.type !== "progress" || !ev.event) continue;
     const e = ev.event;
     if (e.type === "log") state.liveLogs.push(e.message);
@@ -907,8 +916,10 @@ function connectStream() {
 
 function handleLive(msg) {
   if (msg.type === "run-meta") {
+    const hadSelection = Boolean(state.selectedRunId);
+    const shouldSelect = msg.runId === state.selectedRunId || !hadSelection;
     loadRuns().then(() => {
-      if (!state.selectedRunId) selectRun(msg.runId); // auto-focus a freshly started run
+      if (shouldSelect) selectRun(msg.runId, !hadSelection); // auto-focus fresh runs; refresh selected resumes
     });
     return;
   }

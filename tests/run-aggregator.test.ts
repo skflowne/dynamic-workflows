@@ -108,6 +108,7 @@ test("buildRunView folds record.failures in as failed nodes bucketed by phase", 
   assert.ok(verify);
   assert.equal(verify.agents.length, 1);
   const failed = verify.agents[0];
+  assert.ok(failed);
   assert.equal(failed.status, "failed");
   assert.equal(failed.key, "boom");
   assert.equal(failed.hasSession, false);

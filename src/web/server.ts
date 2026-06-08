@@ -164,23 +164,22 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       const filePath = path.join(runsDir, name);
       const recordPath = path.join(runsDir, `${name.slice(0, -EVENTS_SUFFIX.length)}.json`);
       const record = await readRecord(recordPath);
-      if (record && record.status !== "running") {
-        await reapOrphan(filePath);
-        continue;
-      }
+      if (record && record.status !== "running" && (await reapOrphan(filePath))) continue;
       await tailFile(filePath);
     }
   }
 
-  async function reapOrphan(filePath: string): Promise<void> {
+  async function reapOrphan(filePath: string): Promise<boolean> {
     try {
       const { mtimeMs } = await stat(filePath);
-      if (Date.now() - mtimeMs < ORPHAN_GRACE_MS) return; // a sibling process may still be tailing it
+      if (Date.now() - mtimeMs < ORPHAN_GRACE_MS) return false; // a sibling process may still be tailing it
       await unlink(filePath);
       offsets.delete(filePath);
       partials.delete(filePath);
+      return true;
     } catch {
       // best-effort cleanup
+      return true;
     }
   }
 
@@ -264,7 +263,9 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
         return;
       }
       if (segments[1] === "runs" && segments.length === 2) {
-        sendJson(res, 200, await store.list());
+        const records = await Promise.all((await store.list()).map(overlayLiveRecord));
+        records.sort((a, b) => b.startedAt - a.startedAt);
+        sendJson(res, 200, records);
         return;
       }
       if (segments[1] === "runs" && segments.length >= 3) {
@@ -281,11 +282,12 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
   }
 
   async function handleRunRoute(runId: string, rest: string[], res: http.ServerResponse): Promise<void> {
-    const record = await store.get(runId);
-    if (!record) {
+    const storedRecord = await store.get(runId);
+    if (!storedRecord) {
       sendJson(res, 404, { error: `run ${runId} not found` });
       return;
     }
+    const record = await overlayLiveRecord(storedRecord);
     const entries = await readJournalEntries(journalDir, runId);
 
     // GET /api/runs/:id
@@ -342,6 +344,22 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
     });
   }
 
+  async function overlayLiveRecord(record: RunRecord): Promise<RunRecord> {
+    const live = latestLiveRecord(record.runId);
+    if (!live) return record;
+    if (!(await fileExists(runEventsPath(base, record.runId)))) return record;
+    return live;
+  }
+
+  function latestLiveRecord(runId: string): RunRecord | undefined {
+    let live: RunRecord | undefined;
+    for (const event of buffers.get(runId) ?? []) {
+      if (event.type === "run-meta" && isRunRecord(event.record)) live = event.record;
+      else if (event.type === "run-finished") live = undefined;
+    }
+    return live;
+  }
+
   return {
     server,
     async listen(port: number, host = "127.0.0.1") {
@@ -370,6 +388,12 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       });
     },
   };
+}
+
+function isRunRecord(value: unknown): value is RunRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<RunRecord>;
+  return typeof record.runId === "string" && typeof record.name === "string" && typeof record.status === "string";
 }
 
 function resolveWebDir(): string {
@@ -406,6 +430,10 @@ async function serveStatic(pathname: string, res: http.ServerResponse, webDir: s
 }
 
 async function isFile(p: string): Promise<boolean> {
+  return fileExists(p);
+}
+
+async function fileExists(p: string): Promise<boolean> {
   try {
     return (await stat(p)).isFile();
   } catch {
