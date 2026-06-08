@@ -161,17 +161,34 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 
 /* ---------- Pipeline flow graph ---------- */
 .flow { position: relative; }
-.flow-rail { display: flex; align-items: center; flex-wrap: wrap; row-gap: 12px; }
+.flow-tree { display: grid; gap: 12px; }
+.flow-branch {
+  position: relative; display: grid; grid-template-columns: 172px minmax(0, 1fr); gap: 24px;
+  min-height: 54px;
+}
+.tree-svg { position: absolute; inset: 0; pointer-events: none; z-index: 0; overflow: visible; }
+.tree-line { stroke: var(--clay); stroke-width: 1.1; fill: none; opacity: 0.24; }
+.branch-axis { position: relative; z-index: 1; display: flex; align-items: flex-start; padding: 4px 0; }
+.axis-line {
+  position: absolute; left: 16px; top: -12px; bottom: -12px; width: 2px;
+  background: var(--border-strong); opacity: 0.68;
+}
+.branch-axis.first .axis-line { top: 21px; }
+.branch-axis.last .axis-line { bottom: calc(100% - 21px); }
 .flow-phase {
-  display: inline-flex; align-items: center; gap: 9px; cursor: pointer; font-family: var(--sans);
+  position: relative; z-index: 2; display: inline-flex; align-items: center; gap: 9px; cursor: pointer; font-family: var(--sans);
+  min-width: 142px; max-width: 172px;
   background: var(--surface); border: 1px solid var(--border); border-radius: 999px;
-  padding: 9px 15px; color: var(--ink); box-shadow: var(--shadow-sm);
+  padding: 9px 13px; color: var(--ink); box-shadow: var(--shadow-sm);
   transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
 }
 .flow-phase:hover { border-color: var(--border-strong); box-shadow: var(--shadow-md); }
 .flow-phase.active { border-color: var(--clay); background: var(--clay-soft); }
 .flow-phase .fp-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--clay); flex: none; }
-.flow-phase .fp-name { font-family: var(--serif); font-size: 16px; font-weight: 500; }
+.flow-phase .fp-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--serif); font-size: 16px; font-weight: 500;
+}
 .flow-phase .fp-count { font-family: var(--mono); font-size: 12px; color: var(--ink-2); background: var(--paper); padding: 1px 8px; border-radius: 999px; }
 .flow-phase.in-progress .fp-count { background: var(--amber-soft); color: var(--amber); }
 /* Declared-but-not-yet-run phase: pre-rendered, muted until its first agent appears. */
@@ -179,37 +196,13 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 .flow-phase.pending .fp-dot { background: var(--muted); }
 .flow-phase .fp-chev { color: var(--muted); font-size: 11px; transition: transform 0.18s; }
 .flow-phase.active .fp-chev { transform: rotate(180deg); color: var(--clay); }
-/* connector line between phases */
-.flow-link { flex: 0 0 34px; height: 2px; background: linear-gradient(90deg, var(--border-strong), var(--border-strong)); position: relative; }
-.flow-link::after { content: ""; position: absolute; right: -1px; top: 50%; width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); transform: translateY(-50%); }
-
-.flow-expansion {
-  position: relative; margin-top: 22px; padding: 22px 22px 20px; display: flex; gap: 44px; align-items: flex-start;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow-sm);
+.branch-panel {
+  position: relative; z-index: 1; min-width: 0; display: block; padding: 14px 18px;
+  background: transparent; border-top: 1px solid var(--border);
   animation: fade 0.2s;
 }
-/* pointer triangle aligned under the active phase */
-.flow-expansion::before {
-  content: ""; position: absolute; top: -9px; left: var(--pointer-x, 40px); transform: translateX(-50%);
-  border-left: 9px solid transparent; border-right: 9px solid transparent; border-bottom: 9px solid var(--border);
-}
-.flow-expansion::after {
-  content: ""; position: absolute; top: -7px; left: var(--pointer-x, 40px); transform: translateX(-50%);
-  border-left: 8px solid transparent; border-right: 8px solid transparent; border-bottom: 8px solid var(--surface);
-}
-.fan-svg { position: absolute; inset: 0; pointer-events: none; z-index: 0; overflow: visible; }
-.fan-line { stroke: var(--clay); stroke-width: 1.1; fill: none; opacity: 0.28; }
-.fan-hub { position: relative; z-index: 1; flex: 0 0 auto; display: flex; flex-direction: column; gap: 3px; align-items: flex-start; max-width: 180px; }
-.fan-hub .fh-dot { width: 13px; height: 13px; border-radius: 50%; background: var(--clay); box-shadow: 0 0 0 4px var(--clay-soft); margin-bottom: 4px; }
-.fan-hub .fh-name { font-family: var(--serif); font-size: 19px; font-weight: 500; }
-.fan-hub .fh-count { font-size: 12px; color: var(--muted); }
+.branch-panel[hidden] { display: none; }
 .fan-main { position: relative; z-index: 1; flex: 1; min-width: 0; }
-.fan-toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-bottom: 12px; }
-.agent-filter {
-  width: min(320px, 100%); padding: 7px 10px; border: 1px solid var(--border);
-  border-radius: var(--r-sm); background: var(--paper-2); color: var(--ink); font-family: var(--sans); font-size: 12.5px;
-}
-.fan-summary { color: var(--muted); font-size: 12px; flex: none; }
 .fan-grid { display: flex; flex-wrap: wrap; gap: 8px; align-content: center; }
 .fan-grid.compact { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
 .fan-grid.compact .flow-node { max-width: none; justify-content: flex-start; }
@@ -373,14 +366,12 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
   .run-view { padding: 22px 16px 56px; }
   .empty-state { padding: 28px; }
   .rv-title { font-size: 25px; }
-  .flow-rail { align-items: stretch; }
-  .flow-link { display: none; }
-  .flow-phase { width: 100%; justify-content: space-between; border-radius: var(--r); }
-  .flow-expansion { flex-direction: column; gap: 16px; padding: 18px 16px; }
-  .flow-expansion::before, .flow-expansion::after, .fan-svg { display: none; }
-  .fan-hub { max-width: none; }
-  .fan-toolbar { align-items: stretch; flex-direction: column; }
-  .agent-filter { width: 100%; }
+  .flow-branch { grid-template-columns: 1fr; gap: 8px; padding-left: 18px; }
+  .branch-axis { padding: 0; }
+  .axis-line { left: -12px; }
+  .flow-phase { width: 100%; max-width: none; justify-content: space-between; border-radius: var(--r); }
+  .branch-panel { padding: 12px 0 14px; }
+  .tree-svg { display: none; }
   .drawer { width: 100vw; }
   .tabs { overflow-x: auto; padding: 0 14px; }
   .drawer-head { padding: 16px 16px 12px; }

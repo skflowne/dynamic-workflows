@@ -9,8 +9,8 @@ const state = {
   selectedRunId: null,
   runData: null,
   drawerKey: null,
-  expandedPhase: null, // phase title, not index; live updates can insert/reorder phase groups
-  agentFilter: "",
+  expandedPhases: new Set(), // phase titles; live updates can insert/reorder phase groups
+  phaseExpansionTouched: false,
   lastFocus: null,
   liveAgents: new Map(), // key -> {key, label, phase, state} for in-flight/just-finished agents
   liveLogs: [], // log lines seen via SSE (record.logs is only persisted at completion)
@@ -86,8 +86,8 @@ function renderRunList() {
 
 async function selectRun(runId, push = true) {
   state.selectedRunId = runId;
-  state.expandedPhase = null;
-  state.agentFilter = "";
+  state.expandedPhases = new Set();
+  state.phaseExpansionTouched = false;
   state.liveAgents.clear();
   state.liveLogs = [];
   closeSidebar();
@@ -130,10 +130,10 @@ function seedLiveFromBuffer(buffer) {
 
 function renderRunView(data) {
   const { record, view } = data;
-  state.expandedPhase = null;
   const desc = record.description ? `<p class="rv-desc">${escapeHtml(record.description)}</p>` : "";
   const stats = view.stats;
   const phases = mergedPhases();
+  ensureDefaultExpandedPhases(phases);
   const visibleAgentCount = phases.reduce((sum, phase) => sum + phase.agents.length, 0);
   // When a real result exists it's the answer — show it above the logs, which become secondary.
   const hasResult = record.result !== undefined && record.result !== null;
@@ -154,6 +154,7 @@ function renderRunView(data) {
     <div id="flow-section">${renderFlowSection(phases)}</div>
     ${hasResult ? renderResultSection(record) + renderLogs(record) : renderLogs(record) + renderResultSection(record)}
   `;
+  requestAnimationFrame(drawTreeBranches);
   setLiveActive(record.status === "running");
 }
 
@@ -377,44 +378,55 @@ function phaseBadge(p) {
   return { total, done, pending, inProgress: done < total, badge: pending ? "" : done < total ? `${done}/${total}` : `${total}` };
 }
 
-function railNodeHtml(p) {
+function defaultExpandedPhases(phases) {
+  return phases.filter((phase) => phase.agents.length > 0).map((phase) => phase.title);
+}
+
+function ensureDefaultExpandedPhases(phases) {
+  if (!state.phaseExpansionTouched && state.expandedPhases.size === 0) state.expandedPhases = new Set(defaultExpandedPhases(phases));
+}
+
+function phaseNodeHtml(p) {
   const { pending, inProgress, badge } = phaseBadge(p);
-  const active = p.title === state.expandedPhase ? " active" : "";
-  return `<button class="flow-phase${inProgress ? " in-progress" : ""}${pending ? " pending" : ""}${active}" data-phase-title="${escapeHtml(p.title)}" aria-expanded="${active ? "true" : "false"}">
+  const expanded = state.expandedPhases.has(p.title);
+  const active = expanded ? " active" : "";
+  return `<button class="flow-phase${inProgress ? " in-progress" : ""}${pending ? " pending" : ""}${active}" data-phase-title="${escapeHtml(p.title)}" aria-expanded="${expanded ? "true" : "false"}">
         <span class="fp-dot"></span>
         <span class="fp-name">${escapeHtml(p.title)}</span>
         ${pending ? "" : `<span class="fp-count">${badge}</span>`}
-        <span class="fp-chev">▾</span>
+        <span class="fp-chev">v</span>
       </button>`;
-}
-
-// A pending phase is pre-rendered so the whole pipeline is visible before it runs (its agent nodes
-// can't be: their count/labels are decided at runtime).
-function renderRailNodes(phases) {
-  return phases.map((p, i) => (i < phases.length - 1 ? railNodeHtml(p) + `<span class="flow-link"></span>` : railNodeHtml(p))).join("");
 }
 
 function renderFlowSection(phases) {
   if (!phases.length) return `<div class="muted-note">No agents recorded yet.</div>`;
   return `<div class="section-label">Pipeline</div>
-    <div class="flow" id="flow">
-      <div class="flow-rail">${renderRailNodes(phases)}</div>
-      <div class="flow-expansion" id="flow-expansion" hidden></div>
+    <div class="flow flow-tree" id="flow">
+      ${phases.map((phase, index) => renderPhaseBranch(phase, index, phases.length)).join("")}
     </div>`;
 }
 
-function filterAgents(p) {
-  const query = state.agentFilter.trim().toLowerCase();
-  const filtered = query
-    ? p.agents.filter((a) => `${a.label} ${a.resultPreview || ""}`.toLowerCase().includes(query))
-    : p.agents;
-  return { filtered, visible: filtered.slice(0, 180) };
+function renderPhaseBranch(phase, index, total) {
+  const expanded = state.expandedPhases.has(phase.title);
+  const { pending, inProgress } = phaseBadge(phase);
+  return `<div class="flow-branch${expanded ? " expanded" : ""}${pending ? " pending" : ""}${inProgress ? " in-progress" : ""}" data-phase-title="${escapeHtml(phase.title)}">
+    <svg class="tree-svg" aria-hidden="true"></svg>
+    <div class="branch-axis${index === 0 ? " first" : ""}${index === total - 1 ? " last" : ""}">
+      <span class="axis-line"></span>
+      ${phaseNodeHtml(phase)}
+    </div>
+    <div class="branch-panel"${expanded ? "" : " hidden"}>
+      ${expanded ? renderFan(phase) : ""}
+    </div>
+  </div>`;
 }
 
-// Every node carries `data-key` (so the live-tick reconciler can locate it); live (not-yet-journaled)
-// nodes get `data-live` instead of being keyless — that flag, not the absence of a key, is what makes
-// them non-clickable. nodeClassName / nodeInner are shared by the HTML and DOM-creation paths so the
-// two never drift.
+function visibleAgents(p) {
+  return p.agents.slice(0, 180);
+}
+
+// Every node carries `data-key`; live (not-yet-journaled) nodes also get `data-live`, which keeps
+// them visible but non-clickable until their journal entry exists.
 function nodeClassName(a) {
   return `flow-node ${a.status}${a.live ? " pending" : ""}`;
 }
@@ -433,296 +445,75 @@ function fanNodeHtml(a, delayMs) {
 
 function fanNodesHtml(visible) {
   const nodes = visible.map((a, i) => fanNodeHtml(a, Math.min(i * 12, 300))).join("");
-  return nodes || '<div class="muted-note">No matching agents.</div>';
+  return nodes || '<div class="muted-note">No agents.</div>';
 }
 
-function fanSummaryHtml(filtered, p) {
-  return `${fmtNum(filtered.length)} shown${filtered.length !== p.agents.length ? ` / ${fmtNum(p.agents.length)}` : ""}`;
-}
-
-function fanNoteHtml(filtered, visible) {
-  return filtered.length > visible.length ? `<div class="fan-note">Showing first ${visible.length}; refine the filter to narrow this phase.</div>` : "";
+function fanNoteHtml(p, visible) {
+  return p.agents.length > visible.length ? `<div class="fan-note">Showing first ${visible.length} of ${fmtNum(p.agents.length)} agents.</div>` : "";
 }
 
 function renderFan(p) {
-  const { filtered, visible } = filterAgents(p);
+  const visible = visibleAgents(p);
   const compact = p.agents.length > 48 ? " compact" : "";
-  return `<svg class="fan-svg" aria-hidden="true"></svg>
-    <div class="fan-hub">
-      <span class="fh-dot"></span>
-      <span class="fh-name">${escapeHtml(p.title)}</span>
-      <span class="fh-count">${p.agents.length} agent${p.agents.length === 1 ? "" : "s"}</span>
-    </div>
-    <div class="fan-main">
-      <div class="fan-toolbar">
-        <span class="fan-summary">${fanSummaryHtml(filtered, p)}</span>
-        <input class="agent-filter" type="search" value="${escapeHtml(state.agentFilter)}" placeholder="Filter agents" autocomplete="off" />
-      </div>
+  return `<div class="fan-main">
       <div class="fan-grid${compact}">${fanNodesHtml(visible)}</div>
-      ${fanNoteHtml(filtered, visible)}
+      ${fanNoteHtml(p, visible)}
     </div>`;
 }
 
-// Live filter update: reconcile the grid in place (never the <input> — recreating it mid-keystroke
-// would abort an in-progress IME composition so Chinese/Japanese/Korean never commits), and update
-// the summary/note. Reconciling (vs innerHTML rebuild) keeps surviving nodes from re-firing their
-// entrance animation on every keystroke.
-function applyAgentFilter() {
-  if (!state.expandedPhase) return;
-  const phase = mergedPhases().find((p) => p.title === state.expandedPhase);
-  const exp = el("flow-expansion");
-  if (!phase || !exp || exp.hidden) return;
-  const { filtered, visible } = filterAgents(phase);
-  const summary = exp.querySelector(".fan-summary");
-  if (summary) summary.innerHTML = fanSummaryHtml(filtered, phase);
-  const grid = exp.querySelector(".fan-grid");
-  const layoutChanged = reconcileFanGrid(grid, visible);
-  const note = exp.querySelector(".fan-note");
-  const noteHtml = fanNoteHtml(filtered, visible);
-  if (note) note.remove();
-  if (noteHtml && grid) grid.insertAdjacentHTML("afterend", noteHtml);
-  if (layoutChanged) drawFan();
-}
-
 function togglePhase(title) {
-  if (state.expandedPhase === title) {
-    state.expandedPhase = null;
-    state.agentFilter = "";
-    const exp = el("flow-expansion");
-    exp.hidden = true;
-    exp.innerHTML = "";
-    document.querySelectorAll(".flow-phase").forEach((b) => b.classList.remove("active"));
-    return;
+  state.phaseExpansionTouched = true;
+  if (state.expandedPhases.has(title)) state.expandedPhases.delete(title);
+  else state.expandedPhases.add(title);
+  renderCurrentFlow();
+}
+
+function renderCurrentFlow() {
+  const section = el("flow-section");
+  if (!section) return;
+  section.innerHTML = renderFlowSection(mergedPhases());
+  requestAnimationFrame(drawTreeBranches);
+}
+
+function drawTreeBranches() {
+  for (const branch of document.querySelectorAll(".flow-branch.expanded")) {
+    drawTreeBranch(branch);
   }
-  state.agentFilter = "";
-  expandPhase(title);
 }
 
-function expandPhase(title) {
-  const phases = mergedPhases();
-  const phase = phases.find((p) => p.title === title);
-  if (!phase) return;
-  state.expandedPhase = title;
-  document.querySelectorAll(".flow-phase").forEach((b) => {
-    const active = b.dataset.phaseTitle === title;
-    b.classList.toggle("active", active);
-    b.setAttribute("aria-expanded", active ? "true" : "false");
-  });
-  const exp = el("flow-expansion");
-  exp.innerHTML = renderFan(phase);
-  exp.hidden = false;
-  positionPointer(title);
-  // Synchronous draw (getBoundingClientRect forces layout); a deferred pass catches font/wrap reflow.
-  drawFan();
-  requestAnimationFrame(drawFan);
-}
-
-// Aligns the expansion panel's pointer triangle under the active phase node.
-function positionPointer(title) {
-  const btn = [...document.querySelectorAll(".flow-phase")].find((node) => node.dataset.phaseTitle === title);
-  const flow = el("flow");
-  const exp = el("flow-expansion");
-  if (!btn || !flow || !exp) return;
-  const b = btn.getBoundingClientRect();
-  const f = flow.getBoundingClientRect();
-  exp.style.setProperty("--pointer-x", `${b.left + b.width / 2 - f.left}px`);
-}
-
-// Draws SVG curves from the phase hub out to every agent node (a fan-out).
-function drawFan() {
-  const exp = el("flow-expansion");
-  if (!exp || exp.hidden) return;
-  const svg = exp.querySelector(".fan-svg");
-  const hub = exp.querySelector(".fan-hub");
-  if (!svg || !hub) return;
-  if (exp.querySelectorAll(".flow-node").length > 80 || matchMedia("(max-width: 720px)").matches) {
+function drawTreeBranch(branch) {
+  const svg = branch.querySelector(".tree-svg");
+  const phase = branch.querySelector(".flow-phase");
+  if (!svg || !phase) return;
+  if (branch.querySelectorAll(".flow-node").length > 120 || matchMedia("(max-width: 720px)").matches) {
     svg.innerHTML = "";
     return;
   }
-  const base = exp.getBoundingClientRect();
+  const base = branch.getBoundingClientRect();
   svg.setAttribute("width", String(base.width));
   svg.setAttribute("height", String(base.height));
   svg.setAttribute("viewBox", `0 0 ${base.width} ${base.height}`);
-  const hb = hub.getBoundingClientRect();
-  const sx = hb.right - base.left;
-  const sy = hb.top + hb.height / 2 - base.top;
+  const pb = phase.getBoundingClientRect();
+  const sx = pb.right - base.left - 2;
+  const sy = pb.top + pb.height / 2 - base.top;
   let paths = "";
-  for (const n of exp.querySelectorAll(".flow-node")) {
+  for (const n of branch.querySelectorAll(".flow-node")) {
     const nb = n.getBoundingClientRect();
-    const ex = nb.left - base.left;
+    const ex = nb.left - base.left - 4;
     const ey = nb.top + nb.height / 2 - base.top;
     const c = Math.max((ex - sx) * 0.5, 18);
-    paths += `<path class="fan-line" d="M${sx.toFixed(1)},${sy.toFixed(1)} C${(sx + c).toFixed(1)},${sy.toFixed(1)} ${(ex - c).toFixed(1)},${ey.toFixed(1)} ${ex.toFixed(1)},${ey.toFixed(1)}"/>`;
+    paths += `<path class="tree-line" d="M${sx.toFixed(1)},${sy.toFixed(1)} C${(sx + c).toFixed(1)},${sy.toFixed(1)} ${(ex - c).toFixed(1)},${ey.toFixed(1)} ${ex.toFixed(1)},${ey.toFixed(1)}"/>`;
   }
   svg.innerHTML = paths;
 }
 
-/* ---- Incremental live update: patch head stats + flow IN PLACE, keyed by agent key, instead of
-   tearing down and re-animating the whole view on every 350ms refetch tick. ---- */
+/* ---- Live update: refresh stats and repaint the tree while preserving multi-expanded state. ---- */
 
-// Builds a fresh fan-node element. New nodes get the default 0ms animation-delay so a genuinely new
-// agent fades in once (desirable) — only re-creation re-fires the animation, which we now avoid for
-// existing nodes.
-function createFanNode(a) {
-  const node = document.createElement("button");
-  node.className = nodeClassName(a);
-  node.dataset.key = a.key;
-  if (a.live) node.dataset.live = "1";
-  node.title = nodeTitle(a);
-  node.innerHTML = nodeInner(a);
-  return node;
-}
-
-// Patches an existing fan node in place — flips status classes / dot / label and live→clickable —
-// without recreating the element, so the `rise` animation does NOT replay.
-function updateFanNode(node, a) {
-  const cls = nodeClassName(a);
-  if (node.className !== cls) node.className = cls;
-  if (a.live) node.dataset.live = "1";
-  else if (node.dataset.live) delete node.dataset.live;
-  const title = nodeTitle(a);
-  if (node.title !== title) node.title = title;
-  const dot = node.querySelector(".fn-dot");
-  const dotCls = `fn-dot ${a.status}`;
-  if (dot && dot.className !== dotCls) dot.className = dotCls;
-  const label = node.querySelector(".fn-label");
-  if (label && label.textContent !== a.label) label.textContent = a.label;
-}
-
-// Reconcile the fan grid's node elements against `visible` IN PLACE, keyed by agent key: update
-// survivors, create new nodes, drop gone ones, and fix order. Returns true iff node membership/order
-// changed (→ the SVG fan-out needs a redraw; a pure status flip leaves every node's position intact).
-function reconcileFanGrid(grid, visible) {
-  if (!grid) return false;
-  if (visible.length === 0) {
-    const had = grid.querySelector(".flow-node");
-    grid.innerHTML = '<div class="muted-note">No matching agents.</div>';
-    return Boolean(had);
-  }
-  const placeholder = grid.querySelector(".muted-note");
-  if (placeholder) placeholder.remove();
-
-  const existing = new Map();
-  for (const node of grid.querySelectorAll(".flow-node")) existing.set(node.dataset.key, node);
-
-  let layoutChanged = false;
-  visible.forEach((a, i) => {
-    let node = existing.get(a.key);
-    if (node) {
-      updateFanNode(node, a);
-      existing.delete(a.key);
-    } else {
-      node = createFanNode(a);
-      layoutChanged = true;
-    }
-    const current = grid.children[i];
-    if (current !== node) {
-      grid.insertBefore(node, current || null);
-      layoutChanged = true;
-    }
-  });
-  for (const node of existing.values()) {
-    node.remove();
-    layoutChanged = true;
-  }
-  return layoutChanged;
-}
-
-// Patches a rail phase button's badge + in-progress/pending classes in place. Leaves `active`
-// untouched — that's owned by expand/collapse.
-function updateRailNode(btn, p) {
-  const { pending, inProgress, badge } = phaseBadge(p);
-  btn.classList.toggle("in-progress", inProgress);
-  btn.classList.toggle("pending", pending);
-  let count = btn.querySelector(".fp-count");
-  if (pending) {
-    if (count) count.remove();
-  } else {
-    if (!count) {
-      count = document.createElement("span");
-      count.className = "fp-count";
-      btn.insertBefore(count, btn.querySelector(".fp-chev"));
-    }
-    if (count.textContent !== badge) count.textContent = badge;
-  }
-}
-
-// Reconcile the pipeline rail. Same phase set/order → patch each badge in place; a changed set
-// (rare: a new phase title appears mid-run) → rebuild just `.flow-rail` (cheap, no entrance
-// animation), leaving the sibling expansion panel alone.
-function patchRail(phases) {
-  const rail = el("flow")?.querySelector(".flow-rail");
-  if (!rail) return;
-  const current = [...rail.querySelectorAll(".flow-phase")];
-  const newTitles = phases.map((p) => p.title);
-  const sameSet = current.length === newTitles.length && current.every((b, i) => b.dataset.phaseTitle === newTitles[i]);
-  if (!sameSet) {
-    rail.innerHTML = renderRailNodes(phases);
-    if (state.expandedPhase) {
-      const btn = [...rail.querySelectorAll(".flow-phase")].find((b) => b.dataset.phaseTitle === state.expandedPhase);
-      if (btn) {
-        btn.classList.add("active");
-        btn.setAttribute("aria-expanded", "true");
-      }
-    }
-    return;
-  }
-  const byTitle = new Map(current.map((b) => [b.dataset.phaseTitle, b]));
-  for (const p of phases) {
-    const btn = byTitle.get(p.title);
-    if (btn) updateRailNode(btn, p);
-  }
-}
-
-// Reconcile the currently-open fan: hub count, summary, note, the keyed node grid, and the
-// compact-grid threshold. Only redraws the SVG when node layout actually changed.
-function patchOpenFan(phases) {
-  if (!state.expandedPhase) return;
-  const exp = el("flow-expansion");
-  if (!exp || exp.hidden) return;
-  const phase = phases.find((p) => p.title === state.expandedPhase);
-  if (!phase) {
-    togglePhase(state.expandedPhase); // the expanded phase vanished (shouldn't happen mid-run) — collapse
-    return;
-  }
-  const hubCount = exp.querySelector(".fan-hub .fh-count");
-  if (hubCount) hubCount.textContent = `${phase.agents.length} agent${phase.agents.length === 1 ? "" : "s"}`;
-
-  const { filtered, visible } = filterAgents(phase);
-  const summary = exp.querySelector(".fan-summary");
-  if (summary) summary.innerHTML = fanSummaryHtml(filtered, phase);
-
-  const grid = exp.querySelector(".fan-grid");
-  let layoutChanged = reconcileFanGrid(grid, visible);
-  if (grid) {
-    const wantCompact = phase.agents.length > 48; // mirrors renderFan(): compact grid past 48 nodes
-    if (grid.classList.contains("compact") !== wantCompact) {
-      grid.classList.toggle("compact", wantCompact);
-      layoutChanged = true;
-    }
-  }
-
-  const note = exp.querySelector(".fan-note");
-  const noteHtml = fanNoteHtml(filtered, visible);
-  if (note) note.remove();
-  if (noteHtml && grid) grid.insertAdjacentHTML("afterend", noteHtml);
-
-  if (layoutChanged) {
-    drawFan();
-    requestAnimationFrame(drawFan);
-  }
-}
-
-// Reconcile the whole flow section incrementally. Falls back to a one-shot full render only when the
-// section hasn't been built yet (e.g. the first paint had zero agents).
 function patchFlow(phases) {
-  if (!el("flow")) {
-    const section = el("flow-section");
-    if (section) section.innerHTML = renderFlowSection(phases);
-    return;
-  }
-  patchRail(phases);
-  patchOpenFan(phases);
+  const section = el("flow-section");
+  if (!section) return;
+  section.innerHTML = renderFlowSection(phases);
+  requestAnimationFrame(drawTreeBranches);
 }
 
 // Live-tick entry point (replaces a full renderRunView on every refetch): refresh the head stats +
@@ -732,6 +523,7 @@ function patchRunView(data) {
   state.runData = data;
   const { record, view } = data;
   const phases = mergedPhases();
+  ensureDefaultExpandedPhases(phases);
   const visibleAgentCount = phases.reduce((sum, p) => sum + p.agents.length, 0);
   const statsBox = $(".rv-stats");
   if (statsBox) statsBox.innerHTML = renderHeadStats(record, view.stats, visibleAgentCount);
@@ -1034,13 +826,6 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Tab" && !el("drawer").hidden) trapDrawerFocus(e);
 });
 
-document.addEventListener("input", (e) => {
-  const filter = e.target.closest(".agent-filter");
-  if (!filter) return;
-  state.agentFilter = filter.value;
-  applyAgentFilter();
-});
-
 el("run-search").addEventListener("input", (e) => {
   state.filter = e.target.value;
   renderRunList();
@@ -1053,11 +838,10 @@ window.addEventListener("popstate", () => {
 
 let resizeRaf = null;
 window.addEventListener("resize", () => {
-  if (state.expandedPhase == null) return;
+  if (!state.expandedPhases.size) return;
   if (resizeRaf) cancelAnimationFrame(resizeRaf);
   resizeRaf = requestAnimationFrame(() => {
-    positionPointer(state.expandedPhase);
-    drawFan();
+    drawTreeBranches();
   });
 });
 
