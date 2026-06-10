@@ -47,7 +47,9 @@ console.log(JSON.stringify({
       command: fakeGemini,
       cwd: dir,
       model: "runner-model",
-      agentTimeoutMs: 1000,
+      // Generous: under full-suite parallel load the fake CLI's node startup can exceed 1s, which
+      // intermittently tripped this as a spurious agent timeout.
+      agentTimeoutMs: 10000,
     });
     const result = await runner.run(makeCall("payload", "call-model"), undefined, (meta) => metas.push(meta));
 
