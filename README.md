@@ -1,14 +1,15 @@
 # codex-dynamic-workflows
 
-Run **Claude Code-style dynamic workflows** from the command line, backed by **OpenAI Codex** or
-**Gemini CLI** — with a **live visual run viewer** that shows the whole pipeline, every step's
+Run **Claude Code-style dynamic workflows** from the command line, backed by **OpenAI Codex**,
+**Gemini CLI**, or **pi** (the pi-coding-agent harness, which also reaches any OpenAI/Anthropic-
+compatible endpoint) — with a **live visual run viewer** that shows the whole pipeline, every step's
 progress, and the complete agent result behind each step.
 
 A workflow is an open TypeScript/JavaScript script with a `meta` block and top-level `await`. The
 orchestration primitives — `agent()`, `parallel()`, `pipeline()`, `workflow()`, `phase()`, `log()`,
 `args`, `budget` — are injected by the runtime. Each `agent()` call runs as an independent backend
-session: a Codex thread by default, or a fresh Gemini CLI process with `--backend gemini`. The script
-body itself executes unrestricted under **Bun**.
+session: a Codex thread by default, a fresh Gemini CLI process with `--backend gemini`, or a fresh pi
+process with `--backend pi`. The script body itself executes unrestricted under **Bun**.
 
 ```bash
 codex-workflow run examples/deep-research.js --args '"what changed in the API?"'   # auto-starts the viewer
@@ -20,8 +21,10 @@ The CLI binary is named `codex-workflow`.
 
 Claude Code ships a built-in `Workflow` tool for fan-out/verify/synthesize orchestration. This brings
 the same authoring model to Codex users as a standalone CLI: the same script shape runs unchanged,
-but the subagents can run through Codex using your local `codex login` credentials, or through Gemini
-CLI using your local Gemini CLI authentication.
+but the subagents can run through Codex using your local `codex login` credentials, through Gemini
+CLI using your local Gemini CLI authentication, or through **pi** — a full agentic harness (file +
+shell tools) that you can point at any OpenAI/Anthropic-compatible API (OpenAI, DeepSeek, vLLM,
+Ollama, LiteLLM, …) via `--base-url`.
 
 ## Requirements
 
@@ -29,8 +32,11 @@ CLI using your local Gemini CLI authentication.
 - **[Bun](https://bun.sh)** — workflow scripts execute in a Bun child process.
 - **[Codex CLI](https://github.com/openai/codex)** authenticated via `codex login` (the SDK reuses
   `~/.codex/auth.json`) for the default `codex` backend.
-- **Gemini CLI** for `--backend gemini`. Only one real agent backend is needed for `run`; neither is
-  needed for `validate`/`list`.
+- **Gemini CLI** for `--backend gemini`.
+- **[pi](https://pi.dev)** (`npm i -g @earendil-works/pi-coding-agent`) for `--backend pi`; supply
+  credentials via a provider env var (e.g. `OPENAI_API_KEY`), `--api-key`, or `--base-url` + `--api-key`
+  for a custom OpenAI/Anthropic-compatible endpoint.
+- Only one real agent backend is needed for `run`; none is needed for `validate`/`list`.
 
 ## Install
 
@@ -68,16 +74,18 @@ etc.) are treated as paths and report a file-not-found error if missing.
 from that run's journal cache (only failed/unrun agents re-execute). Pressing Ctrl-C during a run
 cancels it cleanly and prints the `resume` command to pick it back up. The run options below also
 apply to `resume` — pass `--args` (or most flags) there to override what was recorded. The **backend**
-(plus `--model` / `--gemini-command`) is inherited from the record when omitted; an explicit
-`--backend` that conflicts with the recorded one is refused, since the journal cache is not
-backend-aware and resuming under a different backend would silently mix results.
+(plus `--model` / `--gemini-command`, and the pi backend's `--pi-command` / `--provider` / `--base-url`
+/ `--pi-api` / `--thinking` / `--tools` / `--exclude-tools` / `--no-tools` — but **not** the API key,
+which resume re-reads from `--api-key` or the provider env var) is inherited from the record when
+omitted; an explicit `--backend` that conflicts with the recorded one is refused, since the journal
+cache is not backend-aware and resuming under a different backend would silently mix results.
 
 Run options:
 
 | Flag | Meaning |
 | --- | --- |
 | `--args <json\|@file.json>` | Value exposed to the script as `args` |
-| `--backend <codex\|gemini>` | Agent backend (default: `codex`; can also use `CODEX_WORKFLOW_BACKEND`) |
+| `--backend <codex\|gemini\|pi>` | Agent backend (default: `codex`; can also use `CODEX_WORKFLOW_BACKEND`) |
 | `--model <model>` | Model for every `agent()` call on the selected built-in backend |
 | `--concurrency <n>` | Max concurrent agents (capped at 16) |
 | `--budget <tokens>` | Token budget (estimate) shared across the run |
@@ -86,13 +94,26 @@ Run options:
 | `--sandbox <mode>` | Codex only: `read-only` \| `workspace-write` \| `danger-full-access` |
 | `--approval <policy>` | Codex only: `never` \| `on-request` \| `on-failure` \| `untrusted` |
 | `--reasoning <effort>` | Codex only: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
+| `--provider <name>` | pi only: backend provider (e.g. `openai`, `anthropic`, `deepseek`) |
+| `--base-url <url>` | pi only: custom OpenAI/Anthropic-compatible endpoint (requires `--model`) |
+| `--api-key <key>` | pi only: API key (or set the provider's env var, e.g. `OPENAI_API_KEY`) |
+| `--pi-api <shape>` | pi only: `openai-completions` (default) \| `openai-responses` \| `anthropic-messages` \| `google-generative-ai` |
+| `--thinking <level>` | pi only: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
+| `--tools` / `--exclude-tools <list>` | pi only: comma-separated tool allowlist / denylist |
+| `--no-tools` | pi only: disable all tools (a pure text turn) |
 | `--bun <path>` | Path to the Bun binary |
 | `--gemini-command <path>` | Gemini CLI executable for `--backend gemini` (or `CODEX_WORKFLOW_GEMINI_COMMAND`) |
+| `--pi-command <path>` | pi executable for `--backend pi` (or `CODEX_WORKFLOW_PI_COMMAND`) |
 | `--idle-timeout <ms>` | Bun child idle watchdog in milliseconds (`0` disables; default 300000) |
 | `--json` | Machine-readable output to stdout (suppresses progress) |
 | `--quiet` / `--no-progress` | Reduce / plainify progress output |
 
-For the Codex backend, web search + network access are **always enabled** for agents.
+For the Codex backend, web search + network access are **always enabled** for agents. The pi backend
+runs with its full built-in tool set (read/bash/edit/write/grep/find/ls) plus `--approve` by default;
+narrow it with `--tools` / `--exclude-tools` / `--no-tools`. For a custom `--base-url`, the runner
+generates a pi `models.json` describing the endpoint and injects the API key via env (never written to
+disk); omit `--api-key` for keyless endpoints (Ollama, vLLM, …) and a placeholder is sent instead. pi
+exits 0 even on a model error, so failures are detected from the turn's stop reason.
 
 Run history, the per-agent journal, and session links are recorded in a **global** data dir,
 `~/.codex-workflow/` (override with `CODEX_WORKFLOW_HOME`), so runs from every project are shared by
@@ -110,6 +131,11 @@ codex-workflow run examples/hello.js --args '{"name":"Ada"}' --json | jq .result
 
 # Real Gemini CLI run:
 codex-workflow run examples/hello.js --backend gemini --model gemini-3.5-flash --args '{"name":"Ada"}'
+
+# Real pi run against a custom OpenAI-compatible endpoint (e.g. DeepSeek):
+codex-workflow run examples/hello.js --backend pi \
+  --base-url https://api.deepseek.com --api-key "$DEEPSEEK_API_KEY" --model deepseek-v4-flash \
+  --args '{"name":"Ada"}'
 ```
 
 `examples/nested-demo.js` demonstrates the `workflow()` nesting primitive (nesting by path; registered
@@ -174,14 +200,14 @@ return { findings: findings.flat().filter(Boolean) }
 
 - `agent(prompt, opts?)` — spawn one subagent on the selected backend. Options: `label`, `phase`,
   `schema` (JSON Schema → validated structured output), `model`, `agentType`, `isolation:
-  'worktree'` (runs in a fresh detached git worktree). Built-in Codex/Gemini runners intentionally
+  'worktree'` (runs in a fresh detached git worktree). Built-in Codex/Gemini/pi runners intentionally
   ignore workflow-authored `model` values (`agent({ model })` and `meta.phases[].model`) so Claude
   workflows with hard-coded model names remain portable; use CLI/library `--model` / runner options
-  to choose the backend model. `agentType` is prompt context only; Codex/Gemini do not load Claude's
+  to choose the backend model. `agentType` is prompt context only; the backends do not load Claude's
   built-in agent definitions or tool bundles. Without a schema it returns the final text; with a
-  schema it returns the validated object. Gemini CLI does not receive a native JSON schema, so schema
-  correctness is enforced by the workflow runtime and failed validation is retried like any other
-  agent failure.
+  schema it returns the validated object. Neither Gemini CLI nor pi receives a native JSON schema, so
+  schema correctness is enforced by the workflow runtime and failed validation is retried like any
+  other agent failure.
 - `parallel(thunks)` — run `() => …` thunks concurrently; a thrown thunk resolves to `null`.
 - `pipeline(items, stage1, stage2, …)` — run each item through all stages independently (no barrier);
   stages receive `(prevResult, originalItem, index)`; a throwing stage drops the item to `null`.
@@ -210,7 +236,7 @@ represented as nullable in the strict copy and stripped back out before loose-sc
 The CLI is built on a small library you can embed:
 
 ```ts
-import { CodexSdkAgentRunner, GeminiCliAgentRunner, WorkflowController } from "codex-workflow";
+import { CodexSdkAgentRunner, GeminiCliAgentRunner, PiCliAgentRunner, WorkflowController } from "codex-workflow";
 
 const controller = new WorkflowController({
   runner: new CodexSdkAgentRunner({ cwd: process.cwd() }),
@@ -219,6 +245,19 @@ const controller = new WorkflowController({
 
 const geminiController = new WorkflowController({
   runner: new GeminiCliAgentRunner({ cwd: process.cwd(), model: "gemini-3.5-flash" }),
+});
+
+// pi against a custom OpenAI-compatible endpoint. `agentDir` hosts the generated models.json;
+// `sessionDir` is where pi writes session JSONL (point the viewer at the same path).
+const piController = new WorkflowController({
+  runner: new PiCliAgentRunner({
+    cwd: process.cwd(),
+    baseUrl: "https://api.deepseek.com",
+    apiKey: process.env.DEEPSEEK_API_KEY,
+    model: "deepseek-v4-flash",
+    agentDir: "/tmp/pi-home",
+    sessionDir: "/tmp/pi-sessions",
+  }),
 });
 
 const output = await controller.run({ scriptPath: "examples/deep-research.js", args: "What changed?" });
@@ -243,6 +282,7 @@ codex-workflow run
             -> JSONL IPC routes agent()/workflow()/phase()/log() back to the parent
                  -> CodexSdkAgentRunner  (real Codex threads)
                  -> GeminiCliAgentRunner (real Gemini CLI processes)
+                 -> PiCliAgentRunner     (real pi processes; OpenAI/Anthropic-compatible via --base-url)
                  -> ScriptedAgentRunner  (deterministic tests)
        -> FileRunStore records run history -> `runs` / `show`
 ```
@@ -255,11 +295,13 @@ npm run typecheck         # tsc over src + tests
 npm run test:deepresearch # runs the real Claude deep-research workflow against a stubbed runner
 ```
 
-The live Codex and Gemini paths are gated to avoid spending tokens / external service calls:
+The live Codex, Gemini, and pi paths are gated to avoid spending tokens / external service calls:
 
 ```bash
 RUN_CODEX_SDK_LIVE=1 npm test
 RUN_GEMINI_CLI_LIVE=1 npm test
+# pi: set PI_CLI_MODEL/PI_CLI_PROVIDER, or PI_CLI_BASE_URL + PI_CLI_API_KEY for a custom endpoint.
+RUN_PI_CLI_LIVE=1 PI_CLI_BASE_URL=https://api.deepseek.com PI_CLI_API_KEY=sk-... PI_CLI_MODEL=deepseek-v4-flash npm test
 ```
 
 `test:deepresearch` runs the vendored `deep-research` workflow (`examples/deep-research.js`) against a

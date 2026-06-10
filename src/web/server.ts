@@ -3,10 +3,12 @@ import { mkdir, open, readFile, readdir, stat, unlink } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { piSessionsDir as defaultPiSessionsDir } from "../paths.js";
 import { FileRunStore, type RunRecord } from "../run-store.js";
 import type { WorkflowAgentOptions, WorkflowJournalEntry } from "../types.js";
 import { runEventsPath } from "./event-log.js";
 import { linkGeminiAgent, parseGeminiSessionFile } from "./gemini-session.js";
+import { linkPiAgent, parsePiSessionFile } from "./pi-session.js";
 import { buildRunView, readJournalEntries } from "./run-aggregator.js";
 import { linkRun } from "./session-linker.js";
 import { parseCodexSessionFile } from "./session-parser.js";
@@ -40,6 +42,7 @@ export interface WebServerOptions {
   version?: string;
   sessionsDir?: string;
   geminiSessionsDir?: string;
+  piSessionsDir?: string;
   webDir?: string;
 }
 
@@ -72,6 +75,8 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
   const runsDir = path.join(base, "runs");
   const journalDir = path.join(base, "journal");
   const linksDir = path.join(base, "links");
+  // Where the pi backend writes its session JSONL (the runner passes the same path via --session-dir).
+  const piSessionsDir = options.piSessionsDir ?? defaultPiSessionsDir(base);
   const webDir = options.webDir ?? resolveWebDir();
   const store = new FileRunStore(runsDir);
 
@@ -323,6 +328,20 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
             sendJson(res, 200, { sessionPath: link.sessionPath, ...session });
           } catch (error) {
             sendJson(res, 404, { error: `could not read Gemini session: ${error instanceof Error ? error.message : String(error)}` });
+          }
+          return;
+        }
+        if (entry.backend === "pi") {
+          const link = await linkPiAgent(record, entry, { sessionsDir: piSessionsDir });
+          if (!link) {
+            sendJson(res, 404, { error: "no linked pi session for this agent" });
+            return;
+          }
+          try {
+            const session = await parsePiSessionFile(link.sessionPath);
+            sendJson(res, 200, { sessionPath: link.sessionPath, ...session });
+          } catch (error) {
+            sendJson(res, 404, { error: `could not read pi session: ${error instanceof Error ? error.message : String(error)}` });
           }
           return;
         }

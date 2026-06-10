@@ -255,6 +255,51 @@ test("CLI persists --model and resume inherits it", async () => {
   }
 });
 
+test("CLI persists the pi runner config (base-url/pi-api/tools) and resume inherits it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-pi-"));
+  try {
+    const wfPath = path.join(dir, "cli_demo.js");
+    await writeFile(wfPath, WORKFLOW, "utf8");
+
+    const run = await runCli(
+      [
+        "run", wfPath,
+        "--backend", "pi",
+        "--base-url", "https://api.example.com",
+        "--model", "my-model",
+        "--pi-api", "anthropic-messages",
+        "--tools", "read,grep",
+        "--thinking", "low",
+        "--json", "--cwd", dir,
+      ],
+      dir,
+    );
+    assert.equal(run.code, 0, run.stderr);
+    const runId = (JSON.parse(run.stdout) as { runId: string }).runId;
+
+    type PiRunner = { backend?: string; baseUrl?: string; piApi?: string; tools?: string; thinking?: string };
+    const recPath = path.join(dir, "runs", `${runId.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
+    const recBefore = JSON.parse(await readFile(recPath, "utf8")) as { runner?: PiRunner };
+    assert.equal(recBefore.runner?.backend, "pi");
+    assert.equal(recBefore.runner?.baseUrl, "https://api.example.com");
+    assert.equal(recBefore.runner?.piApi, "anthropic-messages");
+    assert.equal(recBefore.runner?.tools, "read,grep");
+    assert.equal(recBefore.runner?.thinking, "low");
+
+    // Resume with NO pi flags: pi-api/tools must travel with base-url, or the uncached agents would
+    // silently switch API shape / tool set relative to the original run.
+    const resumed = await runCli(["resume", runId, "--json", "--cwd", dir], dir);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    const recAfter = JSON.parse(await readFile(recPath, "utf8")) as { runner?: PiRunner };
+    assert.equal(recAfter.runner?.baseUrl, "https://api.example.com");
+    assert.equal(recAfter.runner?.piApi, "anthropic-messages");
+    assert.equal(recAfter.runner?.tools, "read,grep");
+    assert.equal(recAfter.runner?.thinking, "low");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("CLI rejects Codex-only flags with the Gemini backend", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-gemini-flags-"));
   try {

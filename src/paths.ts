@@ -23,3 +23,16 @@ export function journalDir(dataDir = workflowDataDir()): string {
 export function linksDir(dataDir = workflowDataDir()): string {
   return path.join(dataDir, "links");
 }
+
+/**
+ * Where the pi backend writes its session JSONL (passed to `pi --session-dir`). The single source of
+ * truth for this path — the web server imports it as its default, so runner and viewer always agree.
+ */
+export function piSessionsDir(dataDir = workflowDataDir()): string {
+  return path.join(dataDir, "pi", "sessions");
+}
+
+/** pi agent-config home (`PI_CODING_AGENT_DIR`) used to host a generated models.json for a custom base URL. */
+export function piHomeDir(dataDir = workflowDataDir()): string {
+  return path.join(dataDir, "pi", "home");
+}

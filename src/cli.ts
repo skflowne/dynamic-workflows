@@ -28,6 +28,15 @@ const OPTIONS = {
   reasoning: { type: "string" },
   bun: { type: "string" },
   "gemini-command": { type: "string" },
+  "pi-command": { type: "string" },
+  provider: { type: "string" },
+  "base-url": { type: "string" },
+  "api-key": { type: "string" },
+  "pi-api": { type: "string" },
+  thinking: { type: "string" },
+  tools: { type: "string" },
+  "exclude-tools": { type: "string" },
+  "no-tools": { type: "boolean" },
   "idle-timeout": { type: "string" },
   json: { type: "boolean" },
   quiet: { type: "boolean" },
@@ -40,7 +49,7 @@ const OPTIONS = {
   version: { type: "boolean", short: "v" },
 } as const;
 
-const HELP = `codex-workflow — run Claude-compatible dynamic workflows, backed by Codex or Gemini CLI.
+const HELP = `codex-workflow — run Claude-compatible dynamic workflows, backed by Codex, Gemini CLI, or pi.
 
 Usage:
   codex-workflow run <file|name> [options]   Run a workflow file or registered name
@@ -54,7 +63,7 @@ Usage:
 
 Run options:
   --args <json|@file.json>   Arguments passed to the workflow as \`args\`
-  --backend <name>           Agent backend: codex | gemini (default: codex)
+  --backend <name>           Agent backend: codex | gemini | pi (default: codex)
   --model <model>            Model for every agent() call (backend-specific)
   --concurrency <n>          Max concurrent agents (capped at 16)
   --budget <tokens>          Token budget (estimate) shared across the run
@@ -67,6 +76,15 @@ Run options:
   --reasoning <effort>       Codex only: minimal | low | medium | high | xhigh
   --bun <path>               Path to the Bun binary
   --gemini-command <path>    Gemini CLI executable for --backend gemini
+  --pi-command <path>        pi CLI executable for --backend pi
+  --provider <name>          pi only: backend provider (e.g. openai, anthropic, deepseek)
+  --base-url <url>           pi only: custom OpenAI/Anthropic-compatible endpoint
+  --api-key <key>            pi only: API key (or set the provider's env var, e.g. OPENAI_API_KEY)
+  --pi-api <shape>           pi only: openai-completions (default) | openai-responses | anthropic-messages | google-generative-ai
+  --thinking <level>         pi only: off | minimal | low | medium | high | xhigh
+  --tools <list>             pi only: comma-separated tool allowlist (default: all built-in tools)
+  --exclude-tools <list>     pi only: comma-separated tool denylist
+  --no-tools                 pi only: disable all tools (a pure text turn)
   --idle-timeout <ms>         Bun child idle watchdog in ms (0 disables; default 300000)
   --json                     Emit machine-readable JSON (suppresses progress & viewer)
   --quiet                    Suppress progress output

@@ -12,12 +12,28 @@ export type RunRecordStatus = "running" | "completed" | "failed" | "cancelled";
  * different backend would mix results). Historical records omit it and are treated as the codex backend.
  */
 export interface RunnerConfig {
-  /** Agent backend, e.g. "codex" or "gemini". */
+  /** Agent backend, e.g. "codex", "gemini", or "pi". */
   backend: string;
   /** Model passed to the backend (runner/CLI `--model`), when set. */
   model?: string;
   /** Gemini CLI executable, when overridden (`--gemini-command`). */
   geminiCommand?: string;
+  /** pi CLI executable, when overridden (`--pi-command`). */
+  piCommand?: string;
+  /** Backend provider name (`--provider`), for the pi backend. */
+  provider?: string;
+  /** Custom OpenAI/Anthropic-compatible endpoint (`--base-url`), for the pi backend. */
+  baseUrl?: string;
+  /** Thinking level (`--thinking`), for the pi backend. NOTE: the API key is deliberately NOT persisted. */
+  thinking?: string;
+  /** Provider API shape (`--pi-api`), for the pi backend — must travel with `baseUrl` across resume. */
+  piApi?: string;
+  /** Tool allowlist (`--tools`, raw comma-separated string), for the pi backend. */
+  tools?: string;
+  /** Tool denylist (`--exclude-tools`, raw comma-separated string), for the pi backend. */
+  excludeTools?: string;
+  /** All tools disabled (`--no-tools`), for the pi backend. */
+  noTools?: boolean;
 }
 
 export interface RunRecord {

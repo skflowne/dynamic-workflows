@@ -13,6 +13,8 @@ export { CodexSdkAgentRunner } from "./runners/codex-sdk.js";
 export type { CodexSdkAgentRunnerOptions } from "./runners/codex-sdk.js";
 export { GeminiCliAgentRunner } from "./runners/gemini-cli.js";
 export type { GeminiCliAgentRunnerOptions } from "./runners/gemini-cli.js";
+export { PiCliAgentRunner } from "./runners/pi-cli.js";
+export type { PiCliAgentRunnerOptions } from "./runners/pi-cli.js";
 export { ScriptedAgentRunner } from "./runners/scripted.js";
 export type { ScriptedAgentHandler } from "./runners/scripted.js";
 export { runWorkflow } from "./runtime.js";

@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { CodexSdkAgentRunner, type CodexSdkAgentRunnerOptions } from "../runners/codex-sdk.js";
 import { GeminiCliAgentRunner, type GeminiCliAgentRunnerOptions } from "../runners/gemini-cli.js";
+import { PiCliAgentRunner, type PiCliAgentRunnerOptions } from "../runners/pi-cli.js";
 import type { SandboxMode, ThreadOptions } from "@openai/codex-sdk";
 import { defaultWorkflowDirs, WorkflowController } from "../controller.js";
 import { WorkflowAbortError, WorkflowInputError } from "../errors.js";
@@ -19,7 +20,7 @@ import { ProgressRenderer, type ProgressMode } from "./progress.js";
 import { createWebServer, type WorkflowWebServer } from "../web/server.js";
 import { RunEventLog, runEventsPath } from "../web/event-log.js";
 import { openBrowser, pickPort } from "../web/launcher.js";
-import { workflowDataDir, runsDir, journalDir } from "../paths.js";
+import { workflowDataDir, runsDir, journalDir, piHomeDir, piSessionsDir } from "../paths.js";
 
 const exec = promisify(execFile);
 
@@ -39,6 +40,15 @@ export interface RunFlags {
   reasoningEffort?: string;
   bun?: string;
   "gemini-command"?: string;
+  "pi-command"?: string;
+  provider?: string;
+  "base-url"?: string;
+  "api-key"?: string;
+  "pi-api"?: string;
+  thinking?: string;
+  tools?: string;
+  "exclude-tools"?: string;
+  "no-tools"?: boolean;
   "idle-timeout"?: string;
   json?: boolean;
   quiet?: boolean;
@@ -52,8 +62,9 @@ export interface RunFlags {
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
 const APPROVAL_MODES = ["never", "on-request", "on-failure", "untrusted"];
 const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
-const AGENT_BACKENDS = ["codex", "gemini"] as const;
+const AGENT_BACKENDS = ["codex", "gemini", "pi"] as const;
 type AgentBackend = (typeof AGENT_BACKENDS)[number];
+const PI_API_SHAPES = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
 
 /** `codex-workflow run <file>` */
 export async function runCommand(target: string | undefined, flags: RunFlags): Promise<number> {
@@ -137,6 +148,18 @@ export async function resumeCommand(runId: string | undefined, flags: RunFlags):
   if (flags["gemini-command"] === undefined && record.runner?.geminiCommand !== undefined) {
     flags["gemini-command"] = record.runner.geminiCommand;
   }
+  // pi backend: inherit the full recorded runner config — provider/base-url/pi-api/thinking/tool
+  // selection/pi-command. pi-api and the tool flags must travel with base-url, or resume would
+  // silently switch API shape / tool set on the uncached agents. The API key is never persisted, so
+  // resume re-reads it from --api-key or the provider env var.
+  if (flags["pi-command"] === undefined && record.runner?.piCommand !== undefined) flags["pi-command"] = record.runner.piCommand;
+  if (flags.provider === undefined && record.runner?.provider !== undefined) flags.provider = record.runner.provider;
+  if (flags["base-url"] === undefined && record.runner?.baseUrl !== undefined) flags["base-url"] = record.runner.baseUrl;
+  if (flags.thinking === undefined && record.runner?.thinking !== undefined) flags.thinking = record.runner.thinking;
+  if (flags["pi-api"] === undefined && record.runner?.piApi !== undefined) flags["pi-api"] = record.runner.piApi;
+  if (flags.tools === undefined && record.runner?.tools !== undefined) flags.tools = record.runner.tools;
+  if (flags["exclude-tools"] === undefined && record.runner?.excludeTools !== undefined) flags["exclude-tools"] = record.runner.excludeTools;
+  if (flags["no-tools"] === undefined && record.runner?.noTools) flags["no-tools"] = true;
 
   return executeRun(input, runId, cwd, flags, { resumeRecord: record });
 }
@@ -161,7 +184,7 @@ async function executeRun(
   const dataDir = workflowDataDir();
   let runner: WorkflowAgentRunner;
   try {
-    runner = buildAgentRunner(cwd, flags);
+    runner = buildAgentRunner(cwd, flags, dataDir);
   } catch (error) {
     process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 2;
@@ -546,7 +569,7 @@ export async function serveCommand(flags: RunFlags): Promise<number> {
 }
 
 /** `codex-workflow doctor` */
-export async function doctorCommand(flags: { cwd?: string; backend?: string; "gemini-command"?: string }): Promise<number> {
+export async function doctorCommand(flags: { cwd?: string; backend?: string; "gemini-command"?: string; "pi-command"?: string }): Promise<number> {
   let ok = true;
   let backend: AgentBackend;
   try {
@@ -571,15 +594,23 @@ export async function doctorCommand(flags: { cwd?: string; backend?: string; "ge
   const auth = await pathExists(authPath);
   const geminiCommand = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini";
   const gemini = await tryExec(geminiCommand, ["--version"]);
+  const piCommand = flags["pi-command"] ?? process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi";
+  const pi = await tryExec(piCommand, ["--version"]);
 
   if (backend === "codex") {
     required(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Install Codex CLI and run `codex login`.");
     required(auth, "Codex auth (~/.codex/auth.json)", "Run `codex login` to authenticate.");
     optional(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Only needed for `--backend gemini`.");
+    optional(pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Only needed for `--backend pi`.");
+  } else if (backend === "pi") {
+    required(pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Install pi (npm i -g @earendil-works/pi-coding-agent), add it to PATH, or pass --pi-command <path>.");
+    optional(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Only needed for the default Codex backend.");
+    optional(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Only needed for `--backend gemini`.");
   } else {
     required(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Install Gemini CLI, add it to PATH, or pass --gemini-command <path>.");
     optional(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Only needed for the default Codex backend.");
     optional(auth, "Codex auth (~/.codex/auth.json)", "Only needed for the default Codex backend.");
+    optional(pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Only needed for `--backend pi`.");
   }
 
   const dataDir = workflowDataDir();
@@ -628,15 +659,17 @@ async function parseArgsValue(raw: string | undefined, cwd: string): Promise<unk
   }
 }
 
-function buildAgentRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
+function buildAgentRunner(cwd: string, flags: RunFlags, dataDir: string): WorkflowAgentRunner {
   if (process.env.CODEX_WORKFLOW_FAKE_AGENT) return new FakeAgentRunner();
 
   const backend = resolveBackend(flags.backend);
   if (backend === "gemini") return buildGeminiRunner(cwd, flags);
+  if (backend === "pi") return buildPiRunner(cwd, flags, dataDir);
   return buildCodexRunner(cwd, flags);
 }
 
 function buildCodexRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
+  rejectPiOnlyFlags(flags, "codex");
   const options: CodexSdkAgentRunnerOptions = { cwd };
   if (flags.model) options.model = flags.model;
   if (flags.sandbox) options.sandboxMode = assertOneOf(flags.sandbox, SANDBOX_MODES, "--sandbox") as SandboxMode;
@@ -661,12 +694,75 @@ function buildGeminiRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
     throw new WorkflowInputError(`${unsupported.join(", ")} ${unsupported.length === 1 ? "is" : "are"} only supported with --backend codex`);
   }
 
+  rejectPiOnlyFlags(flags, "gemini");
   const options: GeminiCliAgentRunnerOptions = { cwd };
   options.command = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini";
   if (flags.model) options.model = flags.model;
   const geminiTimeout = parseAgentTimeoutFlag(flags["agent-timeout"]);
   if (geminiTimeout !== undefined) options.agentTimeoutMs = geminiTimeout;
   return new GeminiCliAgentRunner(options);
+}
+
+function buildPiRunner(cwd: string, flags: RunFlags, dataDir: string): WorkflowAgentRunner {
+  const codexOnly = [
+    flags.sandbox !== undefined ? "--sandbox" : undefined,
+    flags.approval !== undefined ? "--approval" : undefined,
+    (flags.reasoning ?? flags.reasoningEffort) !== undefined ? "--reasoning" : undefined,
+  ].filter(Boolean);
+  if (codexOnly.length) {
+    throw new WorkflowInputError(`${codexOnly.join(", ")} ${codexOnly.length === 1 ? "is" : "are"} only supported with --backend codex (pi uses --thinking)`);
+  }
+
+  const options: PiCliAgentRunnerOptions = { cwd };
+  options.command = flags["pi-command"] ?? process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi";
+  // pi writes session JSONL here; the viewer reads linked sessions from the same path.
+  options.sessionDir = piSessionsDir(dataDir);
+  if (flags.model) options.model = flags.model;
+  if (flags.provider) options.provider = flags.provider;
+  if (flags["base-url"]) {
+    options.baseUrl = flags["base-url"];
+    // A custom endpoint needs a config home to host the generated models.json.
+    options.agentDir = piHomeDir(dataDir);
+  }
+  if (flags["api-key"]) options.apiKey = flags["api-key"];
+  if (flags["pi-api"]) {
+    options.api = assertOneOf(flags["pi-api"], PI_API_SHAPES, "--pi-api") as NonNullable<PiCliAgentRunnerOptions["api"]>;
+  }
+  if (flags.thinking) options.thinking = assertOneOf(flags.thinking, REASONING_EFFORTS, "--thinking");
+  if (flags["no-tools"]) options.noTools = true;
+  if (flags.tools) options.tools = splitList(flags.tools);
+  if (flags["exclude-tools"]) options.excludeTools = splitList(flags["exclude-tools"]);
+  const piTimeout = parseAgentTimeoutFlag(flags["agent-timeout"]);
+  if (piTimeout !== undefined) options.agentTimeoutMs = piTimeout;
+
+  if (options.baseUrl && !options.model) {
+    throw new WorkflowInputError("--base-url requires --model (the model id sent to the endpoint)");
+  }
+  return new PiCliAgentRunner(options);
+}
+
+/** pi-only flags must not silently no-op on the codex/gemini backends. */
+function rejectPiOnlyFlags(flags: RunFlags, backend: string): void {
+  const piOnly = [
+    flags.provider !== undefined ? "--provider" : undefined,
+    flags["base-url"] !== undefined ? "--base-url" : undefined,
+    flags["api-key"] !== undefined ? "--api-key" : undefined,
+    flags["pi-api"] !== undefined ? "--pi-api" : undefined,
+    flags.thinking !== undefined ? "--thinking" : undefined,
+    flags.tools !== undefined ? "--tools" : undefined,
+    flags["exclude-tools"] !== undefined ? "--exclude-tools" : undefined,
+    flags["no-tools"] ? "--no-tools" : undefined,
+  ].filter(Boolean);
+  if (piOnly.length) {
+    throw new WorkflowInputError(`${piOnly.join(", ")} ${piOnly.length === 1 ? "is" : "are"} only supported with --backend pi`);
+  }
+}
+
+function splitList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function resolveBackend(raw: string | undefined): AgentBackend {
@@ -681,6 +777,18 @@ function resolveRunnerConfig(flags: RunFlags): RunnerConfig {
   if (config.backend === "gemini") {
     const command = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND;
     if (command) config.geminiCommand = command;
+  }
+  if (config.backend === "pi") {
+    const command = flags["pi-command"] ?? process.env.CODEX_WORKFLOW_PI_COMMAND;
+    if (command) config.piCommand = command;
+    if (flags.provider) config.provider = flags.provider;
+    if (flags["base-url"]) config.baseUrl = flags["base-url"];
+    if (flags.thinking) config.thinking = flags.thinking;
+    if (flags["pi-api"]) config.piApi = flags["pi-api"];
+    if (flags.tools) config.tools = flags.tools;
+    if (flags["exclude-tools"]) config.excludeTools = flags["exclude-tools"];
+    if (flags["no-tools"]) config.noTools = true;
+    // The API key is intentionally NOT persisted; resume reads it from --api-key or the provider env var.
   }
   return config;
 }

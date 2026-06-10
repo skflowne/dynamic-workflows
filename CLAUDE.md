@@ -5,7 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `codex-workflow` is a CLI + library that runs **Claude Code-style dynamic workflows** on top of
-pluggable agent backends (**OpenAI Codex** by default, **Gemini CLI** with `--backend gemini`). A
+pluggable agent backends (**OpenAI Codex** by default, **Gemini CLI** with `--backend gemini`, and
+**pi** — the pi-coding-agent harness — with `--backend pi`, which also reaches any OpenAI/Anthropic-
+compatible endpoint via `--base-url`). A
 workflow is an open TS/JS script with a `meta` block and top-level `await`; the
 orchestration primitives (`agent`, `parallel`, `pipeline`, `workflow`, `phase`, `log`, `args`,
 `budget`) are injected at runtime. Each `agent()` call runs as an independent backend session. The
@@ -34,9 +36,11 @@ node dist/cli.js serve --port 4173   # local web viewer (overview + per-step det
   `fake:<prompt>` / `"{}"`), so `run` works without Codex/tokens. Used by `tests/cli.test.ts`.
 - **`RUN_CODEX_SDK_LIVE=1`** un-gates the one live Codex SDK test (spends tokens). Off by default.
 - **`RUN_GEMINI_CLI_LIVE=1`** un-gates the one live Gemini CLI smoke test. Off by default.
+- **`RUN_PI_CLI_LIVE=1`** un-gates the one live pi smoke test (set `PI_CLI_MODEL`/`PI_CLI_PROVIDER`
+  or `PI_CLI_BASE_URL`+`PI_CLI_API_KEY`). Off by default.
 - Requires **Bun** (workflow bodies execute in a Bun child) and exactly one real agent backend for
-  real runs: Codex CLI authenticated via `codex login` for `--backend codex`, or Gemini CLI for
-  `--backend gemini`.
+  real runs: Codex CLI authenticated via `codex login` for `--backend codex`, Gemini CLI for
+  `--backend gemini`, or `pi` (npm `@earendil-works/pi-coding-agent`) for `--backend pi`.
 
 ## Architecture (the mental model matters most)
 
@@ -109,12 +113,28 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   with the same detached git worktree behavior. CLI selection is `--backend gemini` or
   `CODEX_WORKFLOW_BACKEND=gemini`; `--gemini-command` / `CODEX_WORKFLOW_GEMINI_COMMAND` override the binary.
   Raw `spawn` stdout/stderr are bounded (32MB/4MB) so a runaway YOLO turn can't OOM the parent.
-- `src/runners/prompt.ts` — shared subagent prompt discipline used by Codex and Gemini runners.
+- `src/runners/pi-cli.ts` — real pi runner (`@earendil-works/pi-coding-agent`, a full agentic harness:
+  read/bash/edit/write/grep/find/ls tools). Spawns `pi -p --mode json --no-context-files [--approve]
+  [--tools …] --provider/--model/--session-dir … "<prompt>"` per `agent()`. Parses pi's NDJSON event
+  stream: session id from the first `{type:"session"}`, the **last assistant `message_end`** text-blocks
+  as the result, and summed `usage.output` across assistant turns for `outputTokens`. **pi exits 0 even
+  when the model turn errored — success/failure is decided by the last assistant message's `stopReason`
+  (`"error"` ⇒ throw a retryable failure), NOT the exit code.** No native schema flag, so the runtime's
+  AJV loop is the `agent({schema})` contract (prompt-embedded, like Gemini). `isolation:'worktree'`
+  supported. **Custom OpenAI/Anthropic-compatible endpoint:** pi has no `--base-url` flag, so when
+  `baseUrl` is set the runner writes a synthetic-provider `models.json` under `agentDir`
+  (`PI_CODING_AGENT_DIR`) and points pi at it (`--provider custom`); the API key is injected via env
+  (`CODEX_WORKFLOW_PI_API_KEY`, referenced as `$VAR` in models.json) and **never written to disk** —
+  without an apiKey the config gets a literal `"dummy"` (pi errors on unset env refs; keyless endpoints
+  like Ollama accept anything). CLI
+  selection is `--backend pi` / `CODEX_WORKFLOW_BACKEND=pi`; `--pi-command` / `CODEX_WORKFLOW_PI_COMMAND`
+  override the binary. stdout/stderr bounded (64MB/4MB).
+- `src/runners/prompt.ts` — shared subagent prompt discipline used by the Codex, Gemini, and pi runners.
 - `src/runners/worktree.ts` — shared detached-`git worktree` lifecycle (create + dirty-aware
-  preserve/remove cleanup) used by both runners.
+  preserve/remove cleanup) used by all CLI runners.
 - `src/runners/turn-control.ts` — shared per-agent timeout + run/timeout abort-signal combination
   (leak-free listener cleanup) + the canonical `agent exceeded agentTimeoutMs (...)` error message,
-  used by both runners.
+  used by all runners.
 - `src/runners/scripted.ts` — deterministic test runner.
 - `src/paths.ts` — resolves the **global data dir** (`~/.codex-workflow`, override `CODEX_WORKFLOW_HOME`)
   holding `runs/`, `journal/`, `links/`. Shared across projects; the CLI passes these into
@@ -136,17 +156,23 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   not found rather than falling through to name lookup. `run` and `resume` share `executeRun()`:
   `resume <runId>` reconstructs the input (script path / name + `args`) from the run record and reuses
   the journal cache; Ctrl-C aborts the in-flight run, marks it `cancelled`, and prints the `resume` hint.
-  The record also persists the runner config (`RunRecord.runner`: backend/model/gemini-command); `resume`
+  The record also persists the runner config (`RunRecord.runner`: backend/model/gemini-command, plus the
+  pi backend's pi-command/provider/base-url/pi-api/thinking/tools/exclude-tools/no-tools — but **never
+  the API key**); `resume`
   **inherits** it when the flag is omitted and **refuses** an explicit `--backend` that disagrees with the
   recorded one (the journal cache key is NOT backend-aware, so resuming under a different backend would
-  silently mix results). Historical records without `runner` are treated as the codex backend.
+  silently mix results). Historical records without `runner` are treated as the codex backend. pi-only
+  flags (`--provider`/`--base-url`/`--api-key`/`--pi-api`/`--thinking`/`--tools`/`--exclude-tools`/
+  `--no-tools`) error on codex/gemini; codex-only flags (`--sandbox`/`--approval`/`--reasoning`) error on pi.
 - `src/web/` + `web/` — **local web viewer** (zero-dep Node `http`, vanilla SPA, claude.ai-styled).
   `server.ts` serves a JSON API (`/api/runs`, `/api/runs/:id` → run-aggregator view, `…/agents/:key`
   → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`),
   and exposes an in-process `broadcast(event)` for liveness. `run-aggregator.ts` groups journal entries
   into phase buckets; `session-parser.ts` turns a rollout `.jsonl` into a timeline
-  (messages/reasoning/web-search/tool calls/usage); `session-linker.ts` (Codex) and `gemini-session.ts`
-  (Gemini) map each agent → its session file. Exact match via the journal's `sessionId` searches **all**
+  (messages/reasoning/web-search/tool calls/usage); `session-linker.ts` (Codex), `gemini-session.ts`
+  (Gemini), and `pi-session.ts` (pi — parses pi's `<ts>_<uuid>.jsonl` tree into the same timeline shape;
+  the server picks the linker by `entry.backend`, and the runner writes pi sessions to `<dataDir>/pi/sessions`
+  via `--session-dir`, which the server reads back) map each agent → its session file. Exact match via the journal's `sessionId` searches **all**
   session files regardless of date/mtime — this is what lets `resume` link a cached agent whose file was
   written during the original run (resume reuses the runId but resets `record.startedAt` to now, so the
   old file falls outside this run's window). Only the `sessionId`-less heuristic content-match is scoped
@@ -172,19 +198,28 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 - **Gemini has no native schema flag in this integration.** The Gemini runner adds the shared
   structured-output prompt instructions, returns text from the JSON wrapper's `response`, and relies
   on `normalizeAgentResult` + AJV for validation/retry.
+- **pi exits 0 on a failed model turn.** Never trust pi's exit code for success/failure — inspect the
+  last assistant `message_end`'s `stopReason` (`"error"` + nested-JSON `errorMessage` ⇒ throw). pi also
+  runs its own `auto_retry` cycles inside one invocation (multiple `agent_start`/`agent_end`), on top of
+  the runtime's retry loop. pi (like Gemini) has no native JSON-schema flag → AJV is the `agent({schema})`
+  contract. The pi backend's custom-`baseUrl` config is the only place this tool generates a backend
+  config file (`models.json`); keep the API key out of it (env-injected via `$CODEX_WORKFLOW_PI_API_KEY`).
 - **`agentType` is prompt context only.** Claude's built-in agent definitions/tool bundles are not
   loaded; full equivalence would require a separate agent registry surface.
 - **Web search + network are always enabled for Codex agents** (no flag to disable — set by design in
-  `buildCodexRunner`). Gemini uses the local Gemini CLI's configured capabilities.
+  `buildCodexRunner`). Gemini uses the local Gemini CLI's configured capabilities. pi runs with its
+  full built-in tool set (read/bash/edit/write/grep/find/ls) plus `--approve` by default; narrow it with
+  `--tools`/`--exclude-tools`/`--no-tools`.
 - **Model resolution:** the runtime still attaches `agent({model})` / `meta.phases[].model` to
-  `WorkflowAgentCall.options` for Claude compatibility and custom runners, but built-in Codex and
-  Gemini runners intentionally ignore workflow-authored model values. Use runner/CLI `--model` to
-  select a built-in backend model; otherwise each backend uses its own default.
+  `WorkflowAgentCall.options` for Claude compatibility and custom runners, but the built-in Codex,
+  Gemini, and pi runners intentionally ignore workflow-authored model values. Use runner/CLI `--model` to
+  select a built-in backend model; otherwise each backend uses its own default. (For pi + `--base-url`,
+  `--model` is required and is the model id sent to the endpoint.)
 - **Build layout:** `tsconfig.json` uses `rootDir: "src"` so output is `dist/index.js` / `dist/cli.js`
   (the `bin`). Tests are excluded from emit and typechecked separately via `tsconfig.test.json`.
 - **Observability layers** when debugging a run: the **web viewer** (in-process per `run` on a random
   port, or `serve` to browse history) → overview + per-step details; workflow logs/stats →
   `show <runId>`; per-subagent prompt+result → `~/.codex-workflow/journal/<runId>/*.json`; Codex
   full traces (reasoning, web searches, tool calls) → `~/.codex/sessions/<date>/rollout-*.jsonl`
-  (`codex resume <sessionUUID>`).
+  (`codex resume <sessionUUID>`); pi full traces → `~/.codex-workflow/pi/sessions/<ts>_<uuid>.jsonl`.
 - `AGENTS.md` is a symlink to this file (Codex reads `AGENTS.md`).
