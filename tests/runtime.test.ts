@@ -8,6 +8,7 @@ import {
   InMemoryWorkflowJournal,
   runWorkflow,
   ScriptedAgentRunner,
+  WorkflowAbortError,
   WorkflowAgentCapError,
 } from "../src/index.js";
 import type { WorkflowAgentMeta, WorkflowAgentRunner } from "../src/index.js";
@@ -374,6 +375,59 @@ return { a, b, spent: budget.spent() }
   // length/4 estimate). Total stays 100 — proving real usage feeds spent and cache hits are free.
   assert.equal(result.result.spent, 100);
   assert.equal(result.cacheHits, 1);
+});
+
+test("runWorkflow progress exposes running agent detail before journal write", async () => {
+  const events: any[] = [];
+  const runner: WorkflowAgentRunner = {
+    async run(call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      onMeta?.({ sessionId: "sess-live" });
+      return `ok:${call.prompt}`;
+    },
+  };
+
+  await runWorkflow(
+    `export const meta = { name: 'live_detail', description: 'Live detail' }
+return agent('inspect while running', { label: 'inspect', model: 'm-live' })
+`,
+    {
+      runner,
+      onProgress: (event) => events.push(event),
+    },
+  );
+
+  const started = events.filter((event) => event.type === "agent" && event.state === "started");
+  assert.ok(started.length >= 1);
+  assert.equal(started[0].prompt, "inspect while running");
+  assert.equal(started[0].options.label, "inspect");
+  assert.equal(started[0].options.model, "m-live");
+  assert.ok(started.some((event) => event.sessionId === "sess-live"));
+});
+
+test("runWorkflow abort tolerates a late agent response after the Bun child is closed", async () => {
+  const controller = new AbortController();
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const runner: WorkflowAgentRunner = {
+    async run() {
+      markStarted();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return "late result";
+    },
+  };
+
+  const promise = runWorkflow(
+    `export const meta = { name: 'abort_late_agent', description: 'Abort with late agent response' }
+return agent('slow', { label: 'slow' })
+`,
+    { runner, signal: controller.signal },
+  );
+
+  await started;
+  controller.abort();
+  await assert.rejects(promise, WorkflowAbortError);
 });
 
 test("the agent cap error carries the Claude-style 'remaining() returns Infinity' guidance", async () => {

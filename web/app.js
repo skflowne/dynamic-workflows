@@ -16,6 +16,8 @@ const state = {
   liveLogs: [], // log lines seen via SSE (record.logs is only persisted at completion)
   refetchTimer: null,
   backstopTimer: null, // low-frequency poll while a running run is open (self-heals missed live events)
+  sessionTimer: null, // poll the open Session tab while the run is live (appends new trace items)
+  sessionFetching: false, // guard so a slow session fetch can't overlap the next poll tick
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -124,8 +126,25 @@ function seedLiveFromBuffer(buffer) {
     if (ev.type !== "progress" || !ev.event) continue;
     const e = ev.event;
     if (e.type === "log") state.liveLogs.push(e.message);
-    else if (e.type === "agent" && e.key) state.liveAgents.set(e.key, { key: e.key, label: e.label, phase: e.phase, state: e.state });
+    else if (e.type === "agent" && e.key) rememberLiveAgent(e);
   }
+}
+
+function rememberLiveAgent(event) {
+  const prev = state.liveAgents.get(event.key) || {};
+  state.liveAgents.set(event.key, {
+    ...prev,
+    key: event.key,
+    label: event.label || prev.label || "agent",
+    phase: event.phase || prev.phase,
+    state: event.state || prev.state || "started",
+    backend: event.backend || prev.backend,
+    prompt: event.prompt ?? prev.prompt,
+    options: event.options || prev.options,
+    sessionId: event.sessionId || prev.sessionId,
+    result: event.result ?? prev.result,
+    error: event.error || prev.error,
+  });
 }
 
 function renderRunView(data) {
@@ -359,10 +378,11 @@ function mergedPhases() {
     grp.agents.push({
       key: la.key,
       label: la.label,
+      sessionId: la.sessionId,
       status: la.state === "failed" ? "failed" : la.state === "started" ? "running" : "ok",
       resultPreview: la.state === "started" ? "running…" : "",
-      hasSchema: false,
-      hasSession: false,
+      hasSchema: Boolean(la.options?.schema),
+      hasSession: Boolean(la.sessionId),
       live: true,
     });
   }
@@ -425,8 +445,7 @@ function visibleAgents(p) {
   return p.agents.slice(0, 180);
 }
 
-// Every node carries `data-key`; live (not-yet-journaled) nodes also get `data-live`, which keeps
-// them visible but non-clickable until their journal entry exists.
+// Every node carries `data-key`; live (not-yet-journaled) nodes also get `data-live` for styling.
 function nodeClassName(a) {
   return `flow-node ${a.status}${a.live ? " pending" : ""}`;
 }
@@ -465,14 +484,7 @@ function togglePhase(title) {
   state.phaseExpansionTouched = true;
   if (state.expandedPhases.has(title)) state.expandedPhases.delete(title);
   else state.expandedPhases.add(title);
-  renderCurrentFlow();
-}
-
-function renderCurrentFlow() {
-  const section = el("flow-section");
-  if (!section) return;
-  section.innerHTML = renderFlowSection(mergedPhases());
-  requestAnimationFrame(drawTreeBranches);
+  patchFlow(mergedPhases());
 }
 
 function drawTreeBranches() {
@@ -509,11 +521,147 @@ function drawTreeBranch(branch) {
 
 /* ---- Live update: refresh stats and repaint the tree while preserving multi-expanded state. ---- */
 
+// Incremental flow update: reconcile branches by `data-phase-title` and agent nodes by `data-key`,
+// touching only what actually changed. The old full `innerHTML = renderFlowSection(...)` tore down
+// every node on each tick, replaying the `rise` entrance animation on all of them (the visible
+// "everything flashes"). Here, an unchanged node's DOM is left alone, so no animation replay.
 function patchFlow(phases) {
   const section = el("flow-section");
   if (!section) return;
-  section.innerHTML = renderFlowSection(phases);
+  let flow = el("flow");
+  if (!flow) {
+    // First paint (or the "no agents yet" placeholder is still showing): render the structure once.
+    section.innerHTML = renderFlowSection(phases);
+    requestAnimationFrame(drawTreeBranches);
+    return;
+  }
+
+  const existing = new Map();
+  for (const b of flow.querySelectorAll(":scope > .flow-branch")) existing.set(b.dataset.phaseTitle, b);
+
+  phases.forEach((phase, index) => {
+    const branch = existing.get(phase.title);
+    if (!branch) {
+      flow.insertAdjacentHTML("beforeend", renderPhaseBranch(phase, index, phases.length));
+    } else {
+      existing.delete(phase.title);
+      patchBranch(branch, phase, index, phases.length);
+    }
+  });
+
   requestAnimationFrame(drawTreeBranches);
+}
+
+function patchBranch(branch, phase, index, total) {
+  const { pending, inProgress } = phaseBadge(phase);
+  const expanded = state.expandedPhases.has(phase.title);
+  branch.classList.toggle("expanded", expanded);
+  branch.classList.toggle("pending", pending);
+  branch.classList.toggle("in-progress", inProgress);
+
+  const axis = branch.querySelector(".branch-axis");
+  if (axis) {
+    axis.classList.toggle("first", index === 0);
+    axis.classList.toggle("last", index === total - 1);
+  }
+
+  const phaseNode = branch.querySelector(".flow-phase");
+  if (phaseNode) patchPhaseNode(phaseNode, phase, expanded);
+
+  const panel = branch.querySelector(".branch-panel");
+  if (!panel) return;
+  panel.hidden = !expanded;
+  if (expanded) patchFan(panel, phase);
+}
+
+function patchPhaseNode(node, phase, expanded) {
+  const { pending, inProgress, badge } = phaseBadge(phase);
+  node.classList.toggle("in-progress", inProgress);
+  node.classList.toggle("pending", pending);
+  node.classList.toggle("active", expanded);
+  node.setAttribute("aria-expanded", expanded ? "true" : "false");
+  let count = node.querySelector(".fp-count");
+  if (pending) {
+    if (count) count.remove();
+  } else if (!count) {
+    const chev = node.querySelector(".fp-chev");
+    const span = document.createElement("span");
+    span.className = "fp-count";
+    span.textContent = badge;
+    node.insertBefore(span, chev);
+  } else if (count.textContent !== badge) {
+    count.textContent = badge;
+  }
+}
+
+function patchFan(panel, phase) {
+  const grid = panel.querySelector(".fan-grid");
+  if (!grid) {
+    // Branch was collapsed (fan never built) and is now expanding: build it once.
+    panel.innerHTML = renderFan(phase);
+    return;
+  }
+  const visible = visibleAgents(phase);
+  const empty = grid.querySelector(":scope > .muted-note");
+  if (empty && visible.length) empty.remove();
+
+  const existing = new Map();
+  for (const n of grid.querySelectorAll(":scope > .flow-node")) existing.set(n.dataset.key, n);
+
+  // Keyed reconcile in `visible` order: reuse existing nodes (patch in place), create missing ones,
+  // move only when out of position. Existing nodes are never torn down → no entrance-animation replay.
+  let cursor = grid.firstElementChild;
+  for (const a of visible) {
+    let node = existing.get(a.key);
+    if (node) {
+      existing.delete(a.key);
+      patchNode(node, a);
+    } else {
+      node = nodeFromHtml(fanNodeHtml(a, null)); // no entrance-delay on live appends
+    }
+    if (node === cursor) {
+      cursor = cursor.nextElementSibling;
+    } else {
+      grid.insertBefore(node, cursor);
+    }
+  }
+  for (const stale of existing.values()) stale.remove(); // agents normally only grow; defensive
+  patchFanNote(panel, phase, visible);
+}
+
+function nodeFromHtml(html) {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html.trim();
+  return tpl.content.firstElementChild;
+}
+
+// Update a node in place; only writes attributes that actually changed so unchanged nodes neither
+// re-layout nor replay their entrance animation.
+function patchNode(node, a) {
+  const cls = nodeClassName(a);
+  if (node.className !== cls) node.className = cls;
+  if (a.live) node.setAttribute("data-live", "1");
+  else node.removeAttribute("data-live");
+  const title = nodeTitle(a);
+  if (node.getAttribute("title") !== title) node.setAttribute("title", title);
+  const dot = node.querySelector(".fn-dot");
+  const dotCls = `fn-dot ${a.status}`;
+  if (dot && dot.className !== dotCls) dot.className = dotCls;
+  const label = node.querySelector(".fn-label");
+  if (label && label.textContent !== a.label) label.textContent = a.label;
+}
+
+function patchFanNote(panel, phase, visible) {
+  const main = panel.querySelector(".fan-main");
+  if (!main) return;
+  const note = main.querySelector(".fan-note");
+  if (phase.agents.length <= visible.length) {
+    if (note) note.remove();
+    return;
+  }
+  const text = `Showing first ${visible.length} of ${fmtNum(phase.agents.length)} agents.`;
+  if (!note) main.insertAdjacentHTML("beforeend", `<div class="fan-note">${text}</div>`);
+  else if (note.textContent !== text) note.textContent = text;
 }
 
 // Live-tick entry point (replaces a full renderRunView on every refetch): refresh the head stats +
@@ -541,6 +689,7 @@ function patchRunView(data) {
 /* ----------------------------- Drawer (agent detail) ----------------------------- */
 
 async function openDrawer(key) {
+  stopSessionAutoRefresh(); // drop any poll bound to the previously-open agent
   state.drawerKey = key;
   state.lastFocus = document.activeElement;
   const drawer = el("drawer");
@@ -571,83 +720,166 @@ async function openDrawer(key) {
     <div class="tabs">
       <button class="tab active" data-tab="result">Result</button>
       <button class="tab" data-tab="prompt">Prompt</button>
-      <button class="tab" data-tab="session">Codex session</button>
+      <button class="tab" data-tab="session">Session</button>
     </div>
     <div class="drawer-body">
       <div class="panel active" data-panel="result">${renderResult(entry.result)}</div>
       <div class="panel" data-panel="prompt"><div class="codeblock">${escapeHtml(entry.prompt)}</div></div>
-      <div class="panel" data-panel="session"><div class="loading" id="session-loading">Linking Codex session</div></div>
+      <div class="panel" data-panel="session"><div class="loading" id="session-loading">Linking session</div></div>
     </div>
   `;
   requestAnimationFrame(() => el("drawer-close")?.focus());
 }
 
 function renderResult(result) {
+  if (result === undefined) return `<div class="muted-note">No result yet.</div>`;
   if (typeof result === "string") return `<div class="codeblock">${escapeHtml(result)}</div>`;
   return `<div class="json-block">${highlightJson(result)}</div>`;
 }
 
+function sessionUrl() {
+  return `/api/runs/${encodeURIComponent(state.selectedRunId)}/agents/${encodeURIComponent(state.drawerKey)}/session`;
+}
+
 async function loadSession() {
   const panel = $('.panel[data-panel="session"]');
-  if (!panel || panel.dataset.loaded) return;
-  panel.dataset.loaded = "1";
-  try {
-    const s = await fetchJSON(`/api/runs/${encodeURIComponent(state.selectedRunId)}/agents/${encodeURIComponent(state.drawerKey)}/session`);
-    panel.innerHTML = renderSession(s);
-  } catch (err) {
-    panel.innerHTML = `<div class="muted-note">No linked Codex session.<br/><span style="font-size:11.5px">${escapeHtml(err.message)}</span></div>`;
+  if (!panel) return;
+  if (!panel.dataset.loaded) {
+    panel.dataset.loaded = "1";
+    try {
+      const s = await fetchJSON(sessionUrl());
+      panel.innerHTML = renderSession(s);
+    } catch (err) {
+      panel.innerHTML = `<div class="muted-note">No linked session trace.<br/><span style="font-size:11.5px">${escapeHtml(err.message)}</span></div>`;
+    }
   }
+  // While the run is still producing output, the linked session file keeps growing — poll and append
+  // the new trace items in place. (Re-entering this tab restarts the poll if the run is still live.)
+  startSessionAutoRefresh();
+}
+
+function startSessionAutoRefresh() {
+  stopSessionAutoRefresh();
+  if (state.runData?.record?.status !== "running") return; // a finished run's session is static
+  state.sessionTimer = setInterval(refreshSession, 2000);
+}
+
+function stopSessionAutoRefresh() {
+  if (state.sessionTimer) clearInterval(state.sessionTimer);
+  state.sessionTimer = null;
+}
+
+// Pull the latest session trace and reconcile it into the open panel without a full re-render:
+// append items beyond what's already shown and refresh the usage totals. Existing DOM (expanded
+// tool sections, scroll position) is left untouched.
+async function refreshSession() {
+  const panel = $('.panel[data-panel="session"]');
+  if (el("drawer").hidden || !panel || !panel.classList.contains("active")) return stopSessionAutoRefresh();
+  if (state.sessionFetching) return; // a previous (slow) fetch is still in flight
+  state.sessionFetching = true;
+  let s;
+  try {
+    s = await fetchJSON(sessionUrl());
+  } catch {
+    return; // transient (e.g. session not linked yet) — keep retrying on the next tick
+  } finally {
+    state.sessionFetching = false;
+  }
+  const timeline = el("session-timeline");
+  if (!timeline) {
+    // The panel was showing the "no trace" placeholder; the session just became linkable — build it.
+    panel.innerHTML = renderSession(s);
+  } else {
+    const items = s.items || [];
+    const rendered = Number(timeline.dataset.count || "0");
+    if (items.length > rendered) {
+      timeline.querySelector(":scope > .muted-note")?.remove();
+      timeline.insertAdjacentHTML("beforeend", items.slice(rendered).map(renderSessionItem).join(""));
+      timeline.dataset.count = String(items.length);
+    }
+    const usage = el("session-usage");
+    if (usage) usage.innerHTML = renderSessionUsage(s.usage);
+  }
+  if (state.runData?.record?.status !== "running") stopSessionAutoRefresh(); // last refresh done
 }
 
 function renderSession(s) {
-  const m = s.meta || {};
-  const metaLine = `<div class="drawer-meta" style="margin-bottom:14px">
+  const items = s.items || [];
+  // `session-usage` / `session-timeline` carry stable ids + a rendered-item count so a live refresh
+  // can patch token totals and append new trace items in place — without tearing down the timeline
+  // (which would collapse any tool sections the user expanded and reset scroll). See refreshSession.
+  return (
+    renderSessionMeta(s.meta || {}) +
+    `<div id="session-usage">${renderSessionUsage(s.usage)}</div>` +
+    `<div class="timeline" id="session-timeline" data-count="${items.length}">${
+      items.map(renderSessionItem).join("") || '<div class="muted-note">Session has no displayable items.</div>'
+    }</div>`
+  );
+}
+
+function renderSessionMeta(m) {
+  return `<div class="drawer-meta" style="margin-bottom:14px">
       ${m.id ? `<span class="tag">${escapeHtml(m.id)}</span>` : ""}
-      ${m.model || m.modelProvider ? `<span class="tag">${escapeHtml(m.model || m.modelProvider)}</span>` : ""}
+      ${m.model || m.modelProvider ? `<span class="tag">model: ${escapeHtml(m.model || m.modelProvider)}</span>` : ""}
+      ${m.effort ? `<span class="tag effort">effort: ${escapeHtml(m.effort)}</span>` : ""}
       ${m.cliVersion ? `<span class="tag">codex ${escapeHtml(m.cliVersion)}</span>` : ""}
     </div>`;
-  const u = s.usage;
-  const usage = u
-    ? `<div class="usage-bar">
-        <div class="u"><div class="uv">${fmtNum(u.totalTokens)}</div><div class="ul">total tokens</div></div>
-        <div class="u"><div class="uv">${fmtNum(u.inputTokens)}</div><div class="ul">input</div></div>
-        <div class="u"><div class="uv">${fmtNum(u.outputTokens)}</div><div class="ul">output</div></div>
-        <div class="u"><div class="uv">${fmtNum(u.reasoningOutputTokens)}</div><div class="ul">reasoning</div></div>
-        <div class="u"><div class="uv">${fmtNum(u.cachedInputTokens)}</div><div class="ul">cached</div></div>
-      </div>`
-    : "";
-  const items = (s.items || []).map(renderSessionItem).join("");
-  return metaLine + usage + `<div class="timeline">${items || '<div class="muted-note">Session has no displayable items.</div>'}</div>`;
+}
+
+function renderSessionUsage(u) {
+  if (!u) return "";
+  return `<div class="usage-bar">
+      <div class="u"><div class="uv">${fmtNum(u.totalTokens)}</div><div class="ul">total tokens</div></div>
+      <div class="u"><div class="uv">${fmtNum(u.inputTokens)}</div><div class="ul">input</div></div>
+      <div class="u"><div class="uv">${fmtNum(u.outputTokens)}</div><div class="ul">output</div></div>
+      <div class="u"><div class="uv">${fmtNum(u.reasoningOutputTokens)}</div><div class="ul">reasoning</div></div>
+      <div class="u"><div class="uv">${fmtNum(u.cachedInputTokens)}</div><div class="ul">cached</div></div>
+    </div>`;
+}
+
+// Only real conversation turns stay open; everything else (reasoning, web search, tool calls/output,
+// and any non-conversation message role) collapses by default so the timeline reads as the dialogue.
+const EXPANDED_ROLES = new Set(["user", "assistant", "developer", "system"]);
+
+// A timeline row that's hidden until clicked. `<details>` with no `open` attribute = collapsed.
+function collapsibleItem(cls, headHtml, bodyHtml) {
+  return `<details class="tl-item ${cls} collapsible"><summary class="tl-head">${headHtml}</summary><div class="tl-body">${bodyHtml}</div></details>`;
 }
 
 function renderSessionItem(it) {
   if (it.kind === "message") {
     const role = it.role || "unknown";
-    return `<div class="tl-item role-${escapeHtml(role)}"><div class="tl-head"><span class="tl-badge">${escapeHtml(role)}</span></div><div class="tl-body">${escapeHtml(it.text)}</div></div>`;
+    const head = `<span class="tl-badge">${escapeHtml(role)}</span>`;
+    if (!EXPANDED_ROLES.has(role)) return collapsibleItem(`role-${escapeHtml(role)}`, head, escapeHtml(it.text));
+    return `<div class="tl-item role-${escapeHtml(role)}"><div class="tl-head">${head}</div><div class="tl-body">${escapeHtml(it.text)}</div></div>`;
   }
   if (it.kind === "reasoning") {
-    return `<div class="tl-item reasoning"><div class="tl-head">✦ reasoning</div><div class="tl-body">${escapeHtml(it.summary)}</div></div>`;
+    return collapsibleItem("reasoning", "✦ reasoning", escapeHtml(it.summary));
   }
   if (it.kind === "web_search") {
     const qs = [];
     if (it.query) qs.push(it.query);
     if (Array.isArray(it.queries)) for (const q of it.queries) if (!qs.includes(q)) qs.push(q);
     const body = qs.length ? qs.map((q) => `<div class="search-q">${escapeHtml(q)}</div>`).join("") : '<span class="muted-note">search</span>';
-    return `<div class="tl-item web_search"><div class="tl-head"><span class="tl-badge">web search</span>${
-      it.status ? escapeHtml(it.status) : ""
-    }</div><div class="tl-body">${body}</div></div>`;
+    const head = `<span class="tl-badge">web search</span>${it.status ? escapeHtml(it.status) : ""}`;
+    return collapsibleItem("web_search", head, body);
   }
   if (it.kind === "function_call") {
     const args = typeof it.arguments === "string" ? it.arguments : JSON.stringify(it.arguments, null, 2);
-    return `<div class="tl-item tool"><div class="tl-head">⌘ ${escapeHtml(it.name)}</div><div class="tl-body">${escapeHtml(args)}</div></div>`;
+    return collapsibleItem("tool", `⌘ ${escapeHtml(it.name)}`, escapeHtml(args));
   }
   if (it.kind === "function_call_output") {
-    return `<div class="tl-item tool"><div class="tl-head">↳ output${it.truncated ? " (truncated)" : ""}</div><div class="tl-body">${escapeHtml(it.output)}</div></div>`;
+    return collapsibleItem("tool", `↳ output${it.truncated ? " (truncated)" : ""}`, escapeHtml(it.output));
+  }
+  // Unrecognized item type forwarded by the parser — show it raw so nothing silently vanishes.
+  if (it.kind === "other") {
+    return collapsibleItem("other", `· ${escapeHtml(it.itemType || "item")}`, escapeHtml(it.raw));
   }
   return "";
 }
 
 function closeDrawer() {
+  stopSessionAutoRefresh();
   el("drawer").hidden = true;
   el("drawer-scrim").hidden = true;
   state.drawerKey = null;
@@ -745,7 +977,7 @@ function applyProgress(event) {
   }
   // Track in-flight agents so a "running" placeholder node shows immediately.
   if (event.type === "agent" && event.key) {
-    state.liveAgents.set(event.key, { key: event.key, label: event.label, phase: event.phase, state: event.state });
+    rememberLiveAgent(event);
   }
   // Debounced refetch re-renders the flow (merged journal + live) and pulls fresh stats/result.
   scheduleRefetch();
@@ -803,7 +1035,7 @@ document.addEventListener("click", (e) => {
   if (runBtn) return selectRun(runBtn.dataset.run);
 
   const node = e.target.closest(".flow-node");
-  if (node) return node.dataset.live ? undefined : openDrawer(node.dataset.key); // live nodes have no detail yet
+  if (node) return openDrawer(node.dataset.key);
 
   const phase = e.target.closest(".flow-phase");
   if (phase) return togglePhase(phase.dataset.phaseTitle);
@@ -815,6 +1047,7 @@ document.addEventListener("click", (e) => {
     document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
     document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.dataset.panel === tab.dataset.tab));
     if (tab.dataset.tab === "session") loadSession();
+    else stopSessionAutoRefresh();
   }
 });
 

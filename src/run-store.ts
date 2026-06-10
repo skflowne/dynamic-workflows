@@ -6,6 +6,20 @@ import type { WorkflowSourceKind } from "./workflow-tool.js";
 
 export type RunRecordStatus = "running" | "completed" | "failed" | "cancelled";
 
+/**
+ * Runner configuration a run used. Persisted so `resume` reuses the same backend/model instead of
+ * silently falling back to defaults (the journal cache key is NOT backend-aware, so resuming under a
+ * different backend would mix results). Historical records omit it and are treated as the codex backend.
+ */
+export interface RunnerConfig {
+  /** Agent backend, e.g. "codex" or "gemini". */
+  backend: string;
+  /** Model passed to the backend (runner/CLI `--model`), when set. */
+  model?: string;
+  /** Gemini CLI executable, when overridden (`--gemini-command`). */
+  geminiCommand?: string;
+}
+
 export interface RunRecord {
   runId: string;
   name: string;
@@ -13,6 +27,8 @@ export interface RunRecord {
   status: RunRecordStatus;
   source: WorkflowSourceKind;
   scriptPath?: string;
+  /** Runner config this run used (backend/model/gemini-command) — lets `resume` reuse it. */
+  runner?: RunnerConfig;
   startedAt: number;
   completedAt?: number;
   durationMs?: number;

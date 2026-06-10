@@ -15,6 +15,7 @@ import {
 
 const OPTIONS = {
   args: { type: "string" },
+  backend: { type: "string" },
   model: { type: "string" },
   concurrency: { type: "string" },
   budget: { type: "string" },
@@ -26,6 +27,7 @@ const OPTIONS = {
   approval: { type: "string" },
   reasoning: { type: "string" },
   bun: { type: "string" },
+  "gemini-command": { type: "string" },
   "idle-timeout": { type: "string" },
   json: { type: "boolean" },
   quiet: { type: "boolean" },
@@ -38,7 +40,7 @@ const OPTIONS = {
   version: { type: "boolean", short: "v" },
 } as const;
 
-const HELP = `codex-workflow — run Claude-compatible dynamic workflows, backed by Codex.
+const HELP = `codex-workflow — run Claude-compatible dynamic workflows, backed by Codex or Gemini CLI.
 
 Usage:
   codex-workflow run <file|name> [options]   Run a workflow file or registered name
@@ -48,21 +50,23 @@ Usage:
   codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
   codex-workflow runs [--json]               List recorded run history
   codex-workflow show <runId> [--json]       Show a recorded run
-  codex-workflow doctor                      Check Bun, Codex CLI, auth, and the viewer
+  codex-workflow doctor                      Check Bun, selected agent backend, and the viewer
 
 Run options:
   --args <json|@file.json>   Arguments passed to the workflow as \`args\`
-  --model <model>            Codex model for every agent() call
+  --backend <name>           Agent backend: codex | gemini (default: codex)
+  --model <model>            Model for every agent() call (backend-specific)
   --concurrency <n>          Max concurrent agents (capped at 16)
   --budget <tokens>          Token budget (estimate) shared across the run
   --max-agents <n>           Hard cap on total agent() calls (default 1000)
   --agent-retries <n>        Retries per agent on transient failure (default 2; agent() returns null when exhausted)
   --agent-timeout <ms>       Per-agent total-duration timeout in ms (0 disables; default 900000)
   --cwd <dir>                Working directory for agents (default: cwd)
-  --sandbox <mode>           read-only | workspace-write | danger-full-access
-  --approval <policy>        never | on-request | on-failure | untrusted
-  --reasoning <effort>       minimal | low | medium | high | xhigh
+  --sandbox <mode>           Codex only: read-only | workspace-write | danger-full-access
+  --approval <policy>        Codex only: never | on-request | on-failure | untrusted
+  --reasoning <effort>       Codex only: minimal | low | medium | high | xhigh
   --bun <path>               Path to the Bun binary
+  --gemini-command <path>    Gemini CLI executable for --backend gemini
   --idle-timeout <ms>         Bun child idle watchdog in ms (0 disables; default 300000)
   --json                     Emit machine-readable JSON (suppresses progress & viewer)
   --quiet                    Suppress progress output
@@ -80,8 +84,8 @@ Viewer:
   -h, --help                 Show this help
   -v, --version              Show version
 
-Workflows are open TS/JS executed under Bun; each agent() spawns a Codex thread.
-Web search + network access are always enabled for agents.
+Workflows are open TS/JS executed under Bun; each agent() spawns an independent backend session.
+For the Codex backend, web search + network access are always enabled for agents.
 Pass run a path to a workflow file (e.g. examples/deep-research.js).
 Bare names resolve from .claude/workflows and ~/.claude/workflows.
 resume restores the workflow's script path / name and args from the run record

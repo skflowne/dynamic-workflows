@@ -51,6 +51,8 @@ export interface WorkflowAgentCall {
 
 /** Metadata a runner can report back mid-run (e.g. the Codex session/thread id). */
 export interface WorkflowAgentMeta {
+  /** Runner/backend identifier, e.g. "codex" or "gemini". */
+  backend?: string;
   sessionId?: string;
   /** Real output tokens this agent spent, when the runner can report them (feeds `budget`). */
   outputTokens?: number;
@@ -92,16 +94,20 @@ export interface WorkflowBudget {
 
 export interface WorkflowProgressAgent {
   type: "agent";
+  backend?: string;
   label: string;
   phase?: string;
   state: "started" | "completed" | "cached" | "failed" | "skipped";
+  /** Prompt/options are included on live started events so the viewer can open running agents. */
+  prompt?: string;
+  options?: WorkflowAgentOptions;
   result?: unknown;
   error?: string;
   /** 1-based ordinal assigned by the runtime; lets the viewer key live agent cards. */
   index?: number;
   /** Stable journal cache key for this agent — lets the viewer match a live node to its journal entry. */
   key?: string;
-  /** Codex session/thread id once known (completed/cached agents on supported runners). */
+  /** Backend session/thread id once known. */
   sessionId?: string;
 }
 
@@ -161,6 +167,8 @@ export interface ParsedWorkflow {
 export interface WorkflowJournalEntry {
   key: string;
   runId: string;
+  /** Runner/backend identifier, when known. Historical entries may omit it and are treated as Codex. */
+  backend?: string;
   prompt: string;
   options: WorkflowAgentOptions;
   result: unknown;

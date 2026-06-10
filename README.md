@@ -1,13 +1,14 @@
 # codex-dynamic-workflows
 
-Run **Claude Code-style dynamic workflows** from the command line, backed by **OpenAI Codex** — with
-a **live visual run viewer** that shows the whole pipeline, every step's progress, and the complete
-Codex session behind each agent.
+Run **Claude Code-style dynamic workflows** from the command line, backed by **OpenAI Codex** or
+**Gemini CLI** — with a **live visual run viewer** that shows the whole pipeline, every step's
+progress, and the complete agent result behind each step.
 
 A workflow is an open TypeScript/JavaScript script with a `meta` block and top-level `await`. The
 orchestration primitives — `agent()`, `parallel()`, `pipeline()`, `workflow()`, `phase()`, `log()`,
-`args`, `budget` — are injected by the runtime. Each `agent()` call runs as an independent **Codex
-thread** via `@openai/codex-sdk`. The script body itself executes unrestricted under **Bun**.
+`args`, `budget` — are injected by the runtime. Each `agent()` call runs as an independent backend
+session: a Codex thread by default, or a fresh Gemini CLI process with `--backend gemini`. The script
+body itself executes unrestricted under **Bun**.
 
 ```bash
 codex-workflow run examples/deep-research.js --args '"what changed in the API?"'   # auto-starts the viewer
@@ -19,14 +20,17 @@ The CLI binary is named `codex-workflow`.
 
 Claude Code ships a built-in `Workflow` tool for fan-out/verify/synthesize orchestration. This brings
 the same authoring model to Codex users as a standalone CLI: the same script shape runs unchanged,
-but the subagents are Codex threads using your local `codex login` credentials and models.
+but the subagents can run through Codex using your local `codex login` credentials, or through Gemini
+CLI using your local Gemini CLI authentication.
 
 ## Requirements
 
 - **Node 20+** (uses `node:util` `parseArgs`, `AbortSignal.any`).
 - **[Bun](https://bun.sh)** — workflow scripts execute in a Bun child process.
 - **[Codex CLI](https://github.com/openai/codex)** authenticated via `codex login` (the SDK reuses
-  `~/.codex/auth.json`). Only needed for real runs, not for `validate`/`list`.
+  `~/.codex/auth.json`) for the default `codex` backend.
+- **Gemini CLI** for `--backend gemini`. Only one real agent backend is needed for `run`; neither is
+  needed for `validate`/`list`.
 
 ## Install
 
@@ -52,7 +56,7 @@ codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
 codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
 codex-workflow runs [--json]               List recorded run history
 codex-workflow show <runId> [--json]       Show a recorded run
-codex-workflow doctor                      Check Bun, Codex CLI, auth, and the viewer
+codex-workflow doctor                      Check Bun, selected agent backend, and the viewer
 ```
 
 `run` takes a workflow file path (absolute or relative) or a bare registered name. Name lookup scans
@@ -63,27 +67,32 @@ etc.) are treated as paths and report a file-not-found error if missing.
 **and** the original `args` straight from the run record, and reuses every completed `agent()` call
 from that run's journal cache (only failed/unrun agents re-execute). Pressing Ctrl-C during a run
 cancels it cleanly and prints the `resume` command to pick it back up. The run options below also
-apply to `resume` — pass `--args` (or any flag) there to override what was recorded.
+apply to `resume` — pass `--args` (or most flags) there to override what was recorded. The **backend**
+(plus `--model` / `--gemini-command`) is inherited from the record when omitted; an explicit
+`--backend` that conflicts with the recorded one is refused, since the journal cache is not
+backend-aware and resuming under a different backend would silently mix results.
 
 Run options:
 
 | Flag | Meaning |
 | --- | --- |
 | `--args <json\|@file.json>` | Value exposed to the script as `args` |
-| `--model <model>` | Codex model for every `agent()` call |
+| `--backend <codex\|gemini>` | Agent backend (default: `codex`; can also use `CODEX_WORKFLOW_BACKEND`) |
+| `--model <model>` | Model for every `agent()` call on the selected built-in backend |
 | `--concurrency <n>` | Max concurrent agents (capped at 16) |
 | `--budget <tokens>` | Token budget (estimate) shared across the run |
 | `--max-agents <n>` | Hard cap on total `agent()` calls (default 1000) |
 | `--cwd <dir>` | Working directory for agents |
-| `--sandbox <mode>` | `read-only` \| `workspace-write` \| `danger-full-access` |
-| `--approval <policy>` | `never` \| `on-request` \| `on-failure` \| `untrusted` |
-| `--reasoning <effort>` | `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
+| `--sandbox <mode>` | Codex only: `read-only` \| `workspace-write` \| `danger-full-access` |
+| `--approval <policy>` | Codex only: `never` \| `on-request` \| `on-failure` \| `untrusted` |
+| `--reasoning <effort>` | Codex only: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
 | `--bun <path>` | Path to the Bun binary |
+| `--gemini-command <path>` | Gemini CLI executable for `--backend gemini` (or `CODEX_WORKFLOW_GEMINI_COMMAND`) |
 | `--idle-timeout <ms>` | Bun child idle watchdog in milliseconds (`0` disables; default 300000) |
 | `--json` | Machine-readable output to stdout (suppresses progress) |
 | `--quiet` / `--no-progress` | Reduce / plainify progress output |
 
-Web search + network access are **always enabled** for agents.
+For the Codex backend, web search + network access are **always enabled** for agents.
 
 Run history, the per-agent journal, and session links are recorded in a **global** data dir,
 `~/.codex-workflow/` (override with `CODEX_WORKFLOW_HOME`), so runs from every project are shared by
@@ -98,6 +107,9 @@ CODEX_WORKFLOW_FAKE_AGENT=1 codex-workflow run examples/hello.js --args '{"name"
 
 # Real run, JSON result piped to jq:
 codex-workflow run examples/hello.js --args '{"name":"Ada"}' --json | jq .result
+
+# Real Gemini CLI run:
+codex-workflow run examples/hello.js --backend gemini --model gemini-3.5-flash --args '{"name":"Ada"}'
 ```
 
 `examples/nested-demo.js` demonstrates the `workflow()` nesting primitive (nesting by path; registered
@@ -123,8 +135,8 @@ A local web viewer (zero runtime dependencies — Node's `http` + a vanilla SPA)
 - **Pipeline flow graph** — phases wired together; click one to expand a fan of its agent nodes.
 - **Per-step progress** — agents appear as "running" placeholders the moment they start (phase badges
   show `done/total`), then flip to ✓ / ✕ as they finish.
-- **Full Codex session** — drill into any agent to see its prompt, structured result, and the complete
-  rollout: messages, reasoning, web searches, tool calls, and token usage.
+- **Per-agent detail** — drill into any agent to see its prompt and structured result; Codex-backed
+  runs also link the complete rollout with messages, reasoning, web searches, tool calls, and usage.
 - **Input & Result** — the workflow's `args` and final return value, rendered top and bottom.
 - **Live** — the page streams updates over SSE (logs, phase progress, status) with no refresh.
 
@@ -160,12 +172,16 @@ const findings = await pipeline(
 return { findings: findings.flat().filter(Boolean) }
 ```
 
-- `agent(prompt, opts?)` — spawn a Codex subagent. Options: `label`, `phase`, `schema` (JSON Schema →
-  validated structured output), `model`, `agentType`, `isolation: 'worktree'` (runs in a fresh
-  detached git worktree). If the current `meta.phases[]` entry has a `model`, agents in that phase
-  inherit it unless they pass `model` explicitly. `agentType` is prompt context only; Codex does not
-  load Claude's built-in agent definitions or tool bundles. Without a schema it returns the final
-  text; with a schema it returns the validated object.
+- `agent(prompt, opts?)` — spawn one subagent on the selected backend. Options: `label`, `phase`,
+  `schema` (JSON Schema → validated structured output), `model`, `agentType`, `isolation:
+  'worktree'` (runs in a fresh detached git worktree). Built-in Codex/Gemini runners intentionally
+  ignore workflow-authored `model` values (`agent({ model })` and `meta.phases[].model`) so Claude
+  workflows with hard-coded model names remain portable; use CLI/library `--model` / runner options
+  to choose the backend model. `agentType` is prompt context only; Codex/Gemini do not load Claude's
+  built-in agent definitions or tool bundles. Without a schema it returns the final text; with a
+  schema it returns the validated object. Gemini CLI does not receive a native JSON schema, so schema
+  correctness is enforced by the workflow runtime and failed validation is retried like any other
+  agent failure.
 - `parallel(thunks)` — run `() => …` thunks concurrently; a thrown thunk resolves to `null`.
 - `pipeline(items, stage1, stage2, …)` — run each item through all stages independently (no barrier);
   stages receive `(prevResult, originalItem, index)`; a throwing stage drops the item to `null`.
@@ -185,8 +201,8 @@ filesystem, `Bun`, etc.). Resume is therefore *best-effort*: completed `agent()`
 journal keyed by prompt+options+runId and reused on `resume`, but non-deterministic script logic is
 not snapshotted.
 
-Codex structured output also requires stricter JSON Schema than Claude. The runner sends a strict
-copy to Codex while preserving the original schema for runtime validation; optional fields are
+Codex structured output also requires stricter JSON Schema than Claude. The Codex runner sends a
+strict copy to Codex while preserving the original schema for runtime validation; optional fields are
 represented as nullable in the strict copy and stripped back out before loose-schema validation.
 
 ## Library use
@@ -194,11 +210,15 @@ represented as nullable in the strict copy and stripped back out before loose-sc
 The CLI is built on a small library you can embed:
 
 ```ts
-import { CodexSdkAgentRunner, WorkflowController } from "codex-workflow";
+import { CodexSdkAgentRunner, GeminiCliAgentRunner, WorkflowController } from "codex-workflow";
 
 const controller = new WorkflowController({
   runner: new CodexSdkAgentRunner({ cwd: process.cwd() }),
   concurrency: 8,
+});
+
+const geminiController = new WorkflowController({
+  runner: new GeminiCliAgentRunner({ cwd: process.cwd(), model: "gemini-3.5-flash" }),
 });
 
 const output = await controller.run({ scriptPath: "examples/deep-research.js", args: "What changed?" });
@@ -222,6 +242,7 @@ codex-workflow run
             -> Bun child process executes the open TS/JS body
             -> JSONL IPC routes agent()/workflow()/phase()/log() back to the parent
                  -> CodexSdkAgentRunner  (real Codex threads)
+                 -> GeminiCliAgentRunner (real Gemini CLI processes)
                  -> ScriptedAgentRunner  (deterministic tests)
        -> FileRunStore records run history -> `runs` / `show`
 ```
@@ -234,10 +255,11 @@ npm run typecheck         # tsc over src + tests
 npm run test:deepresearch # runs the real Claude deep-research workflow against a stubbed runner
 ```
 
-The live Codex path is gated to avoid spending tokens:
+The live Codex and Gemini paths are gated to avoid spending tokens / external service calls:
 
 ```bash
 RUN_CODEX_SDK_LIVE=1 npm test
+RUN_GEMINI_CLI_LIVE=1 npm test
 ```
 
 `test:deepresearch` runs the vendored `deep-research` workflow (`examples/deep-research.js`) against a
@@ -247,6 +269,5 @@ stubbed runner. (Override the path with `DEEP_RESEARCH_WORKFLOW_PATH`.)
 
 - MCP server / in-Codex tool registration (this is a standalone CLI by design).
 - Remote/cloud workflows; a long-running background daemon.
-- Real LLM token accounting — `budget` uses a length-based estimate.
-- Claude built-in agent definitions/tool bundles behind `agentType`; Codex receives `agentType` as
-  prompt context only.
+- Claude built-in agent definitions/tool bundles behind `agentType`; selected backends receive
+  `agentType` as prompt context only.

@@ -15,6 +15,8 @@ export interface CodexSessionMeta {
   originator?: string;
   modelProvider?: string;
   model?: string;
+  /** Reasoning effort / level for the turn (Codex: `turn_context.effort`, e.g. "xhigh"). */
+  effort?: string;
 }
 
 export type CodexSessionItem =
@@ -22,7 +24,9 @@ export type CodexSessionItem =
   | { kind: "reasoning"; summary: string }
   | { kind: "web_search"; query?: string; queries?: string[]; status?: string }
   | { kind: "function_call"; name: string; arguments: unknown; callId?: string }
-  | { kind: "function_call_output"; callId?: string; output: string; truncated?: boolean };
+  | { kind: "function_call_output"; callId?: string; output: string; truncated?: boolean }
+  /** Fallback for an unrecognized response_item type, so new Codex content isn't silently dropped. */
+  | { kind: "other"; itemType: string; raw: string };
 
 export interface CodexSessionUsage {
   inputTokens?: number;
@@ -76,6 +80,7 @@ export function parseCodexSession(raw: string): ParsedCodexSession {
 
     if (type === "turn_context") {
       setMeta(meta, "model", str(payload.model));
+      setMeta(meta, "effort", str(payload.effort));
       continue;
     }
 
@@ -95,7 +100,8 @@ export function parseCodexSession(raw: string): ParsedCodexSession {
 }
 
 function parseResponseItem(payload: Record<string, unknown>): CodexSessionItem | undefined {
-  switch (payload.type) {
+  const type = str(payload.type);
+  switch (type) {
     case "message": {
       const role = str(payload.role) ?? "unknown";
       const text = extractContentText(payload.content);
@@ -118,29 +124,50 @@ function parseResponseItem(payload: Record<string, unknown>): CodexSessionItem |
         ...(status ? { status } : {}),
       };
     }
-    case "function_call": {
-      const callId = str(payload.call_id);
-      return {
-        kind: "function_call",
-        name: str(payload.name) ?? "tool",
-        arguments: parseMaybeJson(payload.arguments),
-        ...(callId ? { callId } : {}),
-      };
-    }
-    case "function_call_output": {
-      const callId = str(payload.call_id);
-      const rawOut = stringifyOutput(payload.output);
-      const truncated = rawOut.length > MAX_OUTPUT_CHARS;
-      return {
-        kind: "function_call_output",
-        ...(callId ? { callId } : {}),
-        output: truncated ? `${rawOut.slice(0, MAX_OUTPUT_CHARS)}\n…[truncated ${rawOut.length - MAX_OUTPUT_CHARS} chars]` : rawOut,
-        ...(truncated ? { truncated: true } : {}),
-      };
-    }
+    case "function_call":
+      return toFunctionCall(payload);
+    case "function_call_output":
+      return toFunctionCallOutput(payload);
     default:
-      return undefined;
+      // Don't silently drop an unrecognized content item. Tool-shaped items — the Responses API
+      // names them "<tool>_call" / "<tool>_output" (custom_tool_call, tool_search_call,
+      // local_shell_call, …) — render like a function call; anything else becomes a raw block.
+      if (!type) return undefined;
+      if (type.endsWith("_call")) return toFunctionCall(payload);
+      if (type.endsWith("_output")) return toFunctionCallOutput(payload);
+      return { kind: "other", itemType: type, raw: cap(stringifyOutput(payload)).output };
   }
+}
+
+// Normalize any tool-call variant into one shape. `function_call` carries `arguments`;
+// `custom_tool_call` carries `input` (e.g. an apply_patch body); `tool_search_call` an `arguments`
+// object and no `name` (so fall back to the item type).
+function toFunctionCall(payload: Record<string, unknown>): CodexSessionItem {
+  const callId = str(payload.call_id);
+  return {
+    kind: "function_call",
+    name: str(payload.name) ?? str(payload.type) ?? "tool",
+    arguments: parseMaybeJson(payload.arguments ?? payload.input ?? {}),
+    ...(callId ? { callId } : {}),
+  };
+}
+
+// Normalize any tool-output variant. `function_call_output` / `custom_tool_call_output` use
+// `output`; `tool_search_output` uses `tools`; otherwise dump the whole payload.
+function toFunctionCallOutput(payload: Record<string, unknown>): CodexSessionItem {
+  const callId = str(payload.call_id);
+  const { output, truncated } = cap(stringifyOutput(payload.output ?? payload.tools ?? payload));
+  return {
+    kind: "function_call_output",
+    ...(callId ? { callId } : {}),
+    output,
+    ...(truncated ? { truncated: true } : {}),
+  };
+}
+
+function cap(text: string): { output: string; truncated: boolean } {
+  if (text.length <= MAX_OUTPUT_CHARS) return { output: text, truncated: false };
+  return { output: `${text.slice(0, MAX_OUTPUT_CHARS)}\n…[truncated ${text.length - MAX_OUTPUT_CHARS} chars]`, truncated: true };
 }
 
 function readUsage(payload: Record<string, unknown>): CodexSessionUsage | undefined {

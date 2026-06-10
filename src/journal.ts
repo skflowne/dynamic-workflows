@@ -60,10 +60,17 @@ export function cloneJournalResult(entry: WorkflowJournalEntry): unknown {
   return structuredClone(entry.result);
 }
 
-export function journalEntryFromCall(call: WorkflowAgentCall, result: unknown, sessionId?: string): WorkflowJournalEntry {
+export function journalEntryFromCall(
+  call: WorkflowAgentCall,
+  result: unknown,
+  meta?: string | { sessionId?: string; backend?: string },
+): WorkflowJournalEntry {
+  const sessionId = typeof meta === "string" ? meta : meta?.sessionId;
+  const backend = typeof meta === "string" ? undefined : meta?.backend;
   return {
     key: call.cacheKey,
     runId: call.runId,
+    ...(backend ? { backend } : {}),
     prompt: call.prompt,
     options: structuredClone(call.options),
     result: structuredClone(result),

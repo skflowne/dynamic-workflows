@@ -22,6 +22,8 @@ test("buildPrompt adds the strict JSON contract when a schema is present", () =>
   assert.match(prompt, /Structured output contract:/);
   assert.match(prompt, /You MUST return ONLY JSON/);
   assert.match(prompt, /If your output fails schema validation the call fails/);
+  // Codex sends the schema as a native parameter, so it must NOT also be embedded in the prompt.
+  assert.doesNotMatch(prompt, /JSON Schema your output must satisfy/);
 });
 
 test("buildPrompt describes worktree isolation as preserve-on-change", () => {

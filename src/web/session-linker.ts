@@ -47,26 +47,32 @@ export async function linkRun(
   const missing = entries.filter((e) => !cache[e.key]);
   if (missing.length === 0) return cache;
 
-  const windowStart = record.startedAt - WINDOW_BEFORE_MS;
-  const windowEnd = (record.completedAt ?? now) + WINDOW_AFTER_MS;
-  const candidates = await collectCandidateSessions(sessionsDir, windowStart, windowEnd, record.startedAt, windowEnd);
-
   const usedPaths = new Set(Object.values(cache).map((l) => l.sessionPath));
   const result: Record<string, SessionLink> = { ...cache };
 
-  // Pass 1: exact links via stored sessionId.
-  for (const entry of missing) {
-    if (!entry.sessionId) continue;
-    const hit = candidates.find((c) => !usedPaths.has(c.path) && c.path.includes(entry.sessionId as string));
-    if (hit) {
-      result[entry.key] = { sessionPath: hit.path, sessionId: entry.sessionId };
-      usedPaths.add(hit.path);
+  // Pass 1: exact links via stored sessionId — search ALL rollout files regardless of date/window. A
+  // recorded sessionId uniquely identifies its rollout; on `resume` the original file's date dir and
+  // mtime fall outside this run's window (resume reuses the runId but resets record.startedAt to now).
+  const withId = missing.filter((e) => e.sessionId);
+  if (withId.length > 0) {
+    const byId = await findRolloutsBySessionId(sessionsDir, new Set(withId.map((e) => e.sessionId as string)));
+    for (const entry of withId) {
+      const id = entry.sessionId as string;
+      const hit = byId.get(id);
+      if (hit && !usedPaths.has(hit)) {
+        result[entry.key] = { sessionPath: hit, sessionId: id };
+        usedPaths.add(hit);
+      }
     }
   }
 
-  // Pass 2: heuristic content match for whatever's left.
+  // Pass 2: heuristic content match within the run's time window for whatever's left (older runs with
+  // no stored sessionId, or an id that matched no file).
   const stillMissing = missing.filter((e) => !result[e.key]);
   if (stillMissing.length > 0) {
+    const windowStart = record.startedAt - WINDOW_BEFORE_MS;
+    const windowEnd = (record.completedAt ?? now) + WINDOW_AFTER_MS;
+    const candidates = await collectCandidateSessions(sessionsDir, windowStart, windowEnd, record.startedAt, windowEnd);
     const unmatched = candidates.filter((c) => !usedPaths.has(c.path));
     const infos = await Promise.all(unmatched.map(async (c) => ({ path: c.path, ...(await readSessionInfo(c.path)) })));
     for (const entry of stillMissing) {
@@ -133,6 +139,37 @@ async function collectCandidateSessions(
     }
   }
   return out.sort((a, b) => a.mtimeMs - b.mtimeMs);
+}
+
+/** Walks the whole sessions tree for rollout files whose name contains one of the sessionIds. */
+async function findRolloutsBySessionId(sessionsDir: string, ids: Set<string>): Promise<Map<string, string>> {
+  const found = new Map<string, string>();
+  const visit = async (dir: string): Promise<void> => {
+    if (found.size === ids.size) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (found.size === ids.size) return;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await visit(full);
+        continue;
+      }
+      if (!entry.name.startsWith("rollout-") || !entry.name.endsWith(".jsonl")) continue;
+      for (const id of ids) {
+        if (!found.has(id) && entry.name.includes(id)) {
+          found.set(id, full);
+          break;
+        }
+      }
+    }
+  };
+  await visit(sessionsDir);
+  return found;
 }
 
 /** Local-date `<dir>/YYYY/MM/DD` directories spanning the run, ±1 day of slack for tz/midnight. */

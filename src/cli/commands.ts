@@ -6,11 +6,12 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { CodexSdkAgentRunner, type CodexSdkAgentRunnerOptions } from "../runners/codex-sdk.js";
+import { GeminiCliAgentRunner, type GeminiCliAgentRunnerOptions } from "../runners/gemini-cli.js";
 import type { SandboxMode, ThreadOptions } from "@openai/codex-sdk";
 import { defaultWorkflowDirs, WorkflowController } from "../controller.js";
 import { WorkflowAbortError, WorkflowInputError } from "../errors.js";
 import { parseWorkflowScript } from "../parser.js";
-import { FileRunStore, type RunRecord } from "../run-store.js";
+import { FileRunStore, type RunnerConfig, type RunRecord } from "../run-store.js";
 import { acquireRunLock, type RunLock } from "../run-lock.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner, WorkflowProgressEvent } from "../types.js";
 import { WorkflowRegistry, type WorkflowInput } from "../workflow-tool.js";
@@ -24,6 +25,7 @@ const exec = promisify(execFile);
 
 export interface RunFlags {
   args?: string;
+  backend?: string;
   model?: string;
   concurrency?: string;
   budget?: string;
@@ -36,6 +38,7 @@ export interface RunFlags {
   reasoning?: string;
   reasoningEffort?: string;
   bun?: string;
+  "gemini-command"?: string;
   "idle-timeout"?: string;
   json?: boolean;
   quiet?: boolean;
@@ -49,6 +52,8 @@ export interface RunFlags {
 const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
 const APPROVAL_MODES = ["never", "on-request", "on-failure", "untrusted"];
 const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
+const AGENT_BACKENDS = ["codex", "gemini"] as const;
+type AgentBackend = (typeof AGENT_BACKENDS)[number];
 
 /** `codex-workflow run <file>` */
 export async function runCommand(target: string | undefined, flags: RunFlags): Promise<number> {
@@ -105,6 +110,34 @@ export async function resumeCommand(runId: string | undefined, flags: RunFlags):
   }
   if (override !== undefined) input.args = override;
 
+  // A run's backend is part of "what ran it" and must survive resume: the journal cache key is NOT
+  // backend-aware, so resuming a codex run under gemini would silently mix results. Inherit the
+  // recorded runner config when this invocation omits it; refuse an explicit backend that disagrees.
+  const recordedBackend = record.runner?.backend ?? "codex";
+  if (flags.backend !== undefined) {
+    let requested: AgentBackend;
+    try {
+      requested = resolveBackend(flags.backend);
+    } catch (error) {
+      process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+      return 2;
+    }
+    if (requested !== recordedBackend) {
+      process.stderr.write(
+        `error: run ${runId} used backend "${recordedBackend}"; cannot resume it with --backend "${requested}". ` +
+          `Drop --backend to reuse "${recordedBackend}", or start a fresh run (the journal cache is not backend-aware).\n`,
+      );
+      return 2;
+    }
+  } else {
+    flags.backend = recordedBackend;
+  }
+  // Inherit the rest of the runner config when omitted (model can still be overridden explicitly).
+  if (flags.model === undefined && record.runner?.model !== undefined) flags.model = record.runner.model;
+  if (flags["gemini-command"] === undefined && record.runner?.geminiCommand !== undefined) {
+    flags["gemini-command"] = record.runner.geminiCommand;
+  }
+
   return executeRun(input, runId, cwd, flags, { resumeRecord: record });
 }
 
@@ -126,7 +159,13 @@ async function executeRun(
   // Runtime data (runs/journal/links) lives in the global data dir so it's shared across projects;
   // `cwd` stays the project dir (where Codex agents run).
   const dataDir = workflowDataDir();
-  const runner = buildAgentRunner(cwd, flags);
+  let runner: WorkflowAgentRunner;
+  try {
+    runner = buildAgentRunner(cwd, flags);
+  } catch (error) {
+    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 2;
+  }
   const runsPath = runsDir(dataDir);
   const runStore = new FileRunStore(runsPath);
   let runLock: RunLock;
@@ -167,6 +206,7 @@ async function executeRun(
       ...(options.resumeRecord?.description ? { description: options.resumeRecord.description } : {}),
       status: "running",
       source: input.name ? "named" : input.scriptPath ? "scriptPath" : "inline",
+      runner: resolveRunnerConfig(flags),
       startedAt,
       ...(declaredPhases ? { declaredPhases } : {}),
       ...(input.args !== undefined ? { args: input.args } : {}),
@@ -506,25 +546,45 @@ export async function serveCommand(flags: RunFlags): Promise<number> {
 }
 
 /** `codex-workflow doctor` */
-export async function doctorCommand(_flags: { cwd?: string }): Promise<number> {
+export async function doctorCommand(flags: { cwd?: string; backend?: string; "gemini-command"?: string }): Promise<number> {
   let ok = true;
-  const line = (good: boolean, label: string, hint?: string) => {
+  let backend: AgentBackend;
+  try {
+    backend = resolveBackend(flags.backend);
+  } catch (error) {
+    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 2;
+  }
+  const required = (good: boolean, label: string, hint?: string) => {
     if (!good) ok = false;
     process.stdout.write(`${good ? green("✓") : red("✗")} ${label}${good || !hint ? "" : `\n    ${dim(hint)}`}\n`);
   };
+  const optional = (good: boolean, label: string, hint?: string) => {
+    process.stdout.write(`${good ? green("✓") : yellow("!")} ${label}${good || !hint ? "" : `\n    ${dim(hint)}`}\n`);
+  };
 
   const bun = await tryExec("bun", ["--version"]);
-  line(bun.ok, `Bun runtime${bun.ok ? ` (${bun.out.trim()})` : ""}`, "Install Bun: https://bun.sh — workflows execute in a Bun child process.");
+  required(bun.ok, `Bun runtime${bun.ok ? ` (${bun.out.trim()})` : ""}`, "Install Bun: https://bun.sh — workflows execute in a Bun child process.");
 
   const codex = await tryExec("codex", ["--version"]);
-  line(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Install Codex CLI and run `codex login`.");
-
   const authPath = path.join(os.homedir(), ".codex", "auth.json");
   const auth = await pathExists(authPath);
-  line(auth, "Codex auth (~/.codex/auth.json)", "Run `codex login` to authenticate.");
+  const geminiCommand = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini";
+  const gemini = await tryExec(geminiCommand, ["--version"]);
+
+  if (backend === "codex") {
+    required(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Install Codex CLI and run `codex login`.");
+    required(auth, "Codex auth (~/.codex/auth.json)", "Run `codex login` to authenticate.");
+    optional(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Only needed for `--backend gemini`.");
+  } else {
+    required(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Install Gemini CLI, add it to PATH, or pass --gemini-command <path>.");
+    optional(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Only needed for the default Codex backend.");
+    optional(auth, "Codex auth (~/.codex/auth.json)", "Only needed for the default Codex backend.");
+  }
 
   const dataDir = workflowDataDir();
   process.stdout.write(`${green("✓")} data dir: ${dataDir}\n`);
+  process.stdout.write(`${dim("·")} backend: ${dim(backend)}\n`);
   process.stdout.write(`${dim("·")} viewer: ${dim("starts in-process per `run` (random port); `codex-workflow serve` browses history")}\n`);
 
   process.stdout.write(ok ? `\n${green("Ready.")}\n` : `\n${yellow("Some checks failed — see hints above.")}\n`);
@@ -571,21 +631,68 @@ async function parseArgsValue(raw: string | undefined, cwd: string): Promise<unk
 function buildAgentRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
   if (process.env.CODEX_WORKFLOW_FAKE_AGENT) return new FakeAgentRunner();
 
+  const backend = resolveBackend(flags.backend);
+  if (backend === "gemini") return buildGeminiRunner(cwd, flags);
+  return buildCodexRunner(cwd, flags);
+}
+
+function buildCodexRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
   const options: CodexSdkAgentRunnerOptions = { cwd };
   if (flags.model) options.model = flags.model;
   if (flags.sandbox) options.sandboxMode = assertOneOf(flags.sandbox, SANDBOX_MODES, "--sandbox") as SandboxMode;
   if (flags.approval) options.approvalPolicy = assertOneOf(flags.approval, APPROVAL_MODES, "--approval") as ThreadOptions["approvalPolicy"];
   const reasoning = flags.reasoning ?? flags.reasoningEffort;
   if (reasoning) options.modelReasoningEffort = assertOneOf(reasoning, REASONING_EFFORTS, "--reasoning") as ThreadOptions["modelReasoningEffort"];
-  if (flags["agent-timeout"] !== undefined) {
-    const timeout = Number(flags["agent-timeout"]);
-    if (!Number.isFinite(timeout)) throw new WorkflowInputError(`--agent-timeout must be a number, got "${flags["agent-timeout"]}"`);
-    options.agentTimeoutMs = timeout;
-  }
+  const codexTimeout = parseAgentTimeoutFlag(flags["agent-timeout"]);
+  if (codexTimeout !== undefined) options.agentTimeoutMs = codexTimeout;
   // Web search + network access are always enabled for agents.
   options.webSearchEnabled = true;
   options.networkAccessEnabled = true;
   return new CodexSdkAgentRunner(options);
+}
+
+function buildGeminiRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
+  const unsupported = [
+    flags.sandbox !== undefined ? "--sandbox" : undefined,
+    flags.approval !== undefined ? "--approval" : undefined,
+    (flags.reasoning ?? flags.reasoningEffort) !== undefined ? "--reasoning" : undefined,
+  ].filter(Boolean);
+  if (unsupported.length) {
+    throw new WorkflowInputError(`${unsupported.join(", ")} ${unsupported.length === 1 ? "is" : "are"} only supported with --backend codex`);
+  }
+
+  const options: GeminiCliAgentRunnerOptions = { cwd };
+  options.command = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini";
+  if (flags.model) options.model = flags.model;
+  const geminiTimeout = parseAgentTimeoutFlag(flags["agent-timeout"]);
+  if (geminiTimeout !== undefined) options.agentTimeoutMs = geminiTimeout;
+  return new GeminiCliAgentRunner(options);
+}
+
+function resolveBackend(raw: string | undefined): AgentBackend {
+  const value = raw ?? process.env.CODEX_WORKFLOW_BACKEND ?? "codex";
+  return assertOneOf(value, [...AGENT_BACKENDS], "--backend") as AgentBackend;
+}
+
+/** Snapshots the runner config a run used so `resume` can reuse it (see `RunnerConfig`). */
+function resolveRunnerConfig(flags: RunFlags): RunnerConfig {
+  const config: RunnerConfig = { backend: resolveBackend(flags.backend) };
+  if (flags.model) config.model = flags.model;
+  if (config.backend === "gemini") {
+    const command = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND;
+    if (command) config.geminiCommand = command;
+  }
+  return config;
+}
+
+/** Parses `--agent-timeout` (ms): a non-negative number, where 0 disables the timeout. */
+function parseAgentTimeoutFlag(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const timeout = Number(raw);
+  if (!Number.isFinite(timeout) || timeout < 0) {
+    throw new WorkflowInputError(`--agent-timeout must be a non-negative number of ms (0 disables), got "${raw}"`);
+  }
+  return timeout;
 }
 
 /** Deterministic, token-free runner used by tests via CODEX_WORKFLOW_FAKE_AGENT=1. */
@@ -651,9 +758,11 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
-async function tryExec(cmd: string, args: string[]): Promise<{ ok: boolean; out: string }> {
+async function tryExec(cmd: string, args: string[], timeoutMs = 5000): Promise<{ ok: boolean; out: string }> {
   try {
-    const { stdout } = await exec(cmd, args);
+    // `doctor` probes external binaries (bun/codex/gemini --version); a misbehaving same-named binary
+    // on PATH must not hang the whole check, so cap each probe with a timeout (SIGTERM on expiry).
+    const { stdout } = await exec(cmd, args, { timeout: timeoutMs });
     return { ok: true, out: stdout };
   } catch {
     return { ok: false, out: "" };

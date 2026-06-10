@@ -42,6 +42,32 @@ test("interleaved pipeline phases don't flip-flop the header (each phase headed 
   assert.deepEqual(cap.headers(), ["Search", "Fetch"]); // not Search, Fetch, Search, Fetch
 });
 
+test("repeated 'started' for one agent counts as a single running agent (key dedup)", () => {
+  const saved = process.env.NO_COLOR;
+  delete process.env.NO_COLOR; // the transient status line is gated on color (pretty + TTY + !NO_COLOR)
+  try {
+    const chunks: string[] = [];
+    const stream = { isTTY: true, write: (s: string) => (chunks.push(s), true) } as unknown as NodeJS.WriteStream;
+    const r = new ProgressRenderer("pretty", stream);
+
+    // The runtime re-emits 'started' for the same agent when backend/sessionId arrive (Gemini does this
+    // twice). All carry the same journal key — they must collapse to one running agent, not three.
+    r.handle({ type: "agent", label: "context", phase: "Context", state: "started", key: "k-ctx" });
+    r.handle({ type: "agent", label: "context", phase: "Context", state: "started", key: "k-ctx", backend: "gemini" });
+    r.handle({ type: "agent", label: "context", phase: "Context", state: "started", key: "k-ctx", sessionId: "s1" });
+
+    const out = chunks.join("");
+    assert.match(out, /running 1 agent\(s\)/);
+    assert.doesNotMatch(out, /running [2-9] agent\(s\)/);
+
+    // Completing it drops the running count back to zero (status line cleared).
+    r.handle({ type: "agent", label: "context", phase: "Context", state: "completed", key: "k-ctx" });
+    assert.doesNotMatch(chunks.join(""), /running [1-9] agent\(s\)$/);
+  } finally {
+    if (saved !== undefined) process.env.NO_COLOR = saved;
+  }
+});
+
 test("explicit phase() re-entry still prints each time (loop-style workflows)", () => {
   const cap = capture();
   const r = new ProgressRenderer("plain", cap.stream);

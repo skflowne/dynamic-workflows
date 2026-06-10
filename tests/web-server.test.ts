@@ -156,6 +156,77 @@ test("broadcast pushes live progress events to SSE subscribers (in-process path)
   }
 });
 
+test("web server exposes live running agent detail before journal entry exists", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-web-live-agent-"));
+  const geminiSessionsDir = await mkdtemp(path.join(tmpdir(), "cw-web-gemini-sessions-"));
+  const server = createWebServer({ cwd, version: "9.9.9", geminiSessionsDir });
+  try {
+    const runId = "wf_live_agent";
+    const record: RunRecord = {
+      runId,
+      name: "live agent",
+      status: "running",
+      source: "scriptPath",
+      startedAt: START,
+      declaredPhases: ["Scope"],
+    };
+    await mkdir(path.join(cwd, ".codex-workflow", "runs"), { recursive: true });
+    await writeFile(path.join(cwd, ".codex-workflow", "runs", `${runId}.json`), JSON.stringify(record), "utf8");
+
+    const geminiDir = path.join(geminiSessionsDir, "project", "chats");
+    await mkdir(geminiDir, { recursive: true });
+    const geminiPath = path.join(geminiDir, "session-2026-06-08T00-00-gemini.jsonl");
+    const geminiSession = [
+      { sessionId: "gemini-live-session", projectHash: "p", startTime: "2026-06-08T00:00:00Z", kind: "main" },
+      { id: "u1", timestamp: "2026-06-08T00:00:01Z", type: "user", content: [{ text: "read me while running" }] },
+      { id: "g1", timestamp: "2026-06-08T00:00:02Z", type: "gemini", content: "live trace", model: "gemini-test" },
+    ]
+      .map((line) => JSON.stringify(line))
+      .join("\n");
+    await writeFile(geminiPath, geminiSession, "utf8");
+    await utimes(geminiPath, new Date(START + 1000), new Date(START + 1000));
+
+    const bound = await server.listen(0);
+    server.broadcast({
+      runId,
+      type: "progress",
+      event: {
+        type: "agent",
+        state: "started",
+        key: "live-key",
+        index: 1,
+        label: "scope",
+        phase: "Scope",
+        backend: "gemini",
+        prompt: "read me while running",
+        options: { label: "scope", phase: "Scope", model: "gemini-test" },
+        sessionId: "gemini-live-session",
+      },
+    });
+
+    const detail = await get(`${bound.url}/api/runs/${runId}`);
+    assert.equal(detail.json.live.length, 1);
+
+    const agent = await get(`${bound.url}/api/runs/${runId}/agents/live-key`);
+    assert.equal(agent.status, 200);
+    assert.equal(agent.json.prompt, "read me while running");
+    assert.equal(agent.json.options.model, "gemini-test");
+    assert.equal(agent.json.backend, "gemini");
+    assert.equal(agent.json.sessionId, "gemini-live-session");
+    assert.equal(agent.json.result, undefined);
+
+    const session = await get(`${bound.url}/api/runs/${runId}/agents/live-key/session`);
+    assert.equal(session.status, 200);
+    assert.equal(session.json.meta.id, "gemini-live-session");
+    assert.equal(session.json.meta.modelProvider, "gemini");
+    assert.ok(session.json.items.some((item: any) => item.kind === "message" && item.role === "assistant" && item.text === "live trace"));
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+    await rm(geminiSessionsDir, { recursive: true, force: true });
+  }
+});
+
 test("server tails a run's events file: initial scan, fs.watch, and drainRun", async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), "cw-tail-"));
   const dataDir = path.join(cwd, ".codex-workflow");

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,12 +25,19 @@ interface CliResult {
   stderr: string;
 }
 
-function runCli(args: string[], cwd: string): Promise<CliResult> {
+function runCli(
+  args: string[],
+  cwd: string,
+  options: { fakeAgent?: boolean; env?: Record<string, string> } = {},
+): Promise<CliResult> {
   return new Promise((resolve, reject) => {
+    const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1", CODEX_WORKFLOW_HOME: cwd, ...(options.env ?? {}) };
+    if (options.fakeAgent !== false) env.CODEX_WORKFLOW_FAKE_AGENT = "1";
+    else delete env.CODEX_WORKFLOW_FAKE_AGENT;
     const child = spawn(process.execPath, [CLI, ...args], {
       cwd,
       // Isolate run history to the temp dir (CODEX_WORKFLOW_HOME) so tests never touch the real ~/.codex-workflow.
-      env: { ...process.env, CODEX_WORKFLOW_FAKE_AGENT: "1", NO_COLOR: "1", CODEX_WORKFLOW_HOME: cwd },
+      env,
     });
     let stdout = "";
     let stderr = "";
@@ -120,6 +127,144 @@ test("CLI resume re-runs a recorded run by id, restoring args and reusing the jo
     const missing = await runCli(["resume", "wf_does-not-exist", "--cwd", dir], dir);
     assert.equal(missing.code, 1);
     assert.match(missing.stderr, /not found/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI run supports the Gemini backend", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-gemini-"));
+  try {
+    const wfPath = path.join(dir, "gemini_demo.js");
+    await writeFile(
+      wfPath,
+      `export const meta = {
+  name: 'gemini_demo',
+  description: 'Gemini CLI backend workflow',
+  phases: [{ title: 'Work', model: 'claude-phase-model' }],
+}
+
+phase('Work')
+return agent('from cli', { label: 'gemini', model: 'claude-hardcoded-model' })
+`,
+      "utf8",
+    );
+    const fakeGemini = path.join(dir, "fake-gemini");
+    await writeFile(
+      fakeGemini,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const valueAfter = (flag) => {
+  const index = args.indexOf(flag);
+  return index >= 0 ? args[index + 1] : undefined;
+};
+const prompt = valueAfter("-p") || valueAfter("--prompt") || "";
+const model = valueAfter("--model") || valueAfter("-m") || "none";
+console.log(JSON.stringify({
+  session_id: "cli-gemini-session",
+  response: "fake-gemini:" + model + ":" + prompt.includes("from cli"),
+  stats: { models: { [model]: { tokens: { candidates: 3, total: 20 } } } }
+}));
+`,
+      "utf8",
+    );
+    await chmod(fakeGemini, 0o755);
+
+    const run = await runCli(
+      ["run", wfPath, "--backend", "gemini", "--model", "test-gemini", "--gemini-command", fakeGemini, "--json", "--cwd", dir],
+      dir,
+      { fakeAgent: false },
+    );
+    assert.equal(run.code, 0, run.stderr);
+    const output = JSON.parse(run.stdout) as { status: string; result: string; stats: { agentCount: number } };
+    assert.equal(output.status, "completed");
+    assert.equal(output.result, "fake-gemini:test-gemini:true");
+    assert.equal(output.stats.agentCount, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI rejects a negative --agent-timeout", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-timeout-"));
+  try {
+    const wfPath = path.join(dir, "wf.js");
+    await writeFile(wfPath, "export const meta = { name: 'x', description: 'x' }\nreturn 'x'\n", "utf8");
+    // Real backend path (FAKE short-circuits before runner construction); the flag is validated while
+    // building the runner, so it fails fast with exit 2 before any backend session starts.
+    // `--agent-timeout=-5` (equals form): a bare `--agent-timeout -5` is rejected earlier by parseArgs.
+    const result = await runCli(["run", wfPath, "--agent-timeout=-5", "--cwd", dir], dir, { fakeAgent: false });
+    assert.equal(result.code, 2, result.stdout);
+    assert.match(result.stderr, /--agent-timeout must be a non-negative number/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI records the run backend and resume refuses a conflicting one", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-backend-"));
+  try {
+    const wfPath = path.join(dir, "cli_demo.js");
+    await writeFile(wfPath, WORKFLOW, "utf8");
+
+    // Run on the default (codex) backend; resolveRunnerConfig records it even under the FAKE agent.
+    const run = await runCli(["run", wfPath, "--args", '{"who":"Ada"}', "--json", "--cwd", dir], dir);
+    assert.equal(run.code, 0, run.stderr);
+    const runId = (JSON.parse(run.stdout) as { runId: string }).runId;
+
+    // The record persisted the backend (CODEX_WORKFLOW_HOME=dir → record at <dir>/runs/<id>.json).
+    const recPath = path.join(dir, "runs", `${runId.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
+    const record = JSON.parse(await readFile(recPath, "utf8")) as { runner?: { backend?: string } };
+    assert.equal(record.runner?.backend, "codex");
+
+    // Resuming with a conflicting backend is refused (exit 2) instead of silently mixing backends.
+    const conflict = await runCli(["resume", runId, "--backend", "gemini", "--cwd", dir], dir);
+    assert.equal(conflict.code, 2, conflict.stdout);
+    assert.match(conflict.stderr, /used backend "codex"/);
+    assert.match(conflict.stderr, /--backend "gemini"/);
+
+    // Resuming without --backend inherits the recorded codex backend and succeeds.
+    const resumed = await runCli(["resume", runId, "--json", "--cwd", dir], dir);
+    assert.equal(resumed.code, 0, resumed.stderr);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI persists --model and resume inherits it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-model-"));
+  try {
+    const wfPath = path.join(dir, "cli_demo.js");
+    await writeFile(wfPath, WORKFLOW, "utf8");
+
+    const run = await runCli(["run", wfPath, "--model", "my-test-model", "--json", "--cwd", dir], dir);
+    assert.equal(run.code, 0, run.stderr);
+    const runId = (JSON.parse(run.stdout) as { runId: string }).runId;
+
+    const recPath = path.join(dir, "runs", `${runId.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
+    const recBefore = JSON.parse(await readFile(recPath, "utf8")) as { runner?: { model?: string } };
+    assert.equal(recBefore.runner?.model, "my-test-model");
+
+    // Resume WITHOUT --model: the recorded model is inherited (and re-persisted into the record).
+    const resumed = await runCli(["resume", runId, "--json", "--cwd", dir], dir);
+    assert.equal(resumed.code, 0, resumed.stderr);
+    const recAfter = JSON.parse(await readFile(recPath, "utf8")) as { runner?: { model?: string } };
+    assert.equal(recAfter.runner?.model, "my-test-model");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("CLI rejects Codex-only flags with the Gemini backend", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-gemini-flags-"));
+  try {
+    const wfPath = path.join(dir, "gemini_demo.js");
+    await writeFile(wfPath, "export const meta = { name: 'x', description: 'x' }\nreturn 'x'\n", "utf8");
+    const result = await runCli(["run", wfPath, "--backend", "gemini", "--approval", "never", "--cwd", dir], dir, {
+      fakeAgent: false,
+    });
+    assert.equal(result.code, 2);
+    assert.match(result.stderr, /--approval is only supported with --backend codex/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

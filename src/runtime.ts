@@ -219,7 +219,8 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
     };
 
     return limiter(async () => {
-      options.onProgress?.(agentProgress(label, assignedPhase, "started", { index, key: cacheKey }));
+      const liveDetail = { index, key: cacheKey, prompt: taskPrompt, options: callOptions };
+      options.onProgress?.(agentProgress(label, assignedPhase, "started", liveDetail));
 
       throwIfUserAborted();
       const cached = await options.journal?.get(call.runId, cacheKey);
@@ -232,6 +233,7 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
             result,
             index,
             key: cacheKey,
+            ...(cached.backend ? { backend: cached.backend } : {}),
             ...(cached.sessionId ? { sessionId: cached.sessionId } : {}),
           }),
         );
@@ -245,9 +247,22 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
         throwIfUserAborted();
 
         let sessionId: string | undefined;
+        let backend: string | undefined;
         let outputTokens: number | undefined;
         const onMeta = (meta: WorkflowAgentMeta) => {
-          if (meta.sessionId) sessionId = meta.sessionId;
+          if (meta.backend) backend = meta.backend;
+          if (meta.sessionId) {
+            sessionId = meta.sessionId;
+          }
+          if (meta.backend || meta.sessionId) {
+            options.onProgress?.(
+              agentProgress(label, assignedPhase, "started", {
+                ...liveDetail,
+                ...(backend ? { backend } : {}),
+                ...(sessionId ? { sessionId } : {}),
+              }),
+            );
+          }
           if (typeof meta.outputTokens === "number") outputTokens = meta.outputTokens;
           if (meta.worktreePreserved && meta.worktreePath) {
             emitLog(`agent ${label} worktree preserved at ${meta.worktreePath} (had changes)`);
@@ -259,10 +274,21 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
           const raw = await runPromise;
           throwIfUserAborted();
           const result = normalizeAgentResult(raw, agentOptions.schema);
-          await options.journal?.put(journalEntryFromCall(call, result, sessionId));
+          await options.journal?.put(
+            journalEntryFromCall(call, result, {
+              ...(sessionId ? { sessionId } : {}),
+              ...(backend ? { backend } : {}),
+            }),
+          );
           state.spent += outputTokens ?? estimateTokens(result);
           options.onProgress?.(
-            agentProgress(label, assignedPhase, "completed", { result, index, key: cacheKey, ...(sessionId ? { sessionId } : {}) }),
+            agentProgress(label, assignedPhase, "completed", {
+              result,
+              index,
+              key: cacheKey,
+              ...(backend ? { backend } : {}),
+              ...(sessionId ? { sessionId } : {}),
+            }),
           );
           return result;
         } catch (error) {
@@ -623,6 +649,10 @@ async function runBunChild(runnerPath: string, options: BunChildOptions): Promis
     armIdleTimer();
 
     child.on("error", (error) => settle(normalizeBunSpawnError(error, options.bunPath)));
+    child.stdin.on("error", (error) => {
+      if (isClosedPipeError(error)) return;
+      settle(error);
+    });
     child.on("exit", (code, signal) => {
       if (settled) return;
       if (code === 0) {
@@ -728,12 +758,20 @@ function sendChildResponse(
     ? { kind: "response", id, error: { message: errorMessage(error) }, spent }
     : { kind: "response", id, value, spent };
   // The child may have already exited (e.g. fire-and-forget agent() left in flight); guard the write.
-  if (!child.stdin.writable) return;
+  if (child.killed || child.exitCode !== null || child.signalCode !== null || child.stdin.destroyed || child.stdin.writableEnded || !child.stdin.writable) return;
   try {
-    child.stdin.write(`${IPC_PREFIX}${JSON.stringify(message)}\n`);
+    child.stdin.write(`${IPC_PREFIX}${JSON.stringify(message)}\n`, (writeError) => {
+      if (writeError && !isClosedPipeError(writeError)) child.emit("error", writeError);
+    });
   } catch {
     // Child gone; nothing to deliver to.
   }
+}
+
+function isClosedPipeError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "EPIPE" || code === "ERR_STREAM_DESTROYED" || code === "ERR_STREAM_WRITE_AFTER_END";
 }
 
 function normalizeAgentOptions(value: unknown): WorkflowAgentOptions {

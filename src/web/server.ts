@@ -4,7 +4,9 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { FileRunStore, type RunRecord } from "../run-store.js";
+import type { WorkflowAgentOptions, WorkflowJournalEntry } from "../types.js";
 import { runEventsPath } from "./event-log.js";
+import { linkGeminiAgent, parseGeminiSessionFile } from "./gemini-session.js";
 import { buildRunView, readJournalEntries } from "./run-aggregator.js";
 import { linkRun } from "./session-linker.js";
 import { parseCodexSessionFile } from "./session-parser.js";
@@ -37,6 +39,7 @@ export interface WebServerOptions {
   cwd?: string;
   version?: string;
   sessionsDir?: string;
+  geminiSessionsDir?: string;
   webDir?: string;
 }
 
@@ -303,13 +306,28 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
     // GET /api/runs/:id/agents/:key[/session]
     if (rest[0] === "agents" && rest[1]) {
       const key = decodeURIComponent(rest[1]);
-      const entry = entries.find((e) => e.key === key);
+      const entry = entries.find((e) => e.key === key) ?? liveAgentEntry(record, buffers.get(runId) ?? [], key);
       if (!entry) {
         sendJson(res, 404, { error: "agent not found" });
         return;
       }
       if (rest[2] === "session") {
-        const links = await linkRun(record, entries, { linksDir, ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}) });
+        if (entry.backend === "gemini") {
+          const link = await linkGeminiAgent(record, entry, { ...(options.geminiSessionsDir ? { sessionsDir: options.geminiSessionsDir } : {}) });
+          if (!link) {
+            sendJson(res, 404, { error: "no linked Gemini session for this agent" });
+            return;
+          }
+          try {
+            const session = await parseGeminiSessionFile(link.sessionPath);
+            sendJson(res, 200, { sessionPath: link.sessionPath, ...session });
+          } catch (error) {
+            sendJson(res, 404, { error: `could not read Gemini session: ${error instanceof Error ? error.message : String(error)}` });
+          }
+          return;
+        }
+        const linkEntries = entries.some((e) => e.key === entry.key) ? entries : [...entries, entry];
+        const links = await linkRun(record, linkEntries, { linksDir, ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}) });
         const link = links[key];
         if (!link) {
           sendJson(res, 404, { error: "no linked Codex session for this agent" });
@@ -394,6 +412,38 @@ function isRunRecord(value: unknown): value is RunRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<RunRecord>;
   return typeof record.runId === "string" && typeof record.name === "string" && typeof record.status === "string";
+}
+
+function liveAgentEntry(record: RunRecord, events: LiveEvent[], key: string): WorkflowJournalEntry | undefined {
+  let merged: Record<string, unknown> | undefined;
+  for (const wrapper of events) {
+    if (wrapper.type !== "progress") continue;
+    const event = wrapper.event;
+    if (!event || typeof event !== "object") continue;
+    const agent = event as Record<string, unknown>;
+    if (agent.type !== "agent" || agent.key !== key) continue;
+    merged = { ...(merged ?? {}), ...agent };
+  }
+  if (!merged) return undefined;
+  const index = typeof merged.index === "number" ? merged.index : 0;
+  return {
+    key,
+    runId: record.runId,
+    prompt: typeof merged.prompt === "string" ? merged.prompt : "",
+    options: liveAgentOptions(merged),
+    result: merged.result,
+    createdAt: (record.startedAt ?? Date.now()) + index,
+    ...(typeof merged.backend === "string" ? { backend: merged.backend } : {}),
+    ...(typeof merged.sessionId === "string" ? { sessionId: merged.sessionId } : {}),
+  };
+}
+
+function liveAgentOptions(event: Record<string, unknown>): WorkflowAgentOptions {
+  const raw = event.options && typeof event.options === "object" ? (event.options as WorkflowAgentOptions) : {};
+  const options: WorkflowAgentOptions = { ...raw };
+  if (typeof event.label === "string" && !options.label) options.label = event.label;
+  if (typeof event.phase === "string" && !options.phase) options.phase = event.phase;
+  return options;
 }
 
 function resolveWebDir(): string {
