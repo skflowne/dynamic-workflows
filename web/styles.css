@@ -159,6 +159,39 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
 .section-label { font-size: 12px; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); font-weight: 600; margin: 28px 0 12px; }
 .section-label .hint { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--faint); }
 
+/* all-agent token usage, grouped by backend/model */
+.token-board {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r);
+  box-shadow: var(--shadow-sm); overflow: hidden;
+}
+.token-board.loading { padding: 14px 16px; color: var(--muted); font-size: 13px; font-style: italic; }
+.token-total-row {
+  display: grid; grid-template-columns: repeat(5, minmax(88px, 1fr)); gap: 0;
+  background: #fbfaf7; border-bottom: 1px solid var(--border);
+}
+.token-total-row .token-metric { padding: 12px 16px; }
+.token-groups { display: grid; }
+.token-group {
+  display: grid; grid-template-columns: minmax(220px, 1.15fr) minmax(360px, 2fr);
+  gap: 16px; align-items: center; padding: 12px 16px; border-top: 1px solid var(--border);
+}
+.token-group:first-child { border-top: none; }
+.token-model { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-width: 0; }
+.token-model strong {
+  font-family: var(--mono); font-size: 13px; font-weight: 650; color: var(--ink);
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.token-backend {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--clay);
+  background: var(--clay-soft); border-radius: 999px; padding: 1px 7px;
+}
+.token-provider, .token-agents { font-size: 11.5px; color: var(--muted); }
+.token-metrics { display: grid; grid-template-columns: repeat(5, minmax(68px, 1fr)); gap: 12px; }
+.token-metric { min-width: 0; }
+.tm-value { font-family: var(--mono); font-weight: 650; font-size: 14px; color: var(--ink); overflow-wrap: anywhere; }
+.tm-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.token-empty { padding: 13px 16px; color: var(--muted); font-size: 13px; }
+
 /* ---------- Pipeline flow graph ---------- */
 .flow { position: relative; }
 .flow-tree { display: grid; gap: 12px; }
@@ -239,6 +272,68 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
   border-radius: var(--r-lg); padding: 20px 24px; box-shadow: var(--shadow-sm); line-height: 1.62;
 }
 .result-text { white-space: pre-wrap; word-break: break-word; color: var(--ink); margin: 2px 0; }
+.result-markdown {
+  color: var(--ink); font-size: 11.5px; line-height: 1.58; overflow-wrap: anywhere; word-break: break-word;
+}
+.result-markdown > :first-child { margin-top: 0; }
+.result-markdown > :last-child { margin-bottom: 0; }
+.result-markdown p { margin: 0 0 9px; }
+.result-markdown h1,
+.result-markdown h2,
+.result-markdown h3,
+.result-markdown h4,
+.result-markdown h5,
+.result-markdown h6 {
+  font-family: var(--sans); font-size: 11.5px; line-height: 1.45; letter-spacing: 0;
+  color: var(--ink); font-weight: 700; margin: 16px 0 7px; padding-bottom: 5px;
+  border-bottom: 1px solid var(--border);
+}
+.result-markdown h3,
+.result-markdown h4,
+.result-markdown h5,
+.result-markdown h6 {
+  color: var(--ink-2); font-weight: 650; padding-bottom: 0; border-bottom: none;
+}
+.result-markdown h1 { margin-top: 0; }
+.result-markdown a { color: var(--blue); text-decoration: none; border-bottom: 1px solid rgba(74, 108, 140, 0.35); }
+.result-markdown a:hover { color: var(--clay); border-bottom-color: rgba(201, 100, 66, 0.45); }
+.result-markdown strong { font-weight: 700; }
+.result-markdown em { font-style: italic; }
+.result-markdown del { color: var(--muted); }
+.result-markdown ul,
+.result-markdown ol { margin: 6px 0 10px; padding-left: 19px; }
+.result-markdown li { margin: 3px 0; }
+.result-markdown li.task-list-item { list-style: none; margin-left: -18px; }
+.result-markdown li.task-list-item input { width: 12px; height: 12px; margin: 0 6px 0 0; vertical-align: -2px; accent-color: var(--clay); }
+.result-markdown blockquote {
+  margin: 9px 0; padding: 0 0 0 12px; color: var(--ink-2);
+  border-left: 3px solid var(--border-strong);
+}
+.result-markdown hr { height: 1px; border: 0; background: var(--border); margin: 14px 0; }
+.result-markdown code {
+  font-family: var(--mono); font-size: 11px; padding: 0.12em 0.35em; border-radius: 5px;
+  background: var(--paper); border: 1px solid var(--border); color: var(--ink);
+}
+.result-markdown pre {
+  margin: 10px 0; padding: 11px 12px; overflow-x: auto; border-radius: var(--r-sm);
+  background: #2c2a26; border: 1px solid #24221f; color: #e9e4d8;
+}
+.result-markdown pre code {
+  display: block; padding: 0; border: 0; border-radius: 0; background: transparent;
+  color: inherit; white-space: pre; font-size: 11px; line-height: 1.55;
+}
+.result-markdown table {
+  display: block; width: 100%; max-width: 100%; margin: 10px 0; border-collapse: collapse;
+  overflow-x: auto; font-size: 11.5px;
+}
+.result-markdown th,
+.result-markdown td {
+  padding: 6px 8px; border: 1px solid var(--border); vertical-align: top; min-width: 72px;
+}
+.result-markdown th { background: var(--paper-2); color: var(--muted); font-weight: 650; }
+.result-markdown tr:nth-child(even) td { background: #fbfaf7; }
+.result-markdown.compact { display: inline-block; max-width: 100%; }
+.result-markdown.compact p { margin-bottom: 4px; }
 .result-field { margin: 14px 0; }
 .result-field:first-child { margin-top: 0; }
 /* nested object/array value → indent so the added level reads clearly */
@@ -377,6 +472,10 @@ button:focus-visible, input:focus-visible, summary:focus-visible {
   .run-view { padding: 22px 16px 56px; }
   .empty-state { padding: 28px; }
   .rv-title { font-size: 25px; }
+  .token-total-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .token-total-row .token-metric { padding: 10px 12px; }
+  .token-group { grid-template-columns: 1fr; gap: 10px; padding: 12px; }
+  .token-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; }
   .flow-branch { grid-template-columns: 1fr; gap: 8px; padding-left: 18px; }
   .branch-axis { padding: 0; }
   .axis-line { left: -12px; }

@@ -16,6 +16,10 @@ const state = {
   liveLogs: [], // log lines seen via SSE (record.logs is only persisted at completion)
   refetchTimer: null,
   backstopTimer: null, // low-frequency poll while a running run is open (self-heals missed live events)
+  tokenSummary: null,
+  tokenTimer: null, // poll all-agent token usage while the selected run is live
+  tokenRefetchTimer: null,
+  tokenFetching: false,
   sessionTimer: null, // poll the open Session tab while the run is live (appends new trace items)
   sessionFetching: false, // guard so a slow session fetch can't overlap the next poll tick
 };
@@ -92,6 +96,9 @@ async function selectRun(runId, push = true) {
   state.phaseExpansionTouched = false;
   state.liveAgents.clear();
   state.liveLogs = [];
+  state.tokenSummary = null;
+  state.tokenFetching = false;
+  stopTokenAutoRefresh();
   closeSidebar();
   renderRunList();
   if (push && location.pathname !== `/runs/${runId}`) history.pushState({ runId }, "", `/runs/${runId}`);
@@ -169,12 +176,14 @@ function renderRunView(data) {
       ${renderRunMeta(record)}
     </div>
 
+    <div id="token-section">${renderTokenSection(state.tokenSummary)}</div>
     ${renderInputSection(record)}
     <div id="flow-section">${renderFlowSection(phases)}</div>
     ${hasResult ? renderResultSection(record) + renderLogs(record) : renderLogs(record) + renderResultSection(record)}
   `;
   requestAnimationFrame(drawTreeBranches);
   setLiveActive(record.status === "running");
+  scheduleTokenRefetch(0);
 }
 
 // The agents / duration / cache-hits run inside `.rv-stats`. Extracted so the live-tick path can
@@ -185,6 +194,56 @@ function renderHeadStats(record, stats, visibleAgentCount) {
     <span class="rv-stat-sep">·</span>
     <span class="rv-stat"><b>${fmtDuration(duration)}</b></span>
     ${stats.cacheHits ? `<span class="rv-stat-sep">·</span><span class="rv-stat"><b>${fmtNum(stats.cacheHits)}</b> cache hits</span>` : ""}`;
+}
+
+function renderTokenSection(summary) {
+  if (summary && summary.agentCount === 0) return "";
+  if (!summary) {
+    return `<div class="section-label">Agent tokens <span class="hint">linking session traces…</span></div>
+      <div class="token-board loading">Waiting for token usage.</div>`;
+  }
+  const linked = `${fmtNum(summary.withUsage)}/${fmtNum(summary.agentCount)}`;
+  const pending = summary.pendingCount ? ` · ${fmtNum(summary.pendingCount)} pending` : "";
+  return `<div class="section-label">Agent tokens <span class="hint">${linked} agents linked${pending}</span></div>
+    <div class="token-board">
+      <div class="token-total-row">
+        ${tokenMetric("total", summary.totals?.totalTokens)}
+        ${tokenMetric("input", summary.totals?.inputTokens)}
+        ${tokenMetric("output", summary.totals?.outputTokens)}
+        ${tokenMetric("reasoning", summary.totals?.reasoningOutputTokens)}
+        ${tokenMetric("cached", summary.totals?.cachedInputTokens)}
+      </div>
+      ${
+        summary.groups?.length
+          ? `<div class="token-groups">${summary.groups.map(renderTokenGroup).join("")}</div>`
+          : `<div class="token-empty">No linked token usage yet.</div>`
+      }
+    </div>`;
+}
+
+function renderTokenGroup(group) {
+  const pending = group.pendingCount ? `<span class="tag">${fmtNum(group.pendingCount)} pending</span>` : "";
+  const provider = group.provider ? `<span class="token-provider">${escapeHtml(group.provider)}</span>` : "";
+  return `<div class="token-group">
+    <div class="token-model">
+      <span class="token-backend">${escapeHtml(group.backend)}</span>
+      <strong>${escapeHtml(group.model)}</strong>
+      ${provider}
+      <span class="token-agents">${fmtNum(group.withUsage)}/${fmtNum(group.agentCount)} agents</span>
+      ${pending}
+    </div>
+    <div class="token-metrics">
+      ${tokenMetric("total", group.usage?.totalTokens)}
+      ${tokenMetric("input", group.usage?.inputTokens)}
+      ${tokenMetric("output", group.usage?.outputTokens)}
+      ${tokenMetric("reasoning", group.usage?.reasoningOutputTokens)}
+      ${tokenMetric("cached", group.usage?.cachedInputTokens)}
+    </div>
+  </div>`;
+}
+
+function tokenMetric(label, value) {
+  return `<div class="token-metric"><div class="tm-value">${fmtNum(value)}</div><div class="tm-label">${escapeHtml(label)}</div></div>`;
 }
 
 function renderRunMeta(record) {
@@ -204,10 +263,49 @@ function setLiveActive(active) {
   // While a run is live, keep a backstop poll running (see pollRunning); stop it once it's terminal.
   if (active) {
     if (!state.backstopTimer) state.backstopTimer = setInterval(pollRunning, 3000);
+    startTokenAutoRefresh();
   } else if (state.backstopTimer) {
     clearInterval(state.backstopTimer);
     state.backstopTimer = null;
+    stopTokenAutoRefresh();
+  } else {
+    stopTokenAutoRefresh();
   }
+}
+
+function startTokenAutoRefresh() {
+  if (!state.tokenTimer) state.tokenTimer = setInterval(() => scheduleTokenRefetch(0), 3000);
+}
+
+function stopTokenAutoRefresh() {
+  if (state.tokenTimer) clearInterval(state.tokenTimer);
+  state.tokenTimer = null;
+  if (state.tokenRefetchTimer) clearTimeout(state.tokenRefetchTimer);
+  state.tokenRefetchTimer = null;
+}
+
+function scheduleTokenRefetch(delay = 700) {
+  if (state.tokenRefetchTimer) clearTimeout(state.tokenRefetchTimer);
+  state.tokenRefetchTimer = setTimeout(refreshTokenSummary, delay);
+}
+
+async function refreshTokenSummary() {
+  state.tokenRefetchTimer = null;
+  const runId = state.selectedRunId;
+  if (!runId || state.tokenFetching) return;
+  state.tokenFetching = true;
+  let summary;
+  try {
+    summary = await fetchJSON(`/api/runs/${encodeURIComponent(runId)}/tokens`);
+  } catch {
+    return;
+  } finally {
+    state.tokenFetching = false;
+  }
+  if (runId !== state.selectedRunId) return;
+  state.tokenSummary = summary;
+  const section = el("token-section");
+  if (section) section.innerHTML = renderTokenSection(summary);
 }
 
 // During a run, record.logs is empty (only persisted at completion) — fall back to the live log
@@ -250,12 +348,12 @@ function renderResultSection(record) {
 // Human-readable rendering of an arbitrary result value (strings as prose, lists as cards/bullets).
 function renderResultValue(v, depth) {
   if (v === null || v === undefined) return `<span class="result-scalar">—</span>`;
-  if (typeof v === "string") return `<div class="result-text">${escapeHtml(v)}</div>`;
+  if (typeof v === "string") return renderResultString(v);
   if (typeof v !== "object") return `<span class="result-scalar">${escapeHtml(String(v))}</span>`;
   if (Array.isArray(v)) {
     if (v.length === 0) return `<span class="result-scalar">—</span>`;
     if (v.every((x) => x === null || typeof x !== "object")) {
-      return `<ul class="result-list">${v.map((x) => `<li>${escapeHtml(String(x))}</li>`).join("")}</ul>`;
+      return `<ul class="result-list">${v.map((x) => `<li>${renderScalarListValue(x)}</li>`).join("")}</ul>`;
     }
     if (canRenderObjectTable(v)) return renderObjectTable(v);
     return `<div class="result-items">${v.map((x) => `<div class="result-subcard">${renderResultValue(x, depth + 1)}</div>`).join("")}</div>`;
@@ -297,6 +395,213 @@ function renderResultValue(v, depth) {
   }
   flush();
   return out;
+}
+
+function renderScalarListValue(v) {
+  if (typeof v === "string" && looksLikeMarkdown(v)) return `<div class="result-markdown compact">${renderMarkdown(v)}</div>`;
+  return escapeHtml(formatScalar(v));
+}
+
+function renderResultString(text) {
+  if (looksLikeMarkdown(text)) return `<div class="result-markdown">${renderMarkdown(text)}</div>`;
+  return `<div class="result-text">${escapeHtml(text)}</div>`;
+}
+
+function looksLikeMarkdown(text) {
+  const s = String(text ?? "");
+  if (!s.trim()) return false;
+  return (
+    /^ {0,3}#{1,6}\s+\S/m.test(s) ||
+    /^ {0,3}```/m.test(s) ||
+    /^ {0,3}>\s+\S/m.test(s) ||
+    /^ {0,3}(?:[-*+]\s+|\d+[.)]\s+)\S/m.test(s) ||
+    /^ {0,3}[-*_](?:\s*[-*_]){2,}\s*$/m.test(s) ||
+    hasMarkdownTable(s) ||
+    /\[[^\]\n]+\]\([^) \n]+(?:\s+"[^"\n]*")?\)/.test(s) ||
+    /(^|[^*])\*\*[^*\n][\s\S]*?\*\*/.test(s) ||
+    /(^|[^_])__[^_\n][\s\S]*?__/.test(s) ||
+    /~~[^~\n][\s\S]*?~~/.test(s) ||
+    /`[^`\n]+`/.test(s) ||
+    /(^|[\s(])https?:\/\/[^\s<]+/i.test(s)
+  );
+}
+
+function hasMarkdownTable(text) {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (splitMarkdownTableLine(lines[i]).length >= 2 && isMarkdownTableSeparator(lines[i + 1])) return true;
+  }
+  return false;
+}
+
+function renderMarkdown(text) {
+  const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+
+    const fence = line.match(/^ {0,3}```\s*([\w.+-]*)\s*$/);
+    if (fence) {
+      const code = [];
+      i++;
+      while (i < lines.length && !/^ {0,3}```\s*$/.test(lines[i])) code.push(lines[i++]);
+      if (i < lines.length) i++;
+      const lang = fence[1] ? ` data-lang="${escapeHtml(fence[1])}"` : "";
+      out.push(`<pre${lang}><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    if (i + 1 < lines.length && splitMarkdownTableLine(line).length >= 2 && isMarkdownTableSeparator(lines[i + 1])) {
+      const table = [line, lines[i + 1]];
+      i += 2;
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|")) table.push(lines[i++]);
+      out.push(renderMarkdownTable(table));
+      continue;
+    }
+
+    const heading = line.match(/^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      const level = heading[1].length;
+      out.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    if (/^ {0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line)) {
+      out.push("<hr>");
+      i++;
+      continue;
+    }
+
+    if (/^ {0,3}>\s?/.test(line)) {
+      const quote = [];
+      while (i < lines.length && /^ {0,3}>\s?/.test(lines[i])) {
+        quote.push(lines[i].replace(/^ {0,3}>\s?/, ""));
+        i++;
+      }
+      out.push(`<blockquote>${renderMarkdown(quote.join("\n"))}</blockquote>`);
+      continue;
+    }
+
+    const list = line.match(/^ {0,3}((?:[-*+])|(?:\d+[.)]))\s+(.+)$/);
+    if (list) {
+      const ordered = /\d/.test(list[1][0]);
+      const items = [];
+      while (i < lines.length) {
+        const item = lines[i].match(/^ {0,3}((?:[-*+])|(?:\d+[.)]))\s+(.+)$/);
+        if (!item || /\d/.test(item[1][0]) !== ordered) break;
+        let body = item[2];
+        i++;
+        while (i < lines.length && lines[i].trim() && !/^ {0,3}(?:[-*+]|\d+[.)])\s+/.test(lines[i]) && !isMarkdownBlockStart(lines[i], lines[i + 1])) {
+          body += `\n${lines[i].replace(/^ {2,4}/, "")}`;
+          i++;
+        }
+        items.push(renderMarkdownListItem(body));
+      }
+      out.push(`<${ordered ? "ol" : "ul"}>${items.join("")}</${ordered ? "ol" : "ul"}>`);
+      continue;
+    }
+
+    const paragraph = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() && !isMarkdownBlockStart(lines[i], lines[i + 1])) {
+      paragraph.push(lines[i++]);
+    }
+    out.push(`<p>${renderInlineMarkdown(paragraph.join("\n")).replace(/\n/g, "<br>")}</p>`);
+  }
+  return out.join("");
+}
+
+function isMarkdownBlockStart(line, nextLine) {
+  return (
+    /^ {0,3}```/.test(line) ||
+    /^ {0,3}#{1,6}\s+\S/.test(line) ||
+    /^ {0,3}>\s?/.test(line) ||
+    /^ {0,3}(?:[-*+]|\d+[.)])\s+\S/.test(line) ||
+    /^ {0,3}[-*_](?:\s*[-*_]){2,}\s*$/.test(line) ||
+    (nextLine !== undefined && splitMarkdownTableLine(line).length >= 2 && isMarkdownTableSeparator(nextLine))
+  );
+}
+
+function renderMarkdownListItem(text) {
+  const task = text.match(/^\[( |x|X)\]\s+([\s\S]*)$/);
+  if (task) {
+    return `<li class="task-list-item"><input type="checkbox" disabled${task[1].toLowerCase() === "x" ? " checked" : ""}>${renderInlineMarkdown(task[2]).replace(/\n/g, "<br>")}</li>`;
+  }
+  return `<li>${renderInlineMarkdown(text).replace(/\n/g, "<br>")}</li>`;
+}
+
+function renderMarkdownTable(lines) {
+  const header = splitMarkdownTableLine(lines[0]);
+  const aligns = splitMarkdownTableLine(lines[1]).map((cell) => {
+    const left = cell.startsWith(":");
+    const right = cell.endsWith(":");
+    return left && right ? "center" : right ? "right" : left ? "left" : "";
+  });
+  const rows = lines.slice(2).map(splitMarkdownTableLine).filter((row) => row.length);
+  const head = header
+    .map((cell, index) => `<th${aligns[index] ? ` style="text-align:${aligns[index]}"` : ""}>${renderInlineMarkdown(cell)}</th>`)
+    .join("");
+  const body = rows
+    .map(
+      (row) =>
+        `<tr>${header
+          .map((_, index) => `<td${aligns[index] ? ` style="text-align:${aligns[index]}"` : ""}>${renderInlineMarkdown(row[index] ?? "")}</td>`)
+          .join("")}</tr>`,
+    )
+    .join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function splitMarkdownTableLine(line) {
+  const trimmed = String(line ?? "").trim();
+  if (!trimmed.includes("|")) return [];
+  return trimmed.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function isMarkdownTableSeparator(line) {
+  const cells = splitMarkdownTableLine(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function renderInlineMarkdown(text) {
+  const tokens = [];
+  const token = (html) => {
+    tokens.push(html);
+    return `\uE000${tokens.length - 1}\uE001`;
+  };
+  let raw = String(text ?? "");
+  raw = raw.replace(/`([^`\n]+)`/g, (_m, code) => token(`<code>${escapeHtml(code)}</code>`));
+  raw = raw.replace(/\[([^\]\n]+)\]\(([^) \n]+)(?:\s+"[^"\n]*")?\)/g, (match, label, href) => {
+    const safe = safeMarkdownHref(href);
+    return safe ? token(`<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${renderInlineMarkdown(label)}</a>`) : match;
+  });
+  raw = raw.replace(/(^|[\s(])(https?:\/\/[^\s<)]+[^\s<).,;:!?])/gi, (_match, prefix, href) =>
+    `${prefix}${token(`<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(href)}</a>`)}`,
+  );
+
+  let html = escapeHtml(raw);
+  html = html.replace(/~~(.+?)~~/g, "<del>$1</del>");
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/__(.+?)__/g, "<strong>$1</strong>");
+  html = html.replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  html = html.replace(/\uE000(\d+)\uE001/g, (_m, index) => tokens[Number(index)] ?? "");
+  return html;
+}
+
+function safeMarkdownHref(href) {
+  const value = String(href ?? "").trim();
+  if (!value || /[\u0000-\u001f\u007f]/.test(value)) return "";
+  if (value.startsWith("//")) return "";
+  const lower = value.toLowerCase();
+  if (/^(https?:|mailto:)/.test(lower) || value.startsWith("#") || (/^\//.test(value) && !value.startsWith("//")) || /^\.\.?\//.test(value)) return value;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) return "";
+  return value;
 }
 
 // A value is "compact" (grid-tileable) when it's a short scalar — number, boolean, or a brief
@@ -488,9 +793,15 @@ function togglePhase(title) {
 }
 
 function drawTreeBranches() {
-  for (const branch of document.querySelectorAll(".flow-branch.expanded")) {
-    drawTreeBranch(branch);
+  for (const branch of document.querySelectorAll(".flow-branch")) {
+    if (branch.classList.contains("expanded")) drawTreeBranch(branch);
+    else clearTreeBranch(branch);
   }
+}
+
+function clearTreeBranch(branch) {
+  const svg = branch.querySelector(".tree-svg");
+  if (svg) svg.innerHTML = "";
 }
 
 function drawTreeBranch(branch) {
@@ -572,6 +883,7 @@ function patchBranch(branch, phase, index, total) {
   if (!panel) return;
   panel.hidden = !expanded;
   if (expanded) patchFan(panel, phase);
+  else clearTreeBranch(branch);
 }
 
 function patchPhaseNode(node, phase, expanded) {
@@ -733,6 +1045,7 @@ async function openDrawer(key) {
 
 function renderResult(result) {
   if (result === undefined) return `<div class="muted-note">No result yet.</div>`;
+  if (typeof result === "string" && looksLikeMarkdown(result)) return `<div class="drawer-result-markdown">${renderResultString(result)}</div>`;
   if (typeof result === "string") return `<div class="codeblock">${escapeHtml(result)}</div>`;
   return `<div class="json-block">${highlightJson(result)}</div>`;
 }
@@ -978,6 +1291,7 @@ function applyProgress(event) {
   // Track in-flight agents so a "running" placeholder node shows immediately.
   if (event.type === "agent" && event.key) {
     rememberLiveAgent(event);
+    scheduleTokenRefetch();
   }
   // Debounced refetch re-renders the flow (merged journal + live) and pulls fresh stats/result.
   scheduleRefetch();

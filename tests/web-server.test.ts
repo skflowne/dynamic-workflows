@@ -107,6 +107,107 @@ test("web server exposes runs, run view, agent detail, and the linked Codex sess
   }
 });
 
+test("web server aggregates agent token usage grouped by actual session model", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-web-tokens-"));
+  const sessionsDir = await mkdtemp(path.join(tmpdir(), "cw-web-token-sessions-"));
+  const server = createWebServer({ cwd, version: "9.9.9", sessionsDir });
+  try {
+    const runId = "wf_tokens";
+    const record: RunRecord = {
+      runId,
+      name: "token demo",
+      status: "completed",
+      source: "named",
+      startedAt: START,
+      completedAt: START + 30000,
+      durationMs: 30000,
+      agentCount: 3,
+      cacheHits: 0,
+      phases: ["Verify"],
+    };
+    await mkdir(path.join(cwd, ".codex-workflow", "runs"), { recursive: true });
+    await writeFile(path.join(cwd, ".codex-workflow", "runs", `${runId}.json`), JSON.stringify(record), "utf8");
+
+    const entries: WorkflowJournalEntry[] = [
+      {
+        key: "agent-a",
+        runId,
+        prompt: "prompt a",
+        options: { label: "a", phase: "Verify", model: "workflow-hardcoded" },
+        result: "a",
+        createdAt: START + 1000,
+        sessionId: "sess-a",
+      },
+      {
+        key: "agent-b",
+        runId,
+        prompt: "prompt b",
+        options: { label: "b", phase: "Verify", model: "gpt-5.4" },
+        result: "b",
+        createdAt: START + 2000,
+        sessionId: "sess-b",
+      },
+      {
+        key: "agent-c",
+        runId,
+        prompt: "prompt c",
+        options: { label: "c", phase: "Verify", model: "gpt-5.4" },
+        result: "c",
+        createdAt: START + 3000,
+      },
+    ];
+    const journalDir = path.join(cwd, ".codex-workflow", "journal", runId);
+    await mkdir(journalDir, { recursive: true });
+    for (const entry of entries) {
+      await writeFile(path.join(journalDir, `${entry.key}.json`), JSON.stringify(entry), "utf8");
+    }
+
+    const sdir = dayDir(sessionsDir, START + 1000);
+    await mkdir(sdir, { recursive: true });
+    const rollout = (sessionId: string, model: string, input: number, output: number, reasoning: number, total: number) =>
+      [
+        { type: "session_meta", payload: { id: sessionId, originator: "codex_sdk_ts", cwd, model_provider: "openai" } },
+        { type: "turn_context", payload: { model } },
+        {
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: { total_token_usage: { input_tokens: input, output_tokens: output, reasoning_output_tokens: reasoning, total_tokens: total } },
+          },
+        },
+      ]
+        .map((line) => JSON.stringify(line))
+        .join("\n");
+    await writeFile(path.join(sdir, "rollout-sess-a.jsonl"), rollout("sess-a", "gpt-5.5", 100, 20, 5, 125), "utf8");
+    await writeFile(path.join(sdir, "rollout-sess-b.jsonl"), rollout("sess-b", "gpt-5.4", 50, 10, 2, 62), "utf8");
+
+    const bound = await server.listen(0);
+    const tokens = await get(`${bound.url}/api/runs/${runId}/tokens`);
+
+    assert.equal(tokens.status, 200);
+    assert.equal(tokens.json.agentCount, 3);
+    assert.equal(tokens.json.withUsage, 2);
+    assert.equal(tokens.json.pendingCount, 1);
+    assert.equal(tokens.json.totals.inputTokens, 150);
+    assert.equal(tokens.json.totals.outputTokens, 30);
+    assert.equal(tokens.json.totals.reasoningOutputTokens, 7);
+    assert.equal(tokens.json.totals.totalTokens, 187);
+
+    const byModel = new Map<string, any>(tokens.json.groups.map((group: any) => [`${group.backend}:${group.model}`, group]));
+    const gpt55 = byModel.get("codex:gpt-5.5");
+    const gpt54 = byModel.get("codex:gpt-5.4");
+    assert.equal(gpt55.usage.totalTokens, 125);
+    assert.equal(gpt55.provider, "openai");
+    assert.equal(gpt54.usage.totalTokens, 62);
+    assert.equal(gpt54.agentCount, 2);
+    assert.equal(gpt54.pendingCount, 1);
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+    await rm(sessionsDir, { recursive: true, force: true });
+  }
+});
+
 test("broadcast pushes live progress events to SSE subscribers (in-process path)", async () => {
   const cwd = await mkdtemp(path.join(tmpdir(), "cw-web-sse-"));
   const server = createWebServer({ cwd, version: "9.9.9" });

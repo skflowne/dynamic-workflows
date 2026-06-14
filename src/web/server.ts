@@ -11,7 +11,7 @@ import { linkGeminiAgent, parseGeminiSessionFile } from "./gemini-session.js";
 import { linkPiAgent, parsePiSessionFile } from "./pi-session.js";
 import { buildRunView, readJournalEntries } from "./run-aggregator.js";
 import { linkRun } from "./session-linker.js";
-import { parseCodexSessionFile } from "./session-parser.js";
+import { parseCodexSessionFile, type CodexSessionMeta, type CodexSessionUsage, type ParsedCodexSession } from "./session-parser.js";
 
 /**
  * Zero-dependency HTTP server for the workflow viewer. Serves the static SPA from `web/`, a JSON API
@@ -52,6 +52,33 @@ export interface LiveEvent {
 }
 
 const MAX_BUFFER = 2000;
+
+interface AgentTokenGroup {
+  backend: string;
+  model: string;
+  provider?: string;
+  agentCount: number;
+  withUsage: number;
+  pendingCount: number;
+  usage: CodexSessionUsage;
+}
+
+interface RunTokenSummary {
+  runId: string;
+  generatedAt: number;
+  agentCount: number;
+  withUsage: number;
+  pendingCount: number;
+  totals: CodexSessionUsage;
+  groups: AgentTokenGroup[];
+}
+
+interface AgentTokenSample {
+  backend: string;
+  model: string;
+  provider?: string;
+  usage?: CodexSessionUsage;
+}
 
 export interface WorkflowWebServer {
   server: http.Server;
@@ -308,6 +335,11 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       sendJson(res, 200, buffers.get(runId) ?? []);
       return;
     }
+    // GET /api/runs/:id/tokens
+    if (rest.length === 1 && rest[0] === "tokens") {
+      sendJson(res, 200, await buildRunTokenSummary(record, entries, buffers.get(runId) ?? []));
+      return;
+    }
     // GET /api/runs/:id/agents/:key[/session]
     if (rest[0] === "agents" && rest[1]) {
       const key = decodeURIComponent(rest[1]);
@@ -364,6 +396,113 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       return;
     }
     sendJson(res, 404, { error: "not found" });
+  }
+
+  async function buildRunTokenSummary(record: RunRecord, journalEntries: WorkflowJournalEntry[], events: LiveEvent[]): Promise<RunTokenSummary> {
+    const entries = mergeJournalAndLiveEntries(record, journalEntries, events);
+    const codexEntries = entries.filter((entry) => agentBackend(record, entry) === "codex");
+    const codexLinks =
+      codexEntries.length > 0
+        ? await linkRun(record, codexEntries, { linksDir, ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}) })
+        : {};
+
+    const samples = await Promise.all(entries.map((entry) => tokenSampleForAgent(record, entry, codexLinks)));
+    const groups = new Map<string, AgentTokenGroup>();
+    const totals: CodexSessionUsage = {};
+    let withUsage = 0;
+
+    for (const sample of samples) {
+      const key = `${sample.backend}\u0000${sample.model}`;
+      let group = groups.get(key);
+      if (!group) {
+        group = {
+          backend: sample.backend,
+          model: sample.model,
+          ...(sample.provider ? { provider: sample.provider } : {}),
+          agentCount: 0,
+          withUsage: 0,
+          pendingCount: 0,
+          usage: {},
+        };
+        groups.set(key, group);
+      } else if (!group.provider && sample.provider) {
+        group.provider = sample.provider;
+      }
+      group.agentCount++;
+      if (sample.usage && hasTokenUsage(sample.usage)) {
+        withUsage++;
+        group.withUsage++;
+        addUsage(group.usage, sample.usage);
+        addUsage(totals, sample.usage);
+      } else {
+        group.pendingCount++;
+      }
+    }
+
+    const knownPending = samples.length - withUsage;
+    const agentCount = Math.max(record.agentCount ?? 0, samples.length, (record.failures ?? []).length);
+    return {
+      runId: record.runId,
+      generatedAt: Date.now(),
+      agentCount,
+      withUsage,
+      pendingCount: Math.max(knownPending, agentCount - withUsage),
+      totals,
+      groups: [...groups.values()].sort(compareTokenGroups),
+    };
+  }
+
+  function mergeJournalAndLiveEntries(record: RunRecord, journalEntries: WorkflowJournalEntry[], events: LiveEvent[]): WorkflowJournalEntry[] {
+    const entries = [...journalEntries];
+    const seen = new Set(entries.map((entry) => entry.key));
+    const liveKeys = new Set<string>();
+    for (const wrapper of events) {
+      if (wrapper.type !== "progress") continue;
+      const event = wrapper.event;
+      if (!event || typeof event !== "object") continue;
+      const key = (event as Record<string, unknown>).key;
+      if (typeof key === "string") liveKeys.add(key);
+    }
+    for (const key of liveKeys) {
+      if (seen.has(key)) continue;
+      const entry = liveAgentEntry(record, events, key);
+      if (!entry) continue;
+      entries.push(entry);
+      seen.add(key);
+    }
+    return entries;
+  }
+
+  async function tokenSampleForAgent(
+    record: RunRecord,
+    entry: WorkflowJournalEntry,
+    codexLinks: Record<string, { sessionPath: string; sessionId?: string }>,
+  ): Promise<AgentTokenSample> {
+    const backend = agentBackend(record, entry);
+    try {
+      const session = await parseLinkedSession(record, entry, backend, codexLinks);
+      return tokenSampleFromSession(record, entry, backend, session);
+    } catch {
+      return tokenSampleFromSession(record, entry, backend, undefined);
+    }
+  }
+
+  async function parseLinkedSession(
+    record: RunRecord,
+    entry: WorkflowJournalEntry,
+    backend: string,
+    codexLinks: Record<string, { sessionPath: string; sessionId?: string }>,
+  ): Promise<ParsedCodexSession | undefined> {
+    if (backend === "gemini") {
+      const link = await linkGeminiAgent(record, entry, { ...(options.geminiSessionsDir ? { sessionsDir: options.geminiSessionsDir } : {}) });
+      return link ? parseGeminiSessionFile(link.sessionPath) : undefined;
+    }
+    if (backend === "pi") {
+      const link = await linkPiAgent(record, entry, { sessionsDir: piSessionsDir });
+      return link ? parsePiSessionFile(link.sessionPath) : undefined;
+    }
+    const link = codexLinks[entry.key];
+    return link ? parseCodexSessionFile(link.sessionPath) : undefined;
   }
 
   function openStream(res: http.ServerResponse): void {
@@ -464,6 +603,52 @@ function liveAgentOptions(event: Record<string, unknown>): WorkflowAgentOptions 
   if (typeof event.phase === "string" && !options.phase) options.phase = event.phase;
   return options;
 }
+
+function tokenSampleFromSession(
+  record: RunRecord,
+  entry: WorkflowJournalEntry,
+  backend: string,
+  session: ParsedCodexSession | undefined,
+): AgentTokenSample {
+  const meta = session?.meta ?? {};
+  const provider = meta.modelProvider && meta.modelProvider !== backend ? meta.modelProvider : undefined;
+  return {
+    backend,
+    model: modelForAgent(record, entry, meta),
+    ...(provider ? { provider } : {}),
+    ...(session?.usage ? { usage: session.usage } : {}),
+  };
+}
+
+function agentBackend(record: RunRecord, entry: WorkflowJournalEntry): string {
+  return entry.backend ?? record.runner?.backend ?? "codex";
+}
+
+function modelForAgent(record: RunRecord, entry: WorkflowJournalEntry, meta: CodexSessionMeta): string {
+  return meta.model ?? entry.options.model ?? record.runner?.model ?? "default";
+}
+
+function hasTokenUsage(usage: CodexSessionUsage): boolean {
+  return TOKEN_USAGE_KEYS.some((key) => typeof usage[key] === "number");
+}
+
+function addUsage(target: CodexSessionUsage, source: CodexSessionUsage): void {
+  for (const key of TOKEN_USAGE_KEYS) {
+    const value = source[key];
+    if (typeof value === "number") target[key] = (target[key] ?? 0) + value;
+  }
+  if (typeof source.contextWindow === "number") target.contextWindow = Math.max(target.contextWindow ?? 0, source.contextWindow);
+}
+
+function compareTokenGroups(a: AgentTokenGroup, b: AgentTokenGroup): number {
+  const usageDelta = (b.usage.totalTokens ?? 0) - (a.usage.totalTokens ?? 0);
+  if (usageDelta !== 0) return usageDelta;
+  const backendDelta = a.backend.localeCompare(b.backend);
+  if (backendDelta !== 0) return backendDelta;
+  return a.model.localeCompare(b.model);
+}
+
+const TOKEN_USAGE_KEYS = ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"] as const;
 
 function resolveWebDir(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
