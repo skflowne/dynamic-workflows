@@ -14,7 +14,7 @@ import { linkRun } from "./session-linker.js";
 import { parseCodexSessionFile, type CodexSessionMeta, type CodexSessionUsage, type ParsedCodexSession } from "./session-parser.js";
 
 /**
- * Zero-dependency HTTP server for the workflow viewer. Serves the static SPA from `web/`, a JSON API
+ * Zero-dependency HTTP server for the workflow viewer. Serves the built static SPA from `web/`, a JSON API
  * over the run-store + journal + linked Codex sessions, and a global SSE stream for liveness.
  *
  * Liveness flows through a single transport: a run's events are appended to `runs/<id>.events.jsonl`
@@ -652,7 +652,7 @@ const TOKEN_USAGE_KEYS = ["inputTokens", "cachedInputTokens", "outputTokens", "r
 
 function resolveWebDir(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  // dist/web/server.js -> ../../web ; src/web/server.ts (tsx) -> ../../web ; both = <project>/web
+  // dist/web/server.js -> ../../web ; src/web/server.ts (tsx) -> ../../web ; both = <project>/web.
   return path.resolve(here, "..", "..", "web");
 }
 
@@ -661,6 +661,7 @@ const MIME: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
 };

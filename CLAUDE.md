@@ -16,10 +16,10 @@ CLI is the primary deliverable; the library underneath is reused by it.
 ## Commands
 
 ```bash
-npm run build          # tsc -> dist/ (emits dist/index.js AND dist/cli.js — the bin)
+npm run build          # Vite React viewer -> web/ + tsc -> dist/ (emits dist/index.js AND dist/cli.js — the bin)
 npm test               # build + full unit suite (ScriptedAgentRunner, no tokens)
 npm run test:unit      # unit suite only (requires a prior build for tests that spawn dist/cli.js)
-npm run typecheck      # tsc over src + tests via tsconfig.test.json (no emit)
+npm run typecheck      # tsc over src/tests + strict web-src React TS (no emit)
 npm run test:deepresearch   # runs the real Claude deep-research gist against a stubbed runner
 
 # Run a single test file:
@@ -164,7 +164,9 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   silently mix results). Historical records without `runner` are treated as the codex backend. pi-only
   flags (`--provider`/`--base-url`/`--api-key`/`--pi-api`/`--thinking`/`--tools`/`--exclude-tools`/
   `--no-tools`) error on codex/gemini; codex-only flags (`--sandbox`/`--approval`/`--reasoning`) error on pi.
-- `src/web/` + `web/` — **local web viewer** (zero-dep Node `http`, vanilla SPA, claude.ai-styled).
+- `src/web/` + `web-src/` + `web/` — **local web viewer** (zero-dep Node `http` server,
+  bundled React/TypeScript SPA, claude.ai-styled). `web-src/` is the strict TS frontend source;
+  `npm run build:web` runs `tsc -p tsconfig.web.json` and Vite, emitting static assets into `web/`.
   `server.ts` serves a JSON API (`/api/runs`, `/api/runs/:id` → run-aggregator view, `…/agents/:key`
   → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`),
   and exposes an in-process `broadcast(event)` for liveness. `run-aggregator.ts` groups journal entries
@@ -181,9 +183,9 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   **The viewer runs in-process: `run` (unless `--json`/`--no-web`) binds its own server on a random
   port, pushes `onProgress` events via `broadcast()`, and (when stdout is a TTY) keeps it live after
   the run until Ctrl-C; non-interactive runs close it immediately. `serve` is the standalone
-  browse-history viewer (foreground; no daemon/`web.json`).** Static `web/` assets are NOT compiled by
-  tsc; the server resolves them at `<moduleDir>/../../web` (project-root `web/` under both `dist/` and
-  `tsx`). **Session linkage requires `originator: "codex_sdk_ts"`** rollouts (set by the SDK runner).
+  browse-history viewer (foreground; no daemon/`web.json`).** The server resolves built `web/` assets
+  at `<moduleDir>/../../web` (project-root `web/` under both `dist/` and `tsx`). **Session linkage
+  requires `originator: "codex_sdk_ts"`** rollouts (set by the SDK runner).
 
 ## Critical invariants / non-obvious gotchas
 

@@ -42,7 +42,7 @@ Ollama, LiteLLM, …) via `--base-url`.
 
 ```bash
 npm install
-npm run build      # emits dist/, including the dist/cli.js bin
+npm run build      # builds the React viewer into web/ and emits dist/, including dist/cli.js
 npm link           # optional: exposes `codex-workflow` on your PATH
 ```
 
@@ -156,7 +156,7 @@ Sample scripts you run by **path** (`codex-workflow run examples/<file>`).
 
 ## Viewer
 
-A local web viewer (zero runtime dependencies — Node's `http` + a vanilla SPA) visualizes runs:
+A local web viewer (zero server-side runtime dependencies: Node's `http` serves a bundled React/TypeScript SPA) visualizes runs:
 
 - **Pipeline flow graph** — phases wired together; click one to expand a fan of its agent nodes.
 - **Per-step progress** — agents appear as "running" placeholders the moment they start (phase badges
