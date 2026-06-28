@@ -15,28 +15,15 @@ import {
 
 const OPTIONS = {
   args: { type: "string" },
-  backend: { type: "string" },
-  model: { type: "string" },
+  config: { type: "string" },
+  provider: { type: "string" },
   concurrency: { type: "string" },
   budget: { type: "string" },
   "max-agents": { type: "string" },
   "agent-retries": { type: "string" },
   "agent-timeout": { type: "string" },
   cwd: { type: "string" },
-  sandbox: { type: "string" },
-  approval: { type: "string" },
-  reasoning: { type: "string" },
   bun: { type: "string" },
-  "gemini-command": { type: "string" },
-  "pi-command": { type: "string" },
-  provider: { type: "string" },
-  "base-url": { type: "string" },
-  "api-key": { type: "string" },
-  "pi-api": { type: "string" },
-  thinking: { type: "string" },
-  tools: { type: "string" },
-  "exclude-tools": { type: "string" },
-  "no-tools": { type: "boolean" },
   "idle-timeout": { type: "string" },
   json: { type: "boolean" },
   quiet: { type: "boolean" },
@@ -59,32 +46,19 @@ Usage:
   codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
   codex-workflow runs [--json]               List recorded run history
   codex-workflow show <runId> [--json]       Show a recorded run
-  codex-workflow doctor                      Check Bun, selected agent backend, and the viewer
+  codex-workflow doctor                      Check Bun, agent backends, the provider config, and the viewer
 
 Run options:
   --args <json|@file.json>   Arguments passed to the workflow as \`args\`
-  --backend <name>           Agent backend: codex | gemini | pi (default: codex)
-  --model <model>            Model for every agent() call (backend-specific)
+  --config <path>            Provider config file (TS/JS); auto-discovers codex-workflow.config.* in cwd / data dir
+  --provider <name>          Run-level default provider from the config (per-agent: agent({provider}))
   --concurrency <n>          Max concurrent agents (capped at 16)
   --budget <tokens>          Token budget (estimate) shared across the run
   --max-agents <n>           Hard cap on total agent() calls (default 1000)
   --agent-retries <n>        Retries per agent on transient failure (default 2; agent() returns null when exhausted)
   --agent-timeout <ms>       Per-agent total-duration timeout in ms (0 disables; default 900000)
   --cwd <dir>                Working directory for agents (default: cwd)
-  --sandbox <mode>           Codex only: read-only | workspace-write | danger-full-access
-  --approval <policy>        Codex only: never | on-request | on-failure | untrusted
-  --reasoning <effort>       Codex only: minimal | low | medium | high | xhigh
   --bun <path>               Path to the Bun binary
-  --gemini-command <path>    Gemini CLI executable for --backend gemini
-  --pi-command <path>        pi CLI executable for --backend pi
-  --provider <name>          pi only: backend provider (e.g. openai, anthropic, deepseek)
-  --base-url <url>           pi only: custom OpenAI/Anthropic-compatible endpoint
-  --api-key <key>            pi only: API key (or set the provider's env var, e.g. OPENAI_API_KEY)
-  --pi-api <shape>           pi only: openai-completions (default) | openai-responses | anthropic-messages | google-generative-ai
-  --thinking <level>         pi only: off | minimal | low | medium | high | xhigh
-  --tools <list>             pi only: comma-separated tool allowlist (default: all built-in tools)
-  --exclude-tools <list>     pi only: comma-separated tool denylist
-  --no-tools                 pi only: disable all tools (a pure text turn)
   --idle-timeout <ms>         Bun child idle watchdog in ms (0 disables; default 300000)
   --json                     Emit machine-readable JSON (suppresses progress & viewer)
   --quiet                    Suppress progress output
@@ -103,7 +77,9 @@ Viewer:
   -v, --version              Show version
 
 Workflows are open TS/JS executed under Bun; each agent() spawns an independent backend session.
-For the Codex backend, web search + network access are always enabled for agents.
+Every run needs a provider config (codex-workflow.config.ts) that names the backends/models; it is
+auto-discovered in the project dir or the data dir, or passed with --config. Route a call with
+agent({provider:"name"}) or agent({model:"id"}), or set a run default with --provider / config.default.
 Pass run a path to a workflow file (e.g. examples/deep-research.js).
 Bare names resolve from .claude/workflows and ~/.claude/workflows.
 resume restores the workflow's script path / name and args from the run record

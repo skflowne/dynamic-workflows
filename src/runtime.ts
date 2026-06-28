@@ -13,9 +13,11 @@ import type {
   WorkflowMeta,
   WorkflowAgentMeta,
   WorkflowAgentOptions,
+  WorkflowAgentRunner,
   WorkflowRef,
   WorkflowRunOptions,
   WorkflowRunResult,
+  WorkflowRunnerResolver,
 } from "./types.js";
 
 const MAX_ITEMS_PER_CALL = 4096;
@@ -154,6 +156,11 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
   const internalAbort = new AbortController();
   const agentSignal = options.signal ? anySignal([internalAbort.signal, options.signal]) : internalAbort.signal;
   const inFlight = new Set<Promise<unknown>>();
+  // A single runner is just a resolver that ignores the options; a function is used as-is for routing.
+  const resolveRunner: WorkflowRunnerResolver =
+    typeof options.runner === "function"
+      ? (options.runner as WorkflowRunnerResolver)
+      : () => options.runner as WorkflowAgentRunner;
 
   const emitLog = (message: unknown) => {
     const text = String(message);
@@ -240,6 +247,11 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
         return result;
       }
 
+      // Pick the runner for this call (provider/model routing). Thrown here — after the cache check,
+      // before the retry loop — so an unknown provider / ambiguous model hard-fails like cap/budget,
+      // rather than being retried into a `null` failure. Cached agents never reach this.
+      const runner = resolveRunner(callOptions);
+
       const maxAttempts = ctx.agentMaxAttempts;
       let lastMessage = "";
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -268,7 +280,7 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
             emitLog(`agent ${label} worktree preserved at ${meta.worktreePath} (had changes)`);
           }
         };
-        const runPromise = Promise.resolve(options.runner.run(call, ctx.agentSignal, onMeta));
+        const runPromise = Promise.resolve(runner.run(call, ctx.agentSignal, onMeta));
         inFlight.add(runPromise);
         try {
           const raw = await runPromise;
@@ -782,6 +794,7 @@ function normalizeAgentOptions(value: unknown): WorkflowAgentOptions {
   setOptionalString(normalized, "label", options.label, "agent label");
   setOptionalString(normalized, "phase", options.phase, "agent phase");
   setOptionalString(normalized, "model", options.model, "agent model");
+  setOptionalString(normalized, "provider", options.provider, "agent provider");
   setOptionalString(normalized, "isolation", options.isolation, "agent isolation");
   setOptionalString(normalized, "agentType", options.agentType, "agent type");
   return normalized;

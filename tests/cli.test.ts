@@ -170,11 +170,18 @@ console.log(JSON.stringify({
     );
     await chmod(fakeGemini, 0o755);
 
-    const run = await runCli(
-      ["run", wfPath, "--backend", "gemini", "--model", "test-gemini", "--gemini-command", fakeGemini, "--json", "--cwd", dir],
-      dir,
-      { fakeAgent: false },
+    const cfgPath = path.join(dir, "codex-workflow.config.ts");
+    await writeFile(
+      cfgPath,
+      `export default {
+  providers: { g: { backend: 'gemini', model: 'test-gemini', geminiCommand: ${JSON.stringify(fakeGemini)} } },
+  default: 'g',
+}
+`,
+      "utf8",
     );
+
+    const run = await runCli(["run", wfPath, "--config", cfgPath, "--json", "--cwd", dir], dir, { fakeAgent: false });
     assert.equal(run.code, 0, run.stderr);
     const output = JSON.parse(run.stdout) as { status: string; result: string; stats: { agentCount: number } };
     assert.equal(output.status, "completed");
@@ -190,9 +197,8 @@ test("CLI rejects a negative --agent-timeout", async () => {
   try {
     const wfPath = path.join(dir, "wf.js");
     await writeFile(wfPath, "export const meta = { name: 'x', description: 'x' }\nreturn 'x'\n", "utf8");
-    // Real backend path (FAKE short-circuits before runner construction); the flag is validated while
-    // building the runner, so it fails fast with exit 2 before any backend session starts.
-    // `--agent-timeout=-5` (equals form): a bare `--agent-timeout -5` is rejected earlier by parseArgs.
+    // --agent-timeout is validated up front in executeRun (before the provider config is even loaded),
+    // so a negative value fails fast with exit 2. `=-5` form: a bare `--agent-timeout -5` is rejected by parseArgs.
     const result = await runCli(["run", wfPath, "--agent-timeout=-5", "--cwd", dir], dir, { fakeAgent: false });
     assert.equal(result.code, 2, result.stdout);
     assert.match(result.stderr, /--agent-timeout must be a non-negative number/);
@@ -201,115 +207,67 @@ test("CLI rejects a negative --agent-timeout", async () => {
   }
 });
 
-test("CLI records the run backend and resume refuses a conflicting one", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-backend-"));
+test("CLI loads a provider config, records it, and resume reloads it", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-config-"));
   try {
-    const wfPath = path.join(dir, "cli_demo.js");
-    await writeFile(wfPath, WORKFLOW, "utf8");
-
-    // Run on the default (codex) backend; resolveRunnerConfig records it even under the FAKE agent.
-    const run = await runCli(["run", wfPath, "--args", '{"who":"Ada"}', "--json", "--cwd", dir], dir);
-    assert.equal(run.code, 0, run.stderr);
-    const runId = (JSON.parse(run.stdout) as { runId: string }).runId;
-
-    // The record persisted the backend (CODEX_WORKFLOW_HOME=dir → record at <dir>/runs/<id>.json).
-    const recPath = path.join(dir, "runs", `${runId.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
-    const record = JSON.parse(await readFile(recPath, "utf8")) as { runner?: { backend?: string } };
-    assert.equal(record.runner?.backend, "codex");
-
-    // Resuming with a conflicting backend is refused (exit 2) instead of silently mixing backends.
-    const conflict = await runCli(["resume", runId, "--backend", "gemini", "--cwd", dir], dir);
-    assert.equal(conflict.code, 2, conflict.stdout);
-    assert.match(conflict.stderr, /used backend "codex"/);
-    assert.match(conflict.stderr, /--backend "gemini"/);
-
-    // Resuming without --backend inherits the recorded codex backend and succeeds.
-    const resumed = await runCli(["resume", runId, "--json", "--cwd", dir], dir);
-    assert.equal(resumed.code, 0, resumed.stderr);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("CLI persists --model and resume inherits it", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-model-"));
-  try {
-    const wfPath = path.join(dir, "cli_demo.js");
-    await writeFile(wfPath, WORKFLOW, "utf8");
-
-    const run = await runCli(["run", wfPath, "--model", "my-test-model", "--json", "--cwd", dir], dir);
-    assert.equal(run.code, 0, run.stderr);
-    const runId = (JSON.parse(run.stdout) as { runId: string }).runId;
-
-    const recPath = path.join(dir, "runs", `${runId.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
-    const recBefore = JSON.parse(await readFile(recPath, "utf8")) as { runner?: { model?: string } };
-    assert.equal(recBefore.runner?.model, "my-test-model");
-
-    // Resume WITHOUT --model: the recorded model is inherited (and re-persisted into the record).
-    const resumed = await runCli(["resume", runId, "--json", "--cwd", dir], dir);
-    assert.equal(resumed.code, 0, resumed.stderr);
-    const recAfter = JSON.parse(await readFile(recPath, "utf8")) as { runner?: { model?: string } };
-    assert.equal(recAfter.runner?.model, "my-test-model");
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
-});
-
-test("CLI persists the pi runner config (base-url/pi-api/tools) and resume inherits it", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-pi-"));
-  try {
-    const wfPath = path.join(dir, "cli_demo.js");
-    await writeFile(wfPath, WORKFLOW, "utf8");
-
-    const run = await runCli(
-      [
-        "run", wfPath,
-        "--backend", "pi",
-        "--base-url", "https://api.example.com",
-        "--model", "my-model",
-        "--pi-api", "anthropic-messages",
-        "--tools", "read,grep",
-        "--thinking", "low",
-        "--json", "--cwd", dir,
-      ],
-      dir,
+    const cfgPath = path.join(dir, "codex-workflow.config.ts");
+    await writeFile(
+      cfgPath,
+      `export default {
+  providers: {
+    main: { backend: 'codex', model: 'gpt-5-codex', baseInstructions: 'Be terse.', webSearch: false },
+    alt: { backend: 'gemini', model: 'gemini-2.5-pro', yolo: false, args: ['--verbosity', 'low'] },
+  },
+  default: 'main',
+}
+`,
+      "utf8",
     );
+    const wfPath = path.join(dir, "route.js");
+    await writeFile(
+      wfPath,
+      `export const meta = { name: 'route_demo', description: 'route demo' }
+const a = await agent('a', { provider: 'alt' })
+const b = await agent('b', { provider: 'main' })
+const c = await agent('c')
+return { a, b, c }
+`,
+      "utf8",
+    );
+
+    // Auto-discovers the config in cwd; --provider sets the run-level default for the unrouted agent c.
+    const run = await runCli(["run", wfPath, "--provider", "alt", "--json", "--cwd", dir], dir);
     assert.equal(run.code, 0, run.stderr);
-    const runId = (JSON.parse(run.stdout) as { runId: string }).runId;
+    assert.match(run.stderr, /Providers:/);
+    const output = JSON.parse(run.stdout) as { runId: string; result: { c: string } };
+    assert.equal(output.result.c, "fake:c");
 
-    type PiRunner = { backend?: string; baseUrl?: string; piApi?: string; tools?: string; thinking?: string };
-    const recPath = path.join(dir, "runs", `${runId.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
-    const recBefore = JSON.parse(await readFile(recPath, "utf8")) as { runner?: PiRunner };
-    assert.equal(recBefore.runner?.backend, "pi");
-    assert.equal(recBefore.runner?.baseUrl, "https://api.example.com");
-    assert.equal(recBefore.runner?.piApi, "anthropic-messages");
-    assert.equal(recBefore.runner?.tools, "read,grep");
-    assert.equal(recBefore.runner?.thinking, "low");
+    const recPath = path.join(dir, "runs", `${output.runId.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
+    const record = JSON.parse(await readFile(recPath, "utf8")) as {
+      runner?: { configPath?: string; configHash?: string; defaultProvider?: string };
+    };
+    assert.equal(record.runner?.configPath, cfgPath);
+    assert.match(record.runner?.configHash ?? "", /^[0-9a-f]{16}$/);
+    assert.equal(record.runner?.defaultProvider, "alt");
 
-    // Resume with NO pi flags: pi-api/tools must travel with base-url, or the uncached agents would
-    // silently switch API shape / tool set relative to the original run.
-    const resumed = await runCli(["resume", runId, "--json", "--cwd", dir], dir);
+    // Resume WITHOUT --config / --provider: both are inherited from the record.
+    const resumed = await runCli(["resume", output.runId, "--json", "--cwd", dir], dir);
     assert.equal(resumed.code, 0, resumed.stderr);
-    const recAfter = JSON.parse(await readFile(recPath, "utf8")) as { runner?: PiRunner };
-    assert.equal(recAfter.runner?.baseUrl, "https://api.example.com");
-    assert.equal(recAfter.runner?.piApi, "anthropic-messages");
-    assert.equal(recAfter.runner?.tools, "read,grep");
-    assert.equal(recAfter.runner?.thinking, "low");
+    assert.match(resumed.stderr, /Providers:/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("CLI rejects Codex-only flags with the Gemini backend", async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-gemini-flags-"));
+test("CLI requires a provider config for a real run", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-noconfig-"));
   try {
-    const wfPath = path.join(dir, "gemini_demo.js");
-    await writeFile(wfPath, "export const meta = { name: 'x', description: 'x' }\nreturn 'x'\n", "utf8");
-    const result = await runCli(["run", wfPath, "--backend", "gemini", "--approval", "never", "--cwd", dir], dir, {
-      fakeAgent: false,
-    });
-    assert.equal(result.code, 2);
-    assert.match(result.stderr, /--approval is only supported with --backend codex/);
+    const wfPath = path.join(dir, "needs.js");
+    await writeFile(wfPath, "export const meta = { name: 'needs_config', description: 'x' }\nreturn 'x'\n", "utf8");
+    // No config in cwd and no --config → a real run is refused before any backend is touched.
+    const run = await runCli(["run", wfPath, "--json", "--cwd", dir], dir, { fakeAgent: false });
+    assert.equal(run.code, 2, run.stdout);
+    assert.match(run.stderr, /no provider config found/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

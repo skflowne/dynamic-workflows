@@ -7,33 +7,18 @@ import type { WorkflowSourceKind } from "./workflow-tool.js";
 export type RunRecordStatus = "running" | "completed" | "failed" | "cancelled";
 
 /**
- * Runner configuration a run used. Persisted so `resume` reuses the same backend/model instead of
- * silently falling back to defaults (the journal cache key is NOT backend-aware, so resuming under a
- * different backend would mix results). Historical records omit it and are treated as the codex backend.
+ * Runner configuration a run used. A run resolves its backends/models from a provider config, so this
+ * records the config file (path + a secret-free content hash) and the run-level default provider, which
+ * is all `resume` needs to reload the same routing. The journal cache key is provider/model-aware, so
+ * cached agents replay regardless; only re-run agents go through the (re-loaded) config.
  */
 export interface RunnerConfig {
-  /** Agent backend, e.g. "codex", "gemini", or "pi". */
-  backend: string;
-  /** Model passed to the backend (runner/CLI `--model`), when set. */
-  model?: string;
-  /** Gemini CLI executable, when overridden (`--gemini-command`). */
-  geminiCommand?: string;
-  /** pi CLI executable, when overridden (`--pi-command`). */
-  piCommand?: string;
-  /** Backend provider name (`--provider`), for the pi backend. */
-  provider?: string;
-  /** Custom OpenAI/Anthropic-compatible endpoint (`--base-url`), for the pi backend. */
-  baseUrl?: string;
-  /** Thinking level (`--thinking`), for the pi backend. NOTE: the API key is deliberately NOT persisted. */
-  thinking?: string;
-  /** Provider API shape (`--pi-api`), for the pi backend — must travel with `baseUrl` across resume. */
-  piApi?: string;
-  /** Tool allowlist (`--tools`, raw comma-separated string), for the pi backend. */
-  tools?: string;
-  /** Tool denylist (`--exclude-tools`, raw comma-separated string), for the pi backend. */
-  excludeTools?: string;
-  /** All tools disabled (`--no-tools`), for the pi backend. */
-  noTools?: boolean;
+  /** Provider config file this run loaded (`--config` or discovered), so `resume` reloads the same one. */
+  configPath?: string;
+  /** Secret-free content hash of the loaded provider config — `resume` warns if it has since drifted. */
+  configHash?: string;
+  /** Run-level default provider name (`--provider`) selected from the config. */
+  defaultProvider?: string;
 }
 
 export interface RunRecord {

@@ -5,13 +5,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `codex-workflow` is a CLI + library that runs **Claude Code-style dynamic workflows** on top of
-pluggable agent backends (**OpenAI Codex** by default, **Gemini CLI** with `--backend gemini`, and
-**pi** — the pi-coding-agent harness — with `--backend pi`, which also reaches any OpenAI/Anthropic-
-compatible endpoint via `--base-url`). A
+pluggable agent backends (**OpenAI Codex**, **Gemini CLI**, and **pi** — the pi-coding-agent harness,
+which also reaches any OpenAI/Anthropic-compatible endpoint). A
 workflow is an open TS/JS script with a `meta` block and top-level `await`; the
 orchestration primitives (`agent`, `parallel`, `pipeline`, `workflow`, `phase`, `log`, `args`,
 `budget`) are injected at runtime. Each `agent()` call runs as an independent backend session. The
 CLI is the primary deliverable; the library underneath is reused by it.
+
+**Every run needs a provider config** (`--config`, or an auto-discovered
+`codex-workflow.config.{ts,mts,js,mjs}` in the project dir or the data dir; the only exception is the
+token-free `CODEX_WORKFLOW_FAKE_AGENT` mode). It names a set of providers (each = backend + model +
+endpoint + credential-env + tuning), so a *single* run can route different `agent()` calls to different
+backends/models: `agent({provider:"name"})`, `agent({model:"id"})` (routes to the provider declaring
+that model), `--provider <name>` for a run-level default, else `config.default`. A call that resolves to
+none of these throws. The CLI itself only **selects and orchestrates** (`--config`/`--provider` plus
+run-level/output flags); all backend/model/tuning lives in the config. See `src/providers/`.
 
 ## Commands
 
@@ -38,9 +46,9 @@ node dist/cli.js serve --port 4173   # local web viewer (overview + per-step det
 - **`RUN_GEMINI_CLI_LIVE=1`** un-gates the one live Gemini CLI smoke test. Off by default.
 - **`RUN_PI_CLI_LIVE=1`** un-gates the one live pi smoke test (set `PI_CLI_MODEL`/`PI_CLI_PROVIDER`
   or `PI_CLI_BASE_URL`+`PI_CLI_API_KEY`). Off by default.
-- Requires **Bun** (workflow bodies execute in a Bun child) and exactly one real agent backend for
-  real runs: Codex CLI authenticated via `codex login` for `--backend codex`, Gemini CLI for
-  `--backend gemini`, or `pi` (npm `@earendil-works/pi-coding-agent`) for `--backend pi`.
+- Requires **Bun** (workflow bodies execute in a Bun child), a provider config, and the CLI for each
+  backend the config uses: Codex CLI authenticated via `codex login` for `codex` providers, Gemini CLI
+  for `gemini` providers, or `pi` (npm `@earendil-works/pi-coding-agent`) for `pi` providers.
 
 ## Architecture (the mental model matters most)
 
@@ -97,21 +105,29 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 - `src/parser.ts` — TS-AST parse. `meta` **must be the first statement and a pure literal**.
   Rewrites top-level `import`/`export` into an async-function-safe body (dynamic imports; type-only
   and re-exports erased; anonymous `export default` bound to a name).
+- `src/providers/config.ts` — provider-config types (`ProviderDef`/`ProvidersConfig`), discovery
+  (`--config` → cwd → global data dir), TS/JS loading (`ts.transpileModule` + data: URL import, no new
+  dep), and validation (per-backend allowed fields, unknown `default`, secret-free content hash). Also
+  `resolveProviderName` (validated lookup) + `buildModelIndex`, reused by the registry.
+- `src/providers/registry.ts` — `buildRunnerResolver(config, factories, {defaultProvider})` → the
+  per-agent `WorkflowRunnerResolver`. Backend-agnostic (the CLI injects a `forProvider` factory that
+  closes over `buildAgentRunner` + flags); implements the provider → model → default chain (throws if a
+  call resolves to none) and caches runners per `provider:model`.
 - `src/runners/codex-sdk.ts` — real runner. `startThread()` **per `agent()` call** (never resumes →
-  every agent is a fresh, independent Codex session). Maps runner/CLI `model`, `sandbox`,
-  `approval`, and reasoning; intentionally ignores workflow-authored `agent({model})` /
-  `meta.phases[].model` values so Claude workflows with hard-coded model names remain portable.
+  every agent is a fresh, independent Codex session). Maps the resolved provider's `model`, `sandbox`,
+  `approval`, and reasoning; a raw workflow-authored `agent({model})` reaches the backend only when a
+  provider declares that model (otherwise it's a routing hint, see Model resolution).
   `isolation:'worktree'` creates a real detached `git worktree` (preserved for review if the agent left
   changes, else force-removed). `buildPrompt()` injects the verbatim-return discipline (+ strict-JSON
   contract when a schema is set). Reports `outputTokens` via `onMeta`; enforces `agentTimeoutMs`.
   **`toStrictJsonSchema()`** rewrites loose Claude schemas into OpenAI-strict form before sending (see gotchas).
 - `src/runners/gemini-cli.ts` — real Gemini runner. Spawns a fresh `gemini` process per `agent()` call
-  using runner/CLI `--model <model>` (workflow-authored models are ignored), `-y`, `-o json`, and
+  using the provider's `model` (`--model <model>`), `-y`, `-o json`, and
   `-p <prompt>`. Parses the JSON wrapper's `response`, `session_id`, and
   `stats.models.*.tokens.candidates`; no native schema is sent to Gemini, so the runtime's AJV
   validation/retry loop is the contract for `agent({schema})`. Supports `isolation:'worktree'`
-  with the same detached git worktree behavior. CLI selection is `--backend gemini` or
-  `CODEX_WORKFLOW_BACKEND=gemini`; `--gemini-command` / `CODEX_WORKFLOW_GEMINI_COMMAND` override the binary.
+  with the same detached git worktree behavior. Selected by a provider's `backend: 'gemini'`; the binary
+  comes from the provider's `geminiCommand` or `CODEX_WORKFLOW_GEMINI_COMMAND`.
   Raw `spawn` stdout/stderr are bounded (32MB/4MB) so a runaway YOLO turn can't OOM the parent.
 - `src/runners/pi-cli.ts` — real pi runner (`@earendil-works/pi-coding-agent`, a full agentic harness:
   read/bash/edit/write/grep/find/ls tools). Spawns `pi -p --mode json --no-context-files [--approve]
@@ -126,9 +142,8 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   (`PI_CODING_AGENT_DIR`) and points pi at it (`--provider custom`); the API key is injected via env
   (`CODEX_WORKFLOW_PI_API_KEY`, referenced as `$VAR` in models.json) and **never written to disk** —
   without an apiKey the config gets a literal `"dummy"` (pi errors on unset env refs; keyless endpoints
-  like Ollama accept anything). CLI
-  selection is `--backend pi` / `CODEX_WORKFLOW_BACKEND=pi`; `--pi-command` / `CODEX_WORKFLOW_PI_COMMAND`
-  override the binary. stdout/stderr bounded (64MB/4MB).
+  like Ollama accept anything). Selected by a provider's `backend: 'pi'`; the binary comes from the
+  provider's `piCommand` or `CODEX_WORKFLOW_PI_COMMAND`. stdout/stderr bounded (64MB/4MB).
 - `src/runners/prompt.ts` — shared subagent prompt discipline used by the Codex, Gemini, and pi runners.
 - `src/runners/worktree.ts` — shared detached-`git worktree` lifecycle (create + dirty-aware
   preserve/remove cleanup) used by all CLI runners.
@@ -151,19 +166,23 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 - `src/task-manager.ts` — async launch/wait/cancel (library-level; the CLI runs foreground).
 - `src/cli.ts` + `src/cli/` — `parseArgs`-based CLI
   (`run`/`resume`/`list`/`serve`/`validate`/`runs`/`show`/`doctor`),
-  `progress.ts` (TTY status-line renderer), `commands.ts` (command impls + backend-aware runner factory).
+  `progress.ts` (TTY status-line renderer), `commands.ts` (command impls + provider/runner wiring).
+  `commands.ts` owns: `loadProviderConfigForRun` (discover+load; required for a real run — only
+  `CODEX_WORKFLOW_FAKE_AGENT` may skip it), `providerDefToFlags` (project a `ProviderDef` onto a synthetic
+  `RunFlags` so the per-backend builders consume it — and read `apiKeyEnv` from `process.env` here,
+  in-memory only), and `buildAgentRunnerResolver` (wrap `buildRunnerResolver` with a `forProvider` factory).
   `run` accepts a workflow file path or a bare registered name; path-like missing targets report file
-  not found rather than falling through to name lookup. `run` and `resume` share `executeRun()`:
+  not found rather than falling through to name lookup. `run` and `resume` share `executeRun()`
+  (which validates `--agent-timeout` up front):
   `resume <runId>` reconstructs the input (script path / name + `args`) from the run record and reuses
   the journal cache; Ctrl-C aborts the in-flight run, marks it `cancelled`, and prints the `resume` hint.
-  The record also persists the runner config (`RunRecord.runner`: backend/model/gemini-command, plus the
-  pi backend's pi-command/provider/base-url/pi-api/thinking/tools/exclude-tools/no-tools — but **never
-  the API key**); `resume`
-  **inherits** it when the flag is omitted and **refuses** an explicit `--backend` that disagrees with the
-  recorded one (the journal cache key is NOT backend-aware, so resuming under a different backend would
-  silently mix results). Historical records without `runner` are treated as the codex backend. pi-only
-  flags (`--provider`/`--base-url`/`--api-key`/`--pi-api`/`--thinking`/`--tools`/`--exclude-tools`/
-  `--no-tools`) error on codex/gemini; codex-only flags (`--sandbox`/`--approval`/`--reasoning`) error on pi.
+  The record persists only the routing it needs (`RunRecord.runner`:
+  `configPath`/`configHash`/`defaultProvider` — no backend/model/secrets); `resume` reloads the recorded
+  config (warning if its hash drifted) and re-selects the same default. The CLI is selection-only:
+  `--config` chooses the provider config, `--provider` sets the run-level default provider; everything
+  else (backend, model, sandbox/approval/reasoning, base-url/api/apiKeyEnv/thinking/tools/…) is a
+  `ProviderDef` field. `doctor` validates the discovered/`--config` config and checks the CLI for each
+  backend the config actually uses.
 - `src/web/` + `web-src/` + `web/` — **local web viewer** (zero-dep Node `http` server,
   bundled React/TypeScript SPA, claude.ai-styled). `web-src/` is the strict TS frontend source;
   `npm run build:web` runs `tsc -p tsconfig.web.json` and Vite, emitting static assets into `web/`.
@@ -206,17 +225,40 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   the runtime's retry loop. pi (like Gemini) has no native JSON-schema flag → AJV is the `agent({schema})`
   contract. The pi backend's custom-`baseUrl` config is the only place this tool generates a backend
   config file (`models.json`); keep the API key out of it (env-injected via `$CODEX_WORKFLOW_PI_API_KEY`).
-- **`agentType` is prompt context only.** Claude's built-in agent definitions/tool bundles are not
-  loaded; full equivalence would require a separate agent registry surface.
-- **Web search + network are always enabled for Codex agents** (no flag to disable — set by design in
-  `buildCodexRunner`). Gemini uses the local Gemini CLI's configured capabilities. pi runs with its
-  full built-in tool set (read/bash/edit/write/grep/find/ls) plus `--approve` by default; narrow it with
-  `--tools`/`--exclude-tools`/`--no-tools`.
-- **Model resolution:** the runtime still attaches `agent({model})` / `meta.phases[].model` to
-  `WorkflowAgentCall.options` for Claude compatibility and custom runners, but the built-in Codex,
-  Gemini, and pi runners intentionally ignore workflow-authored model values. Use runner/CLI `--model` to
-  select a built-in backend model; otherwise each backend uses its own default. (For pi + `--base-url`,
-  `--model` is required and is the model id sent to the endpoint.)
+- **`agentType` is a prompt role directive** (`prompt.ts` injects "Act as the \"<type>\" subagent…" for
+  all backends, so the model adopts the role the name implies). Claude's built-in agent definitions/tool
+  bundles are NOT loaded — there's no name→system-prompt/tool registry, so a bare descriptive name is all
+  the model gets; full equivalence would require a separate agent-definitions surface.
+- **Web search + network default on for Codex providers** (`buildCodexRunner` sets them `?? true`); a
+  provider opts out via `webSearch`/`networkAccess`. Gemini uses the local Gemini CLI's configured
+  capabilities. pi runs with its full built-in tool set (read/bash/edit/write/grep/find/ls) plus
+  `approve` by default; narrow it via a provider's `tools`/`excludeTools`/`noTools`.
+- **Model resolution:** the runtime attaches `agent({model})` / `meta.phases[].model` to
+  `WorkflowAgentCall.options`; the per-backend runners send whatever model `providerDefToFlags` resolved
+  (never a raw workflow-authored value directly). `agent({model})` is a **routing key**: a config that
+  declares that model (a provider's `model`/`models`) routes the call there *and* sends that model to the
+  backend; a model no provider declares is ignored (the call falls through to `--provider`/`config.default`),
+  so stock Claude workflows with hard-coded model names stay portable. `agent({provider})` selects a
+  provider by name.
+- **Provider routing (`src/providers/`)** is per-`agent()` and lives in `WorkflowRunOptions.runner`,
+  typed `WorkflowAgentRunner | WorkflowRunnerResolver`. The runtime normalizes a bare runner to
+  `() => runner` and calls the resolver once per **uncached** agent — *after* the journal cache check,
+  *before* the retry loop — so an unknown provider / ambiguous model / unresolvable call **hard-fails**
+  the run (like cap/budget) instead of retrying into a `null`. `config.ts` loads+validates the TS/JS config
+  (reusing the already-present `typescript` dep to transpile `.ts` via a data: URL — no new dependency;
+  relative imports in a `.ts` config won't resolve, `.js`/`.mjs` are imported from their file URL).
+  `registry.ts` `buildRunnerResolver()` is backend-agnostic (a `forProvider` factory is injected by the
+  CLI) and caches built runners per `provider:model`. **provider/model ride in `agent` options → they're
+  in the journal cacheKey**, so the same prompt under two providers is two entries (no cross-provider
+  cache hit), which is what makes mixing safe across `resume`. A `ProviderDef` carries every backend knob:
+  `agentTimeoutMs` + `baseInstructions` (all); codex `sandbox`/`approval`/`reasoning`/`webSearch`/
+  `networkAccess`/`webSearchMode`; gemini `geminiCommand`/`yolo`/`args`; pi `thinking`/`tools`/
+  `excludeTools`/`noTools`/`approve`/`contextFiles`/`piProvider`/`baseUrl`/`api`/`apiKeyEnv`/`piCommand`/
+  `args` (`args` = raw extra CLI flags, a passthrough escape hatch for gemini/pi). They flow through
+  `providerDefToFlags` → the per-backend builders. `RunnerConfig` records only
+  `configPath`/`configHash`/`defaultProvider` (no backend/model/secrets); `resume` reloads the recorded
+  config (warning if its hash drifted). Secrets stay out of the config — a pi provider names a credential
+  env var via `apiKeyEnv`, read at runner-build time and **never persisted**.
 - **Build layout:** `tsconfig.json` uses `rootDir: "src"` so output is `dist/index.js` / `dist/cli.js`
   (the `bin`). Tests are excluded from emit and typechecked separately via `tsconfig.test.json`.
 - **Observability layers** when debugging a run: the **web viewer** (in-process per `run` on a random

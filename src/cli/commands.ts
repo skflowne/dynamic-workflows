@@ -14,7 +14,20 @@ import { WorkflowAbortError, WorkflowInputError } from "../errors.js";
 import { parseWorkflowScript } from "../parser.js";
 import { FileRunStore, type RunnerConfig, type RunRecord } from "../run-store.js";
 import { acquireRunLock, type RunLock } from "../run-lock.js";
-import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner, WorkflowProgressEvent } from "../types.js";
+import type {
+  WorkflowAgentCall,
+  WorkflowAgentMeta,
+  WorkflowAgentRunner,
+  WorkflowProgressEvent,
+  WorkflowRunnerResolver,
+} from "../types.js";
+import {
+  discoverProviderConfig,
+  loadProviderConfig,
+  type LoadedProviderConfig,
+  type ProviderDef,
+} from "../providers/config.js";
+import { buildRunnerResolver, type ProviderRunnerFactories } from "../providers/registry.js";
 import { WorkflowRegistry, type WorkflowInput } from "../workflow-tool.js";
 import { ProgressRenderer, type ProgressMode } from "./progress.js";
 import { createWebServer, type WorkflowWebServer } from "../web/server.js";
@@ -41,7 +54,12 @@ export interface RunFlags {
   bun?: string;
   "gemini-command"?: string;
   "pi-command"?: string;
+  /** Provider config file (`--config`); discovered automatically when omitted. */
+  config?: string;
+  /** Run-level default provider name selected from the config (`--provider`). */
   provider?: string;
+  /** pi backend provider id (`--pi-provider`, e.g. openai/anthropic). */
+  "pi-provider"?: string;
   "base-url"?: string;
   "api-key"?: string;
   "pi-api"?: string;
@@ -49,6 +67,16 @@ export interface RunFlags {
   tools?: string;
   "exclude-tools"?: string;
   "no-tools"?: boolean;
+  // Provider-config-only knobs (no CLI flag; set by providerDefToFlags from a ProviderDef).
+  baseInstructions?: string;
+  /** Raw extra CLI args for the gemini/pi backends (ProviderDef `args`). */
+  extraArgs?: string[];
+  webSearch?: boolean;
+  networkAccess?: boolean;
+  webSearchMode?: string;
+  yolo?: boolean;
+  approve?: boolean;
+  contextFiles?: boolean;
   "idle-timeout"?: string;
   json?: boolean;
   quiet?: boolean;
@@ -87,7 +115,7 @@ export async function runCommand(target: string | undefined, flags: RunFlags): P
 /**
  * `codex-workflow resume <runId>` — re-run a recorded run, reusing its journal cache. Reconstructs the
  * workflow input (script path / registered name + the original `args`) straight from the saved run record,
- * so the user need not re-type the file path or `--args`. CLI flags (`--args`, `--model`, …) still override.
+ * so the user need not re-type the file path or `--args`. CLI flags (`--args`, `--config`, …) still override.
  */
 export async function resumeCommand(runId: string | undefined, flags: RunFlags): Promise<number> {
   if (!runId) {
@@ -121,45 +149,11 @@ export async function resumeCommand(runId: string | undefined, flags: RunFlags):
   }
   if (override !== undefined) input.args = override;
 
-  // A run's backend is part of "what ran it" and must survive resume: the journal cache key is NOT
-  // backend-aware, so resuming a codex run under gemini would silently mix results. Inherit the
-  // recorded runner config when this invocation omits it; refuse an explicit backend that disagrees.
-  const recordedBackend = record.runner?.backend ?? "codex";
-  if (flags.backend !== undefined) {
-    let requested: AgentBackend;
-    try {
-      requested = resolveBackend(flags.backend);
-    } catch (error) {
-      process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
-      return 2;
-    }
-    if (requested !== recordedBackend) {
-      process.stderr.write(
-        `error: run ${runId} used backend "${recordedBackend}"; cannot resume it with --backend "${requested}". ` +
-          `Drop --backend to reuse "${recordedBackend}", or start a fresh run (the journal cache is not backend-aware).\n`,
-      );
-      return 2;
-    }
-  } else {
-    flags.backend = recordedBackend;
-  }
-  // Inherit the rest of the runner config when omitted (model can still be overridden explicitly).
-  if (flags.model === undefined && record.runner?.model !== undefined) flags.model = record.runner.model;
-  if (flags["gemini-command"] === undefined && record.runner?.geminiCommand !== undefined) {
-    flags["gemini-command"] = record.runner.geminiCommand;
-  }
-  // pi backend: inherit the full recorded runner config — provider/base-url/pi-api/thinking/tool
-  // selection/pi-command. pi-api and the tool flags must travel with base-url, or resume would
-  // silently switch API shape / tool set on the uncached agents. The API key is never persisted, so
-  // resume re-reads it from --api-key or the provider env var.
-  if (flags["pi-command"] === undefined && record.runner?.piCommand !== undefined) flags["pi-command"] = record.runner.piCommand;
-  if (flags.provider === undefined && record.runner?.provider !== undefined) flags.provider = record.runner.provider;
-  if (flags["base-url"] === undefined && record.runner?.baseUrl !== undefined) flags["base-url"] = record.runner.baseUrl;
-  if (flags.thinking === undefined && record.runner?.thinking !== undefined) flags.thinking = record.runner.thinking;
-  if (flags["pi-api"] === undefined && record.runner?.piApi !== undefined) flags["pi-api"] = record.runner.piApi;
-  if (flags.tools === undefined && record.runner?.tools !== undefined) flags.tools = record.runner.tools;
-  if (flags["exclude-tools"] === undefined && record.runner?.excludeTools !== undefined) flags["exclude-tools"] = record.runner.excludeTools;
-  if (flags["no-tools"] === undefined && record.runner?.noTools) flags["no-tools"] = true;
+  // Reload the same provider config and re-select the same default so the re-run agents route
+  // identically. The journal cache key embeds each agent's provider/model, so cached agents replay
+  // regardless; a drifted config only affects re-run agents (warned at run time).
+  if (flags.config === undefined && record.runner?.configPath !== undefined) flags.config = record.runner.configPath;
+  if (flags.provider === undefined && record.runner?.defaultProvider !== undefined) flags.provider = record.runner.defaultProvider;
 
   return executeRun(input, runId, cwd, flags, { resumeRecord: record });
 }
@@ -182,9 +176,19 @@ async function executeRun(
   // Runtime data (runs/journal/links) lives in the global data dir so it's shared across projects;
   // `cwd` stays the project dir (where Codex agents run).
   const dataDir = workflowDataDir();
-  let runner: WorkflowAgentRunner;
+  let runner: WorkflowAgentRunner | WorkflowRunnerResolver;
+  let loadedConfig: LoadedProviderConfig | undefined;
   try {
-    runner = buildAgentRunner(cwd, flags, dataDir);
+    parseAgentTimeoutFlag(flags["agent-timeout"]); // validate up front; throws on a negative value
+    loadedConfig = await loadProviderConfigForRun(cwd, dataDir, flags);
+    if (loadedConfig) {
+      process.stderr.write(`${dim("▸")} Providers: ${dim(loadedConfig.path)} (${Object.keys(loadedConfig.config.providers).length})\n`);
+      const priorHash = options.resumeRecord?.runner?.configHash;
+      if (priorHash && priorHash !== loadedConfig.hash) {
+        process.stderr.write(`${yellow("!")} provider config changed since this run — re-run agents use the new mapping (cached agents are unaffected).\n`);
+      }
+    }
+    runner = buildAgentRunnerResolver(cwd, flags, dataDir, loadedConfig);
   } catch (error) {
     process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
     return 2;
@@ -229,7 +233,7 @@ async function executeRun(
       ...(options.resumeRecord?.description ? { description: options.resumeRecord.description } : {}),
       status: "running",
       source: input.name ? "named" : input.scriptPath ? "scriptPath" : "inline",
-      runner: resolveRunnerConfig(flags),
+      runner: resolveRunnerConfig(flags, loadedConfig),
       startedAt,
       ...(declaredPhases ? { declaredPhases } : {}),
       ...(input.args !== undefined ? { args: input.args } : {}),
@@ -569,15 +573,8 @@ export async function serveCommand(flags: RunFlags): Promise<number> {
 }
 
 /** `codex-workflow doctor` */
-export async function doctorCommand(flags: { cwd?: string; backend?: string; "gemini-command"?: string; "pi-command"?: string }): Promise<number> {
+export async function doctorCommand(flags: RunFlags): Promise<number> {
   let ok = true;
-  let backend: AgentBackend;
-  try {
-    backend = resolveBackend(flags.backend);
-  } catch (error) {
-    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 2;
-  }
   const required = (good: boolean, label: string, hint?: string) => {
     if (!good) ok = false;
     process.stdout.write(`${good ? green("✓") : red("✗")} ${label}${good || !hint ? "" : `\n    ${dim(hint)}`}\n`);
@@ -589,33 +586,38 @@ export async function doctorCommand(flags: { cwd?: string; backend?: string; "ge
   const bun = await tryExec("bun", ["--version"]);
   required(bun.ok, `Bun runtime${bun.ok ? ` (${bun.out.trim()})` : ""}`, "Install Bun: https://bun.sh — workflows execute in a Bun child process.");
 
-  const codex = await tryExec("codex", ["--version"]);
-  const authPath = path.join(os.homedir(), ".codex", "auth.json");
-  const auth = await pathExists(authPath);
-  const geminiCommand = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini";
-  const gemini = await tryExec(geminiCommand, ["--version"]);
-  const piCommand = flags["pi-command"] ?? process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi";
-  const pi = await tryExec(piCommand, ["--version"]);
+  const dataDir = workflowDataDir();
+  const cwd = path.resolve(flags.cwd ?? process.cwd());
 
-  if (backend === "codex") {
-    required(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Install Codex CLI and run `codex login`.");
-    required(auth, "Codex auth (~/.codex/auth.json)", "Run `codex login` to authenticate.");
-    optional(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Only needed for `--backend gemini`.");
-    optional(pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Only needed for `--backend pi`.");
-  } else if (backend === "pi") {
-    required(pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Install pi (npm i -g @earendil-works/pi-coding-agent), add it to PATH, or pass --pi-command <path>.");
-    optional(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Only needed for the default Codex backend.");
-    optional(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Only needed for `--backend gemini`.");
-  } else {
-    required(gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Install Gemini CLI, add it to PATH, or pass --gemini-command <path>.");
-    optional(codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Only needed for the default Codex backend.");
-    optional(auth, "Codex auth (~/.codex/auth.json)", "Only needed for the default Codex backend.");
-    optional(pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Only needed for `--backend pi`.");
+  // Provider config is required for `run`. Validate it and collect the backends it actually uses.
+  const usedBackends = new Set<string>();
+  try {
+    const configPath = await discoverProviderConfig(cwd, dataDir, flags.config);
+    if (!configPath) {
+      required(false, "provider config", "Required for `run`: create codex-workflow.config.ts (in this project or the data dir) or pass --config <path>.");
+    } else {
+      const { config } = await loadProviderConfig(configPath);
+      const names = Object.keys(config.providers);
+      for (const p of Object.values(config.providers)) usedBackends.add(p.backend);
+      required(true, `provider config (${names.length}): ${dim(configPath)}`);
+      process.stdout.write(`    ${dim(`providers: ${names.join(", ")}${config.default ? ` · default: ${config.default}` : ""} · backends: ${[...usedBackends].join(", ")}`)}\n`);
+    }
+  } catch (error) {
+    required(false, "provider config", error instanceof Error ? error.message : String(error));
   }
 
-  const dataDir = workflowDataDir();
+  // Probe each backend CLI; required when the config uses it, otherwise just informational.
+  const codex = await tryExec("codex", ["--version"]);
+  const auth = await pathExists(path.join(os.homedir(), ".codex", "auth.json"));
+  const gemini = await tryExec(process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini", ["--version"]);
+  const pi = await tryExec(process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi", ["--version"]);
+  const check = (used: boolean, good: boolean, label: string, hint: string) => (used ? required(good, label, hint) : optional(good, label, hint));
+
+  check(usedBackends.has("codex"), codex.ok && auth, `Codex CLI + auth${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Install Codex CLI and run `codex login`.");
+  check(usedBackends.has("gemini"), gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Install the Gemini CLI, or set CODEX_WORKFLOW_GEMINI_COMMAND.");
+  check(usedBackends.has("pi"), pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Install pi (npm i -g @earendil-works/pi-coding-agent), or set CODEX_WORKFLOW_PI_COMMAND.");
+
   process.stdout.write(`${green("✓")} data dir: ${dataDir}\n`);
-  process.stdout.write(`${dim("·")} backend: ${dim(backend)}\n`);
   process.stdout.write(`${dim("·")} viewer: ${dim("starts in-process per `run` (random port); `codex-workflow serve` browses history")}\n`);
 
   process.stdout.write(ok ? `\n${green("Ready.")}\n` : `\n${yellow("Some checks failed — see hints above.")}\n`);
@@ -659,6 +661,89 @@ async function parseArgsValue(raw: string | undefined, cwd: string): Promise<unk
   }
 }
 
+/**
+ * Discover + load the provider config for a run. A config is required (`--config` or an auto-discovered
+ * `codex-workflow.config.*`); the token-free `CODEX_WORKFLOW_FAKE_AGENT` mode is the only exception,
+ * since it has no real backend to route to.
+ */
+async function loadProviderConfigForRun(
+  cwd: string,
+  dataDir: string,
+  flags: RunFlags,
+): Promise<LoadedProviderConfig | undefined> {
+  const configPath = await discoverProviderConfig(cwd, dataDir, flags.config);
+  if (!configPath) {
+    if (process.env.CODEX_WORKFLOW_FAKE_AGENT) return undefined;
+    throw new WorkflowInputError(
+      "no provider config found — create codex-workflow.config.ts in this project (or the data dir), or pass --config <path>. See README › Provider config.",
+    );
+  }
+  return loadProviderConfig(configPath);
+}
+
+/**
+ * Build the per-agent runner resolver, routing `agent({provider})` / `agent({model})` through the
+ * loaded provider config. Provider runners are built lazily on first use and cached per provider:model.
+ */
+function buildAgentRunnerResolver(
+  cwd: string,
+  flags: RunFlags,
+  dataDir: string,
+  loaded: LoadedProviderConfig | undefined,
+): WorkflowRunnerResolver {
+  // No config is reachable only under CODEX_WORKFLOW_FAKE_AGENT — every agent gets the fake runner.
+  if (!loaded) return () => buildAgentRunner(cwd, flags, dataDir);
+  const factories: ProviderRunnerFactories = {
+    forProvider: (_name, def, effectiveModel) => buildAgentRunner(cwd, providerDefToFlags(def, effectiveModel, flags), dataDir),
+  };
+  return buildRunnerResolver(loaded.config, factories, {
+    ...(flags.provider ? { defaultProvider: flags.provider } : {}),
+    source: loaded.path,
+  });
+}
+
+/**
+ * Project a {@link ProviderDef} onto a synthetic {@link RunFlags} so the existing per-backend runner
+ * builders can consume it. The API key is read from `apiKeyEnv` here (in-memory only, never persisted);
+ * run-level flags like `--agent-timeout` carry through unless the provider overrides them.
+ */
+function providerDefToFlags(def: ProviderDef, effectiveModel: string | undefined, base: RunFlags): RunFlags {
+  const flags: RunFlags = { backend: def.backend };
+  if (effectiveModel) flags.model = effectiveModel;
+  const timeout = def.agentTimeoutMs !== undefined ? String(def.agentTimeoutMs) : base["agent-timeout"];
+  if (timeout !== undefined) flags["agent-timeout"] = timeout;
+  if (def.baseInstructions) flags.baseInstructions = def.baseInstructions;
+  if (def.backend === "codex") {
+    if (def.sandbox) flags.sandbox = def.sandbox;
+    if (def.approval) flags.approval = def.approval;
+    if (def.reasoning) flags.reasoning = def.reasoning;
+    if (def.webSearch !== undefined) flags.webSearch = def.webSearch;
+    if (def.networkAccess !== undefined) flags.networkAccess = def.networkAccess;
+    if (def.webSearchMode) flags.webSearchMode = def.webSearchMode;
+  } else if (def.backend === "gemini") {
+    if (def.geminiCommand) flags["gemini-command"] = def.geminiCommand;
+    if (def.yolo !== undefined) flags.yolo = def.yolo;
+    if (def.args?.length) flags.extraArgs = def.args;
+  } else {
+    if (def.piCommand) flags["pi-command"] = def.piCommand;
+    if (def.piProvider) flags["pi-provider"] = def.piProvider;
+    if (def.baseUrl) flags["base-url"] = def.baseUrl;
+    if (def.api) flags["pi-api"] = def.api;
+    if (def.apiKeyEnv) {
+      const key = process.env[def.apiKeyEnv];
+      if (key) flags["api-key"] = key; // in-memory only; never written to a record or the generated models.json
+    }
+    if (def.thinking) flags.thinking = def.thinking;
+    if (def.tools?.length) flags.tools = def.tools.join(",");
+    if (def.excludeTools?.length) flags["exclude-tools"] = def.excludeTools.join(",");
+    if (def.noTools) flags["no-tools"] = true;
+    if (def.approve !== undefined) flags.approve = def.approve;
+    if (def.contextFiles !== undefined) flags.contextFiles = def.contextFiles;
+    if (def.args?.length) flags.extraArgs = def.args;
+  }
+  return flags;
+}
+
 function buildAgentRunner(cwd: string, flags: RunFlags, dataDir: string): WorkflowAgentRunner {
   if (process.env.CODEX_WORKFLOW_FAKE_AGENT) return new FakeAgentRunner();
 
@@ -669,56 +754,41 @@ function buildAgentRunner(cwd: string, flags: RunFlags, dataDir: string): Workfl
 }
 
 function buildCodexRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
-  rejectPiOnlyFlags(flags, "codex");
   const options: CodexSdkAgentRunnerOptions = { cwd };
   if (flags.model) options.model = flags.model;
-  if (flags.sandbox) options.sandboxMode = assertOneOf(flags.sandbox, SANDBOX_MODES, "--sandbox") as SandboxMode;
-  if (flags.approval) options.approvalPolicy = assertOneOf(flags.approval, APPROVAL_MODES, "--approval") as ThreadOptions["approvalPolicy"];
+  if (flags.sandbox) options.sandboxMode = assertOneOf(flags.sandbox, SANDBOX_MODES, "sandbox") as SandboxMode;
+  if (flags.approval) options.approvalPolicy = assertOneOf(flags.approval, APPROVAL_MODES, "approval") as ThreadOptions["approvalPolicy"];
   const reasoning = flags.reasoning ?? flags.reasoningEffort;
-  if (reasoning) options.modelReasoningEffort = assertOneOf(reasoning, REASONING_EFFORTS, "--reasoning") as ThreadOptions["modelReasoningEffort"];
+  if (reasoning) options.modelReasoningEffort = assertOneOf(reasoning, REASONING_EFFORTS, "reasoning") as ThreadOptions["modelReasoningEffort"];
   const codexTimeout = parseAgentTimeoutFlag(flags["agent-timeout"]);
   if (codexTimeout !== undefined) options.agentTimeoutMs = codexTimeout;
-  // Web search + network access are always enabled for agents.
-  options.webSearchEnabled = true;
-  options.networkAccessEnabled = true;
+  if (flags.baseInstructions) options.baseInstructions = flags.baseInstructions;
+  // Web search + network access default on (a provider config may opt out per provider).
+  options.webSearchEnabled = flags.webSearch ?? true;
+  options.networkAccessEnabled = flags.networkAccess ?? true;
+  if (flags.webSearchMode) options.webSearchMode = flags.webSearchMode as ThreadOptions["webSearchMode"];
   return new CodexSdkAgentRunner(options);
 }
 
 function buildGeminiRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
-  const unsupported = [
-    flags.sandbox !== undefined ? "--sandbox" : undefined,
-    flags.approval !== undefined ? "--approval" : undefined,
-    (flags.reasoning ?? flags.reasoningEffort) !== undefined ? "--reasoning" : undefined,
-  ].filter(Boolean);
-  if (unsupported.length) {
-    throw new WorkflowInputError(`${unsupported.join(", ")} ${unsupported.length === 1 ? "is" : "are"} only supported with --backend codex`);
-  }
-
-  rejectPiOnlyFlags(flags, "gemini");
   const options: GeminiCliAgentRunnerOptions = { cwd };
   options.command = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini";
   if (flags.model) options.model = flags.model;
   const geminiTimeout = parseAgentTimeoutFlag(flags["agent-timeout"]);
   if (geminiTimeout !== undefined) options.agentTimeoutMs = geminiTimeout;
+  if (flags.baseInstructions) options.baseInstructions = flags.baseInstructions;
+  if (flags.extraArgs) options.args = flags.extraArgs;
+  if (flags.yolo !== undefined) options.yolo = flags.yolo;
   return new GeminiCliAgentRunner(options);
 }
 
 function buildPiRunner(cwd: string, flags: RunFlags, dataDir: string): WorkflowAgentRunner {
-  const codexOnly = [
-    flags.sandbox !== undefined ? "--sandbox" : undefined,
-    flags.approval !== undefined ? "--approval" : undefined,
-    (flags.reasoning ?? flags.reasoningEffort) !== undefined ? "--reasoning" : undefined,
-  ].filter(Boolean);
-  if (codexOnly.length) {
-    throw new WorkflowInputError(`${codexOnly.join(", ")} ${codexOnly.length === 1 ? "is" : "are"} only supported with --backend codex (pi uses --thinking)`);
-  }
-
   const options: PiCliAgentRunnerOptions = { cwd };
   options.command = flags["pi-command"] ?? process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi";
   // pi writes session JSONL here; the viewer reads linked sessions from the same path.
   options.sessionDir = piSessionsDir(dataDir);
   if (flags.model) options.model = flags.model;
-  if (flags.provider) options.provider = flags.provider;
+  if (flags["pi-provider"]) options.provider = flags["pi-provider"];
   if (flags["base-url"]) {
     options.baseUrl = flags["base-url"];
     // A custom endpoint needs a config home to host the generated models.json.
@@ -726,36 +796,23 @@ function buildPiRunner(cwd: string, flags: RunFlags, dataDir: string): WorkflowA
   }
   if (flags["api-key"]) options.apiKey = flags["api-key"];
   if (flags["pi-api"]) {
-    options.api = assertOneOf(flags["pi-api"], PI_API_SHAPES, "--pi-api") as NonNullable<PiCliAgentRunnerOptions["api"]>;
+    options.api = assertOneOf(flags["pi-api"], PI_API_SHAPES, "api") as NonNullable<PiCliAgentRunnerOptions["api"]>;
   }
-  if (flags.thinking) options.thinking = assertOneOf(flags.thinking, REASONING_EFFORTS, "--thinking");
+  if (flags.thinking) options.thinking = assertOneOf(flags.thinking, REASONING_EFFORTS, "thinking");
   if (flags["no-tools"]) options.noTools = true;
   if (flags.tools) options.tools = splitList(flags.tools);
   if (flags["exclude-tools"]) options.excludeTools = splitList(flags["exclude-tools"]);
+  if (flags.baseInstructions) options.baseInstructions = flags.baseInstructions;
+  if (flags.extraArgs) options.args = flags.extraArgs;
+  if (flags.approve !== undefined) options.approve = flags.approve;
+  if (flags.contextFiles !== undefined) options.contextFiles = flags.contextFiles;
   const piTimeout = parseAgentTimeoutFlag(flags["agent-timeout"]);
   if (piTimeout !== undefined) options.agentTimeoutMs = piTimeout;
 
   if (options.baseUrl && !options.model) {
-    throw new WorkflowInputError("--base-url requires --model (the model id sent to the endpoint)");
+    throw new WorkflowInputError("a pi provider with `baseUrl` requires `model` (the model id sent to the endpoint)");
   }
   return new PiCliAgentRunner(options);
-}
-
-/** pi-only flags must not silently no-op on the codex/gemini backends. */
-function rejectPiOnlyFlags(flags: RunFlags, backend: string): void {
-  const piOnly = [
-    flags.provider !== undefined ? "--provider" : undefined,
-    flags["base-url"] !== undefined ? "--base-url" : undefined,
-    flags["api-key"] !== undefined ? "--api-key" : undefined,
-    flags["pi-api"] !== undefined ? "--pi-api" : undefined,
-    flags.thinking !== undefined ? "--thinking" : undefined,
-    flags.tools !== undefined ? "--tools" : undefined,
-    flags["exclude-tools"] !== undefined ? "--exclude-tools" : undefined,
-    flags["no-tools"] ? "--no-tools" : undefined,
-  ].filter(Boolean);
-  if (piOnly.length) {
-    throw new WorkflowInputError(`${piOnly.join(", ")} ${piOnly.length === 1 ? "is" : "are"} only supported with --backend pi`);
-  }
 }
 
 function splitList(raw: string): string[] {
@@ -766,30 +823,18 @@ function splitList(raw: string): string[] {
 }
 
 function resolveBackend(raw: string | undefined): AgentBackend {
-  const value = raw ?? process.env.CODEX_WORKFLOW_BACKEND ?? "codex";
-  return assertOneOf(value, [...AGENT_BACKENDS], "--backend") as AgentBackend;
+  const value = raw ?? "codex";
+  return assertOneOf(value, [...AGENT_BACKENDS], "provider backend") as AgentBackend;
 }
 
-/** Snapshots the runner config a run used so `resume` can reuse it (see `RunnerConfig`). */
-function resolveRunnerConfig(flags: RunFlags): RunnerConfig {
-  const config: RunnerConfig = { backend: resolveBackend(flags.backend) };
-  if (flags.model) config.model = flags.model;
-  if (config.backend === "gemini") {
-    const command = flags["gemini-command"] ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND;
-    if (command) config.geminiCommand = command;
+/** Snapshots the provider config + run default a run used so `resume` reloads the same routing. */
+function resolveRunnerConfig(flags: RunFlags, loaded?: LoadedProviderConfig): RunnerConfig {
+  const config: RunnerConfig = {};
+  if (loaded) {
+    config.configPath = loaded.path;
+    config.configHash = loaded.hash;
   }
-  if (config.backend === "pi") {
-    const command = flags["pi-command"] ?? process.env.CODEX_WORKFLOW_PI_COMMAND;
-    if (command) config.piCommand = command;
-    if (flags.provider) config.provider = flags.provider;
-    if (flags["base-url"]) config.baseUrl = flags["base-url"];
-    if (flags.thinking) config.thinking = flags.thinking;
-    if (flags["pi-api"]) config.piApi = flags["pi-api"];
-    if (flags.tools) config.tools = flags.tools;
-    if (flags["exclude-tools"]) config.excludeTools = flags["exclude-tools"];
-    if (flags["no-tools"]) config.noTools = true;
-    // The API key is intentionally NOT persisted; resume reads it from --api-key or the provider env var.
-  }
+  if (flags.provider) config.defaultProvider = flags.provider;
   return config;
 }
 

@@ -12,6 +12,7 @@ import type {
   WorkflowResolver,
   WorkflowRunOptions,
   WorkflowRunResult,
+  WorkflowRunnerResolver,
 } from "./types.js";
 
 export interface WorkflowInput {
@@ -46,7 +47,7 @@ export interface WorkflowOutput<T = unknown> {
 export type WorkflowSourceKind = "inline" | "named" | "scriptPath";
 
 export interface WorkflowToolOptions extends Omit<WorkflowRunOptions, "args" | "runId" | "runner"> {
-  runner: WorkflowAgentRunner;
+  runner: WorkflowAgentRunner | WorkflowRunnerResolver;
   registry?: WorkflowRegistry;
   persistDir?: string;
 }

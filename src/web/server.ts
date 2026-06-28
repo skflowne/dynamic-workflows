@@ -620,12 +620,12 @@ function tokenSampleFromSession(
   };
 }
 
-function agentBackend(record: RunRecord, entry: WorkflowJournalEntry): string {
-  return entry.backend ?? record.runner?.backend ?? "codex";
+function agentBackend(_record: RunRecord, entry: WorkflowJournalEntry): string {
+  return entry.backend ?? "codex";
 }
 
-function modelForAgent(record: RunRecord, entry: WorkflowJournalEntry, meta: CodexSessionMeta): string {
-  return meta.model ?? entry.options.model ?? record.runner?.model ?? "default";
+function modelForAgent(_record: RunRecord, entry: WorkflowJournalEntry, meta: CodexSessionMeta): string {
+  return meta.model ?? entry.options.model ?? "default";
 }
 
 function hasTokenUsage(usage: CodexSessionUsage): boolean {

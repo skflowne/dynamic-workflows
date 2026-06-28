@@ -20,7 +20,7 @@ export function buildSubagentPrompt(call: WorkflowAgentCall, options: SubagentPr
     call.options.phase ? `Workflow phase: ${call.options.phase}` : undefined,
     call.options.label ? `Task label: ${call.options.label}` : undefined,
     call.options.agentType
-      ? `Requested Claude-style agentType label: ${call.options.agentType}. ${options.backendName} does not load Claude's built-in agent definitions; use this as role/task context only.`
+      ? `Act as the "${call.options.agentType}" subagent: adopt the role, expertise, and working conventions that this agent type implies, and apply them throughout the task below.`
       : undefined,
     call.options.isolation && !options.inWorktree
       ? `Requested isolation: ${call.options.isolation} (not available here — work in the current directory)`

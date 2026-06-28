@@ -8,11 +8,13 @@ progress, and the complete agent result behind each step.
 A workflow is an open TypeScript/JavaScript script with a `meta` block and top-level `await`. The
 orchestration primitives — `agent()`, `parallel()`, `pipeline()`, `workflow()`, `phase()`, `log()`,
 `args`, `budget` — are injected by the runtime. Each `agent()` call runs as an independent backend
-session: a Codex thread by default, a fresh Gemini CLI process with `--backend gemini`, or a fresh pi
-process with `--backend pi`. The script body itself executes unrestricted under **Bun**.
+session — a Codex thread, a fresh Gemini CLI process, or a fresh pi process — chosen by a
+[**provider config**](#provider-config): a single run can route different calls to different
+backends/models. The script body itself executes unrestricted under **Bun**.
 
 ```bash
-codex-workflow run examples/deep-research.js --args '"what changed in the API?"'   # auto-starts the viewer
+codex-workflow run examples/deep-research.js --config examples/codex-workflow.config.ts \
+  --args '"what changed in the API?"'   # auto-starts the viewer
 ```
 
 The CLI binary is named `codex-workflow`.
@@ -24,19 +26,20 @@ the same authoring model to Codex users as a standalone CLI: the same script sha
 but the subagents can run through Codex using your local `codex login` credentials, through Gemini
 CLI using your local Gemini CLI authentication, or through **pi** — a full agentic harness (file +
 shell tools) that you can point at any OpenAI/Anthropic-compatible API (OpenAI, DeepSeek, vLLM,
-Ollama, LiteLLM, …) via `--base-url`.
+Ollama, LiteLLM, …) via a provider's `baseUrl`.
 
 ## Requirements
 
 - **Node 20+** (uses `node:util` `parseArgs`, `AbortSignal.any`).
 - **[Bun](https://bun.sh)** — workflow scripts execute in a Bun child process.
-- **[Codex CLI](https://github.com/openai/codex)** authenticated via `codex login` (the SDK reuses
-  `~/.codex/auth.json`) for the default `codex` backend.
-- **Gemini CLI** for `--backend gemini`.
-- **[pi](https://pi.dev)** (`npm i -g @earendil-works/pi-coding-agent`) for `--backend pi`; supply
-  credentials via a provider env var (e.g. `OPENAI_API_KEY`), `--api-key`, or `--base-url` + `--api-key`
-  for a custom OpenAI/Anthropic-compatible endpoint.
-- Only one real agent backend is needed for `run`; none is needed for `validate`/`list`.
+- A **[provider config](#provider-config)** for every `run` (`validate`/`list` need none), plus the CLI
+  for each backend the config uses:
+  - **[Codex CLI](https://github.com/openai/codex)** authenticated via `codex login` (the SDK reuses
+    `~/.codex/auth.json`) — for `codex` providers.
+  - **Gemini CLI** — for `gemini` providers.
+  - **[pi](https://pi.dev)** (`npm i -g @earendil-works/pi-coding-agent`) — for `pi` providers;
+    credentials come from a provider env var (e.g. `OPENAI_API_KEY`) or, for a custom `baseUrl`, the
+    provider's `apiKeyEnv`.
 
 ## Install
 
@@ -62,7 +65,7 @@ codex-workflow serve [--port N] [--open]   Start the local web viewer for runs
 codex-workflow validate <file> [--json]    Parse & validate a workflow (no tokens used)
 codex-workflow runs [--json]               List recorded run history
 codex-workflow show <runId> [--json]       Show a recorded run
-codex-workflow doctor                      Check Bun, selected agent backend, and the viewer
+codex-workflow doctor                      Check Bun, the provider config, its backends, and the viewer
 ```
 
 `run` takes a workflow file path (absolute or relative) or a bare registered name. Name lookup scans
@@ -73,69 +76,116 @@ etc.) are treated as paths and report a file-not-found error if missing.
 **and** the original `args` straight from the run record, and reuses every completed `agent()` call
 from that run's journal cache (only failed/unrun agents re-execute). Pressing Ctrl-C during a run
 cancels it cleanly and prints the `resume` command to pick it back up. The run options below also
-apply to `resume` — pass `--args` (or most flags) there to override what was recorded. The **backend**
-(plus `--model` / `--gemini-command`, and the pi backend's `--pi-command` / `--provider` / `--base-url`
-/ `--pi-api` / `--thinking` / `--tools` / `--exclude-tools` / `--no-tools` — but **not** the API key,
-which resume re-reads from `--api-key` or the provider env var) is inherited from the record when
-omitted; an explicit `--backend` that conflicts with the recorded one is refused, since the journal
-cache is not backend-aware and resuming under a different backend would silently mix results.
+apply to `resume` — pass `--args` (or most flags) there to override what was recorded. The provider
+config (`--config`) and run-level default (`--provider`) are inherited from the record when omitted, so
+the re-run agents route exactly as before; if the config file has changed since, `resume` warns and the
+re-run agents use the new mapping (cached agents are unaffected).
 
 Run options:
+
+The CLI selects and orchestrates; backends/models/tuning live in the [provider config](#provider-config).
 
 | Flag | Meaning |
 | --- | --- |
 | `--args <json\|@file.json>` | Value exposed to the script as `args` |
-| `--backend <codex\|gemini\|pi>` | Agent backend (default: `codex`; can also use `CODEX_WORKFLOW_BACKEND`) |
-| `--model <model>` | Model for every `agent()` call on the selected built-in backend |
+| `--config <path>` | Provider config file; auto-discovers `codex-workflow.config.{ts,mts,js,mjs}` when omitted |
+| `--provider <name>` | Run-level default provider from the config (per-agent: `agent({provider})`) |
 | `--concurrency <n>` | Max concurrent agents (capped at 16) |
 | `--budget <tokens>` | Token budget (estimate) shared across the run |
 | `--max-agents <n>` | Hard cap on total `agent()` calls (default 1000) |
+| `--agent-retries <n>` | Retries per agent on transient failure (default 2) |
+| `--agent-timeout <ms>` | Per-agent total-duration timeout (`0` disables; default 900000) |
 | `--cwd <dir>` | Working directory for agents |
-| `--sandbox <mode>` | Codex only: `read-only` \| `workspace-write` \| `danger-full-access` |
-| `--approval <policy>` | Codex only: `never` \| `on-request` \| `on-failure` \| `untrusted` |
-| `--reasoning <effort>` | Codex only: `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
-| `--provider <name>` | pi only: backend provider (e.g. `openai`, `anthropic`, `deepseek`) |
-| `--base-url <url>` | pi only: custom OpenAI/Anthropic-compatible endpoint (requires `--model`) |
-| `--api-key <key>` | pi only: API key (or set the provider's env var, e.g. `OPENAI_API_KEY`) |
-| `--pi-api <shape>` | pi only: `openai-completions` (default) \| `openai-responses` \| `anthropic-messages` \| `google-generative-ai` |
-| `--thinking <level>` | pi only: `off` \| `minimal` \| `low` \| `medium` \| `high` \| `xhigh` |
-| `--tools` / `--exclude-tools <list>` | pi only: comma-separated tool allowlist / denylist |
-| `--no-tools` | pi only: disable all tools (a pure text turn) |
 | `--bun <path>` | Path to the Bun binary |
-| `--gemini-command <path>` | Gemini CLI executable for `--backend gemini` (or `CODEX_WORKFLOW_GEMINI_COMMAND`) |
-| `--pi-command <path>` | pi executable for `--backend pi` (or `CODEX_WORKFLOW_PI_COMMAND`) |
 | `--idle-timeout <ms>` | Bun child idle watchdog in milliseconds (`0` disables; default 300000) |
 | `--json` | Machine-readable output to stdout (suppresses progress) |
 | `--quiet` / `--no-progress` | Reduce / plainify progress output |
 
-For the Codex backend, web search + network access are **always enabled** for agents. The pi backend
-runs with its full built-in tool set (read/bash/edit/write/grep/find/ls) plus `--approve` by default;
-narrow it with `--tools` / `--exclude-tools` / `--no-tools`. For a custom `--base-url`, the runner
-generates a pi `models.json` describing the endpoint and injects the API key via env (never written to
-disk); omit `--api-key` for keyless endpoints (Ollama, vLLM, …) and a placeholder is sent instead. pi
+By default Codex providers have web search + network access on (a provider can opt out with
+`webSearch`/`networkAccess`). The pi backend runs with its full built-in tool set
+(read/bash/edit/write/grep/find/ls) plus `approve` by default; narrow it with a provider's
+`tools` / `excludeTools` / `noTools`. For a provider with a custom `baseUrl`, the runner generates a pi
+`models.json` describing the endpoint and injects the key (from `apiKeyEnv`) via env (never written to
+disk); for keyless endpoints (Ollama, vLLM, …) omit `apiKeyEnv` and a placeholder is sent instead. pi
 exits 0 even on a model error, so failures are detected from the turn's stop reason.
 
 Run history, the per-agent journal, and session links are recorded in a **global** data dir,
 `~/.codex-workflow/` (override with `CODEX_WORKFLOW_HOME`), so runs from every project are shared by
 one store and one viewer.
 
+### Provider config
+
+A provider config lets a **single run** route different `agent()` calls to different backends and
+models. It is a TS/JS file — `codex-workflow.config.{ts,mts,js,mjs}`, auto-discovered in the project
+directory then the global data dir, or passed with `--config <path>` — whose default export names a
+set of providers (each = a backend + model + endpoint + credential env var):
+
+```ts
+// codex-workflow.config.ts
+export default {
+  providers: {
+    'codex-default': { backend: 'codex', model: 'gpt-5-codex', reasoning: 'high' },
+
+    // A terse, offline classifier.
+    'codex-fast': {
+      backend: 'codex', model: 'gpt-5-codex', reasoning: 'low',
+      baseInstructions: 'Answer tersely.', webSearch: false, networkAccess: false,
+    },
+
+    // Claude via the pi backend on an Anthropic-compatible endpoint.
+    'claude-smart': {
+      backend: 'pi',
+      baseUrl: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
+      api: 'anthropic-messages', model: 'claude-opus-4-8',
+      models: ['claude-opus-latest'],   // extra ids that route here via agent({model})
+      apiKeyEnv: 'ANTHROPIC_API_KEY',    // env var NAME — the key is never written to disk
+      thinking: 'high', contextFiles: true,
+    },
+
+    'gemini-pro': { backend: 'gemini', model: 'gemini-2.5-pro', args: ['--verbosity', 'low'] },
+  },
+  default: 'codex-default',   // used when an agent specifies neither a provider nor a routing model
+}
+```
+
+A call resolves a runner in this order:
+
+1. `agent({ provider: 'claude-smart' })` — the named provider.
+2. `agent({ model: 'gemini-2.5-pro' })` — the provider declaring that model id (the model is sent to
+   the backend). An id served by several providers is ambiguous unless `default` is one of them; an
+   unknown id falls through to the default.
+3. `--provider <name>` — the run-level default.
+4. `config.default`.
+
+A call that resolves to none of these (no provider, an unrecognized model, no `--provider`, no
+`default`) is an error. Provider/model are part of each agent's journal cache key, so the same prompt
+under two providers is two cache entries and `resume` stays correct. A `ProviderDef` carries every
+backend knob beyond `backend`:
+
+- **all backends:** `model`, `models`, `agentTimeoutMs`, `baseInstructions`
+- **codex:** `reasoning`, `sandbox`, `approval`, `webSearch`, `networkAccess`, `webSearchMode`
+- **gemini:** `geminiCommand`, `yolo`, `args`
+- **pi:** `thinking`, `tools`, `excludeTools`, `noTools`, `approve`, `contextFiles`, `piProvider`,
+  `baseUrl`, `api`, `apiKeyEnv`, `piCommand`, `args`
+
+`args` is a raw passthrough of extra gemini/pi CLI flags. A pi provider's credentials come from
+`apiKeyEnv` (an env var name read at run time); the key is never written to the config, the run
+record, or the generated `models.json`.
+
 ### Example
 
 ```bash
-# Validate, then run a bundled example without spending tokens:
+# Validate, then run a bundled example without spending tokens (the fake agent needs no config):
 codex-workflow validate examples/hello.js
 CODEX_WORKFLOW_FAKE_AGENT=1 codex-workflow run examples/hello.js --args '{"name":"Ada"}'
 
-# Real run, JSON result piped to jq:
-codex-workflow run examples/hello.js --args '{"name":"Ada"}' --json | jq .result
+# Real run against the bundled example config (routes to its `default` provider):
+codex-workflow run examples/hello.js --config examples/codex-workflow.config.ts \
+  --args '{"name":"Ada"}' --json | jq .result
 
-# Real Gemini CLI run:
-codex-workflow run examples/hello.js --backend gemini --model gemini-3.5-flash --args '{"name":"Ada"}'
-
-# Real pi run against a custom OpenAI-compatible endpoint (e.g. DeepSeek):
-codex-workflow run examples/hello.js --backend pi \
-  --base-url https://api.deepseek.com --api-key "$DEEPSEEK_API_KEY" --model deepseek-v4-flash \
-  --args '{"name":"Ada"}'
+# Pick a specific provider from the config as the run default, or route per-agent in the script
+# with agent({ provider: 'gemini-pro' }) / agent({ model: 'gemini-2.5-pro' }):
+codex-workflow run examples/hello.js --config examples/codex-workflow.config.ts --provider gemini-pro
 ```
 
 `examples/nested-demo.js` demonstrates the `workflow()` nesting primitive (nesting by path; registered
@@ -198,16 +248,17 @@ const findings = await pipeline(
 return { findings: findings.flat().filter(Boolean) }
 ```
 
-- `agent(prompt, opts?)` — spawn one subagent on the selected backend. Options: `label`, `phase`,
-  `schema` (JSON Schema → validated structured output), `model`, `agentType`, `isolation:
-  'worktree'` (runs in a fresh detached git worktree). Built-in Codex/Gemini/pi runners intentionally
-  ignore workflow-authored `model` values (`agent({ model })` and `meta.phases[].model`) so Claude
-  workflows with hard-coded model names remain portable; use CLI/library `--model` / runner options
-  to choose the backend model. `agentType` is prompt context only; the backends do not load Claude's
-  built-in agent definitions or tool bundles. Without a schema it returns the final text; with a
-  schema it returns the validated object. Neither Gemini CLI nor pi receives a native JSON schema, so
-  schema correctness is enforced by the workflow runtime and failed validation is retried like any
-  other agent failure.
+- `agent(prompt, opts?)` — spawn one subagent. Options: `label`, `phase`, `schema` (JSON Schema →
+  validated structured output), `provider`, `model`, `agentType`, `isolation: 'worktree'` (runs in a
+  fresh detached git worktree). `provider` selects a configured provider and `model` routes to the
+  provider declaring that model id (see [Provider config](#provider-config)); a `model` no provider
+  declares is ignored (the call falls through to `--provider`/`config.default`), so Claude workflows with
+  hard-coded model names stay portable. `agentType` is injected into the
+  subagent prompt as a role directive — the model adopts that role — but the backends do not load
+  Claude's built-in agent definitions or per-agent tool bundles. Without a schema it returns the final
+  text; with a schema it returns the validated object. Neither Gemini CLI nor pi receives a native JSON
+  schema, so schema correctness is enforced by the workflow runtime and failed validation is retried
+  like any other agent failure.
 - `parallel(thunks)` — run `() => …` thunks concurrently; a thrown thunk resolves to `null`.
 - `pipeline(items, stage1, stage2, …)` — run each item through all stages independently (no barrier);
   stages receive `(prevResult, originalItem, index)`; a throwing stage drops the item to `null`.
@@ -282,7 +333,7 @@ codex-workflow run
             -> JSONL IPC routes agent()/workflow()/phase()/log() back to the parent
                  -> CodexSdkAgentRunner  (real Codex threads)
                  -> GeminiCliAgentRunner (real Gemini CLI processes)
-                 -> PiCliAgentRunner     (real pi processes; OpenAI/Anthropic-compatible via --base-url)
+                 -> PiCliAgentRunner     (real pi processes; OpenAI/Anthropic-compatible via a provider's baseUrl)
                  -> ScriptedAgentRunner  (deterministic tests)
        -> FileRunStore records run history -> `runs` / `show`
 ```
@@ -311,5 +362,5 @@ stubbed runner. (Override the path with `DEEP_RESEARCH_WORKFLOW_PATH`.)
 
 - MCP server / in-Codex tool registration (this is a standalone CLI by design).
 - Remote/cloud workflows; a long-running background daemon.
-- Claude built-in agent definitions/tool bundles behind `agentType`; selected backends receive
-  `agentType` as prompt context only.
+- Claude built-in agent **tool bundles** behind `agentType` — the backends receive `agentType` as a
+  prompt role directive (the model adopts the role) but cannot load a per-agent tool set.

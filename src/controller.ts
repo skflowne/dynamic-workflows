@@ -3,7 +3,7 @@ import path from "node:path";
 import { FileWorkflowJournal } from "./journal.js";
 import { CodexSdkAgentRunner, type CodexSdkAgentRunnerOptions } from "./runners/codex-sdk.js";
 import { WorkflowTaskManager, type WorkflowLaunchOutput, type WorkflowTask } from "./task-manager.js";
-import type { WorkflowAgentRunner, WorkflowJournal } from "./types.js";
+import type { WorkflowAgentRunner, WorkflowJournal, WorkflowRunnerResolver } from "./types.js";
 import {
   runWorkflowTool,
   WorkflowRegistry,
@@ -22,7 +22,7 @@ type WorkflowControllerRunOptions = Omit<
 export interface WorkflowControllerOptions extends WorkflowControllerRunOptions {
   cwd?: string;
   homeDir?: string;
-  runner?: WorkflowAgentRunner;
+  runner?: WorkflowAgentRunner | WorkflowRunnerResolver;
   codex?: CodexSdkAgentRunnerOptions;
   registry?: WorkflowRegistry;
   taskManager?: WorkflowTaskManager;
@@ -36,7 +36,7 @@ export class WorkflowController {
   readonly cwd: string;
   readonly registry: WorkflowRegistry;
   readonly taskManager: WorkflowTaskManager;
-  readonly runner: WorkflowAgentRunner;
+  readonly runner: WorkflowAgentRunner | WorkflowRunnerResolver;
   readonly journal: WorkflowJournal;
   readonly persistDir: string;
   private readonly runOptions: WorkflowControllerRunOptions;

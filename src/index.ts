@@ -9,6 +9,16 @@ export {
 export { defaultWorkflowDirs, WorkflowController } from "./controller.js";
 export type { WorkflowControllerOptions } from "./controller.js";
 export { parseWorkflowScript } from "./parser.js";
+export {
+  buildModelIndex,
+  discoverProviderConfig,
+  loadProviderConfig,
+  resolveProviderName,
+  validateProvidersConfig,
+} from "./providers/config.js";
+export type { LoadedProviderConfig, ProviderBackend, ProviderDef, ProvidersConfig } from "./providers/config.js";
+export { buildRunnerResolver } from "./providers/registry.js";
+export type { ProviderRunnerFactories, RunnerResolverOptions } from "./providers/registry.js";
 export { CodexSdkAgentRunner } from "./runners/codex-sdk.js";
 export type { CodexSdkAgentRunnerOptions } from "./runners/codex-sdk.js";
 export { GeminiCliAgentRunner } from "./runners/gemini-cli.js";

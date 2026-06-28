@@ -25,7 +25,7 @@ export interface CodexSdkAgentRunnerOptions {
 /**
  * Runs each workflow `agent()` call as an independent Codex thread via `@openai/codex-sdk`.
  * Honors the Claude-style agent options: `schema` (StructuredOutput), `label`/`phase` (prompt
- * context), `agentType` as prompt context, and `isolation: 'worktree'` (a fresh detached git
+ * context), `agentType` as a role directive in the prompt, and `isolation: 'worktree'` (a fresh detached git
  * worktree). In-script `model` values are intentionally ignored; select the Codex model at the
  * runner/CLI layer instead so Claude workflows with hard-coded model names remain portable.
  */

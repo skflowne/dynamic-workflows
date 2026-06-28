@@ -36,6 +36,12 @@ export interface WorkflowAgentOptions {
   phase?: string;
   schema?: JsonSchema;
   model?: string;
+  /**
+   * Selects which configured provider (or alias) handles this agent — resolved against the provider
+   * config (`--config`). When omitted, `model` may route to a provider; otherwise the run default /
+   * anonymous backend is used. See {@link WorkflowRunnerResolver}.
+   */
+  provider?: string;
   isolation?: "worktree" | "remote" | string;
   agentType?: string;
 }
@@ -79,6 +85,14 @@ export interface AgentFailure {
 export interface WorkflowAgentRunner {
   run(call: WorkflowAgentCall, signal?: AbortSignal, onMeta?: (meta: WorkflowAgentMeta) => void): Promise<unknown>;
 }
+
+/**
+ * Picks the {@link WorkflowAgentRunner} for a single `agent()` call from its (normalized) options —
+ * the hook behind per-agent provider/model routing. Called once per uncached agent (after the journal
+ * cache check), so a thrown error (unknown provider, ambiguous model) hard-fails the run rather than
+ * becoming a retryable `null`. A plain runner is accepted anywhere this is, and wrapped as `() => runner`.
+ */
+export type WorkflowRunnerResolver = (options: WorkflowAgentOptions) => WorkflowAgentRunner;
 
 /** A reference to another workflow, as accepted by the in-script `workflow()` primitive. */
 export type WorkflowRef = string | { scriptPath: string };
@@ -126,7 +140,8 @@ export type WorkflowProgressEvent = WorkflowProgressAgent | WorkflowProgressPhas
 export interface WorkflowRunOptions {
   args?: unknown;
   cwd?: string;
-  runner: WorkflowAgentRunner;
+  /** A single runner, or a per-agent {@link WorkflowRunnerResolver} for provider/model routing. */
+  runner: WorkflowAgentRunner | WorkflowRunnerResolver;
   runId?: string;
   concurrency?: number;
   maxAgents?: number;
