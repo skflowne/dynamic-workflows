@@ -93,10 +93,14 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 - **`budget.spent()` uses real output tokens** when the runner reports them (Codex
   `turn.usage.output_tokens`; Gemini sums `stats.models.*.tokens.candidates` across **all** models in
   the turn — `candidates` is generation-only, so do NOT fall back to `total`, which includes input),
-  falling back to `estimateTokens` (len/4) only when unavailable. Cache hits cost 0.
+  falling back to `estimateTokens` (len/4) only when unavailable, and counts a failed/retried attempt's
+  tokens too (a rejected turn still burned real tokens), not just the eventual success. Cache hits cost 0.
 - **`WorkflowAgentCapError`** (distinct from `WorkflowBudgetExceededError`) fires at the `maxAgents`
-  cap; its message names the `budget.remaining()`-Infinity loop trap. Note: error **type** is flattened
-  to message-only across the Bun-child IPC boundary — the message text is the observable contract.
+  cap; its message names the `budget.remaining()`-Infinity loop trap. Error **type** is flattened to
+  message-only across the Bun-child IPC boundary, but fatal errors (agent-cap, budget-exceeded, abort,
+  provider-routing) also carry a structured `fatal` flag alongside the message, so `parallel()`/
+  `pipeline()` key off that flag to rethrow (hard-fail) rather than swallow into `null` — message text
+  plus this flag are the observable contract.
 - **Per-agent timeout** (`agentTimeoutMs`, default 15min, `--agent-timeout`, 0 disables) aborts a single
   hung backend turn → surfaces as a retryable failure. This is a total-duration cap; it fills the gap
   left by the workflow idle watchdog being disarmed while awaiting an agent.
@@ -107,8 +111,10 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   and re-exports erased; anonymous `export default` bound to a name).
 - `src/providers/config.ts` — provider-config types (`ProviderDef`/`ProvidersConfig`), discovery
   (`--config` → cwd → global data dir), TS/JS loading (`ts.transpileModule` + data: URL import, no new
-  dep), and validation (per-backend allowed fields, unknown `default`, secret-free content hash). Also
-  `resolveProviderName` (validated lookup) + `buildModelIndex`, reused by the registry.
+  dep), and validation (rejects unknown top-level/provider keys; per-backend allowed fields; enum-valued
+  fields — codex `sandbox`/`approval`/`reasoning`/`webSearchMode`, pi `thinking`; pi's
+  `baseUrl`-requires-`model`; unknown `default`; secret-free content hash). Also `resolveProviderName`
+  (validated lookup) + `buildModelIndex`, reused by the registry.
 - `src/providers/registry.ts` — `buildRunnerResolver(config, factories, {defaultProvider})` → the
   per-agent `WorkflowRunnerResolver`. Backend-agnostic (the CLI injects a `forProvider` factory that
   closes over `buildAgentRunner` + flags); implements the provider → model → default chain (throws if a
@@ -118,35 +124,50 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   `approval`, and reasoning; a raw workflow-authored `agent({model})` reaches the backend only when a
   provider declares that model (otherwise it's a routing hint, see Model resolution).
   `isolation:'worktree'` creates a real detached `git worktree` (preserved for review if the agent left
-  changes, else force-removed). `buildPrompt()` injects the verbatim-return discipline (+ strict-JSON
+  changes — or if the dirty-check itself fails — else force-removed). `buildPrompt()` injects the
+  verbatim-return discipline (+ strict-JSON
   contract when a schema is set). Reports `outputTokens` via `onMeta`; enforces `agentTimeoutMs`.
   **`toStrictJsonSchema()`** rewrites loose Claude schemas into OpenAI-strict form before sending (see gotchas).
 - `src/runners/gemini-cli.ts` — real Gemini runner. Spawns a fresh `gemini` process per `agent()` call
-  using the provider's `model` (`--model <model>`), `-y`, `-o json`, and
-  `-p <prompt>`. Parses the JSON wrapper's `response`, `session_id`, and
-  `stats.models.*.tokens.candidates`; no native schema is sent to Gemini, so the runtime's AJV
-  validation/retry loop is the contract for `agent({schema})`. Supports `isolation:'worktree'`
-  with the same detached git worktree behavior. Selected by a provider's `backend: 'gemini'`; the binary
-  comes from the provider's `geminiCommand` or `CODEX_WORKFLOW_GEMINI_COMMAND`.
-  Raw `spawn` stdout/stderr are bounded (32MB/4MB) so a runaway YOLO turn can't OOM the parent.
+  using the provider's `model` (`--model <model>`), `-y`, `-o json`; the prompt itself is fed on
+  **stdin** with `-p ""` (empty `-p` triggers headless mode) rather than as a CLI arg, so a huge fan-in
+  prompt can't blow past the OS `ARG_MAX` and isn't visible in `ps`. Parses the JSON wrapper's
+  `response`, `session_id`, and `stats.models.*.tokens.candidates`; no native schema is sent to Gemini,
+  so the runtime's AJV validation/retry loop is the contract for `agent({schema})`. Supports
+  `isolation:'worktree'` with the same detached git worktree behavior. Selected by a provider's
+  `backend: 'gemini'`; the binary comes from the provider's `geminiCommand` or
+  `CODEX_WORKFLOW_GEMINI_COMMAND`. Spawns via `spawn-process.ts` (see below); stdout/stderr bounded
+  (32MB/4MB) so a runaway YOLO turn can't OOM the parent.
 - `src/runners/pi-cli.ts` — real pi runner (`@earendil-works/pi-coding-agent`, a full agentic harness:
   read/bash/edit/write/grep/find/ls tools). Spawns `pi -p --mode json --no-context-files [--approve]
   [--tools …] --provider/--model/--session-dir … "<prompt>"` per `agent()`. Parses pi's NDJSON event
   stream: session id from the first `{type:"session"}`, the **last assistant `message_end`** text-blocks
   as the result, and summed `usage.output` across assistant turns for `outputTokens`. **pi exits 0 even
   when the model turn errored — success/failure is decided by the last assistant message's `stopReason`
-  (`"error"` ⇒ throw a retryable failure), NOT the exit code.** No native schema flag, so the runtime's
-  AJV loop is the `agent({schema})` contract (prompt-embedded, like Gemini). `isolation:'worktree'`
-  supported. **Custom OpenAI/Anthropic-compatible endpoint:** pi has no `--base-url` flag, so when
-  `baseUrl` is set the runner writes a synthetic-provider `models.json` under `agentDir`
-  (`PI_CODING_AGENT_DIR`) and points pi at it (`--provider custom`); the API key is injected via env
-  (`CODEX_WORKFLOW_PI_API_KEY`, referenced as `$VAR` in models.json) and **never written to disk** —
-  without an apiKey the config gets a literal `"dummy"` (pi errors on unset env refs; keyless endpoints
-  like Ollama accept anything). Selected by a provider's `backend: 'pi'`; the binary comes from the
-  provider's `piCommand` or `CODEX_WORKFLOW_PI_COMMAND`. stdout/stderr bounded (64MB/4MB).
+  (`"error"` ⇒ throw a retryable failure), NOT the exit code.** A failed turn still reports its
+  `sessionId`/`outputTokens` via `onMeta` *before* throwing, so a failed agent's partial usage/session
+  linkage isn't lost. No native schema flag, so the runtime's AJV loop is the `agent({schema})` contract
+  (prompt-embedded, like Gemini). `isolation:'worktree'` supported. **Custom OpenAI/Anthropic-compatible
+  endpoint:** pi has no `--base-url` flag, so when `baseUrl` is set the runner writes a synthetic-provider
+  `models.json` under a per-config **subdirectory** of `agentDir` named `custom-<sha256(baseUrl,api,model)
+  [0:16]>` (`PI_CODING_AGENT_DIR` points at that subdirectory — avoids two differently-configured custom
+  providers colliding on one `models.json`) and points pi at it (`--provider custom`); the API key is
+  injected via env (`CODEX_WORKFLOW_PI_API_KEY`, referenced as `$VAR` in models.json) and **never written
+  to disk** — without an apiKey the config gets a literal `"dummy"` (pi errors on unset env refs; keyless
+  endpoints like Ollama accept anything). Selected by a provider's `backend: 'pi'`; the binary comes from
+  the provider's `piCommand` or `CODEX_WORKFLOW_PI_COMMAND`. Spawns via `spawn-process.ts`; stdout/stderr
+  bounded (64MB/4MB); an argv-too-large spawn error (`E2BIG`, from a huge prompt as a positional arg) is
+  caught and rethrown with a clear message.
+- `src/runners/spawn-process.ts` — shared child-process plumbing for the Gemini and pi runners: decodes
+  stdout/stderr via `StringDecoder` (keeps multi-byte UTF-8 intact across chunk boundaries) up to their
+  byte ceilings, and only **settles on the child's `close` event, never `exit`** (which can fire before
+  trailing stdout is delivered and would truncate the result). Abort / timeout / overflow send SIGTERM,
+  wait a 2s grace period, then escalate to SIGKILL.
 - `src/runners/prompt.ts` — shared subagent prompt discipline used by the Codex, Gemini, and pi runners.
 - `src/runners/worktree.ts` — shared detached-`git worktree` lifecycle (create + dirty-aware
-  preserve/remove cleanup) used by all CLI runners.
+  preserve/remove cleanup) used by all CLI runners. The dirty check (`git status --porcelain`) runs with
+  a 64MB `maxBuffer`; if that check itself fails, the worktree is conservatively **preserved** (not
+  removed) rather than risk destroying output.
 - `src/runners/turn-control.ts` — shared per-agent timeout + run/timeout abort-signal combination
   (leak-free listener cleanup) + the canonical `agent exceeded agentTimeoutMs (...)` error message,
   used by all runners.
@@ -154,7 +175,9 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 - `src/paths.ts` — resolves the **global data dir** (`~/.codex-workflow`, override `CODEX_WORKFLOW_HOME`)
   holding `runs/`, `journal/`, `links/`. Shared across projects; the CLI passes these into
   the controller/store/server (`cwd` stays the project dir — where agents run & workflows are discovered).
-- `src/journal.ts` — per-agent result cache keyed by `{prompt, options, runId}` hash → enables
+- `src/journal.ts` — per-agent result cache keyed by `{prompt, options, runId}` hash (`options` excludes
+  an AUTO-generated `label`, which embeds a nondeterministic arrival-order index — a user-set label still
+  counts; this changed the key shape, so journals written before this change won't cache-hit) → enables
   `resume`. Files at `~/.codex-workflow/journal/<runId>/<hash>.json` (prompt + options + result + sessionId).
 - `src/run-store.ts` — run history at `~/.codex-workflow/runs/<runId>.json` (incl. `args`/`result`) → powers `runs`/`show`.
 - `src/workflow-tool.ts` — Claude-compatible `{script|name|scriptPath|resumeFromRunId}` input shape,
@@ -172,10 +195,15 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   `RunFlags` so the per-backend builders consume it — and read `apiKeyEnv` from `process.env` here,
   in-memory only), and `buildAgentRunnerResolver` (wrap `buildRunnerResolver` with a `forProvider` factory).
   `run` accepts a workflow file path or a bare registered name; path-like missing targets report file
-  not found rather than falling through to name lookup. `run` and `resume` share `executeRun()`
-  (which validates `--agent-timeout` up front):
+  not found rather than falling through to name lookup. `run` and `resume` share `executeRun()`, which
+  validates every numeric run flag up front (`--concurrency`/`--budget`/`--max-agents`/`--agent-retries`/
+  `--agent-timeout`/`--idle-timeout`; `serve`'s `--port` is validated separately in `serveCommand`; all of
+  them go through `preprocessNegativeNumericArgs()` in `src/cli.ts` so a negative value like `--budget -5`
+  doesn't get misparsed by `node:util`'s `parseArgs`) — a bad value exits 2 as a usage error before any
+  run record is persisted:
   `resume <runId>` reconstructs the input (script path / name + `args`) from the run record and reuses
-  the journal cache; Ctrl-C aborts the in-flight run, marks it `cancelled`, and prints the `resume` hint.
+  the journal cache, persisting a `"running"`-status record for the duration of the re-run (like a fresh
+  `run`); Ctrl-C aborts the in-flight run, marks it `cancelled`, and prints the `resume` hint.
   The record persists only the routing it needs (`RunRecord.runner`:
   `configPath`/`configHash`/`defaultProvider` — no backend/model/secrets); `resume` reloads the recorded
   config (warning if its hash drifted) and re-selects the same default. The CLI is selection-only:
@@ -186,9 +214,15 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 - `src/web/` + `web-src/` + `web/` — **local web viewer** (zero-dep Node `http` server,
   bundled React/TypeScript SPA, claude.ai-styled). `web-src/` is the strict TS frontend source;
   `npm run build:web` runs `tsc -p tsconfig.web.json` and Vite, emitting static assets into `web/`.
-  `server.ts` serves a JSON API (`/api/runs`, `/api/runs/:id` → run-aggregator view, `…/agents/:key`
-  → journal entry, `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`),
-  and exposes an in-process `broadcast(event)` for liveness. `run-aggregator.ts` groups journal entries
+  `server.ts` serves a JSON API (`/api/runs` — a summary projection only, no `result`/`logs`/`args`/
+  `failures`; `/api/runs/:id` → the full run-aggregator view, `…/agents/:key` → journal entry,
+  `…/agents/:key/session` → parsed Codex trace) + a global SSE stream (`/api/stream`), rejects any
+  request whose `Host` header isn't a localhost/loopback variant with 403 (DNS-rebinding guard, since
+  the server binds `127.0.0.1` but a browser can still send an arbitrary Host header), and exposes an
+  in-process `broadcast(event)` for liveness (SSE writes are guarded so a dead connection can't throw).
+  Session-parse/link results and journal-entry reads are cached (session parsing keyed by file
+  path+mtime+size); per-run event buffers are dropped a grace period after the run finishes to bound
+  memory on a long-lived viewer process. `run-aggregator.ts` groups journal entries
   into phase buckets; `session-parser.ts` turns a rollout `.jsonl` into a timeline
   (messages/reasoning/web-search/tool calls/usage); `session-linker.ts` (Codex), `gemini-session.ts`
   (Gemini), and `pi-session.ts` (pi — parses pi's `<ts>_<uuid>.jsonl` tree into the same timeline shape;
@@ -215,7 +249,11 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
   `additionalProperties:false` + all keys in `required` on every object. The runner sends a
   strictified copy (`toStrictJsonSchema`), but the runtime validates results against the **original
   (loose)** schema. Optional fields are made nullable in the strict copy and stripped back out before
-  loose-schema validation. When touching schema handling, keep these two separate.
+  loose-schema validation. A schema-valued `additionalProperties` (e.g. `Record<string, T>`) is
+  preserved recursively rather than forced to `false`; a nullable `enum` gets `null` folded into the
+  enum array, and a nullable `const` becomes a nullable `enum`; `$defs`/`definitions`/`patternProperties`
+  are treated as maps of name → subschema and recursed into (not as this node's own `properties`/
+  `required`). When touching schema handling, keep these two separate.
 - **Gemini has no native schema flag in this integration.** The Gemini runner adds the shared
   structured-output prompt instructions, returns text from the JSON wrapper's `response`, and relies
   on `normalizeAgentResult` + AJV for validation/retry.

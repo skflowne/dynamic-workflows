@@ -4,6 +4,7 @@ dist/
 *.tsbuildinfo
 .DS_Store
 .codex-workflow/
+.vscode/
 
 # Local research / reverse-engineering notes — not for publication.
 claude-workflow-research.md

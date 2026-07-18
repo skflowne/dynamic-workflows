@@ -116,12 +116,32 @@ const TARGET = FIRST_IS_LEVEL ? RAW_ARGS.slice(FIRST.length).trim() : RAW_ARGS
 const P = LEVEL_PARAMS[LEVEL]
 
 // Prompt fragments shared with the inline /code-review cells (one source of truth).
-const CORRECTNESS_ANGLES = ${JSON.stringify(isO)}
-const CLEANUP_ANGLES = ${JSON.stringify(rsO)}
-const VERDICT_LADDER = ${JSON.stringify(di8)}
-const VERDICT_LADDER_RECALL = ${JSON.stringify(ci8)}
-const CLEANUP_PRECEDENCE = ${JSON.stringify(ZV_)}
-const SWEEP_GAP_FOCUS = ${JSON.stringify(li8)}
+// Reconstructed literals (the original build-time markers referenced shared prompt
+// constants from the client binary that aren't available here) — kept consistent
+// with the angle/verdict semantics documented above.
+const CORRECTNESS_ANGLES = [
+  { label: "logic-and-edge-cases", text: "Logic errors and edge cases: off-by-one errors, incorrect boundary conditions, mishandled null/undefined/empty inputs, wrong operator precedence or comparison direction." },
+  { label: "concurrency-and-state", text: "Concurrency and shared-state bugs: races, unguarded mutable state, missing awaits, double-execution, stale closures, and incorrect assumptions about ordering or atomicity." },
+  { label: "error-handling", text: "Error handling: swallowed exceptions, unchecked promise rejections, misleading error messages, missing cleanup/rollback on the failure path, and resources leaked when an error short-circuits normal flow." },
+  { label: "security", text: "Security: injection (SQL/shell/path), unsanitized input reaching a sink, secrets or credentials logged or committed, missing authz/authn checks, and unsafe deserialization." },
+  { label: "data-integrity", text: "Data integrity: type coercion bugs, incorrect serialization/deserialization, silent data loss or truncation, and mismatches between a schema/type and the data actually produced or consumed." },
+]
+const CLEANUP_ANGLES = [
+  { label: "reuse", text: "Reuse: near-duplicate logic that should call a shared helper instead of being re-implemented, and existing utilities the diff reinvents." },
+  { label: "simplification", text: "Simplification: unnecessary complexity, dead code, over-abstraction, and control flow that could be flattened or expressed more directly without changing behavior." },
+  { label: "efficiency", text: "Efficiency: avoidable O(n^2)+ patterns, redundant work inside loops, unnecessary re-renders/re-fetches, and needless allocations on hot paths." },
+  { label: "altitude", text: "Altitude: comments or abstractions pitched at the wrong level of detail — either restating the code line-by-line or hiding behavior a reviewer needs to see." },
+]
+const VERDICT_LADDER =
+  "CONFIRMED: you traced the exact inputs/state that trigger the failure scenario and it demonstrably reproduces.\n" +
+  "PLAUSIBLE: the reasoning is sound and the failure scenario is credible, but you could not fully trace or reproduce it from the diff alone.\n" +
+  "REFUTED: the code is correct as written, the failure scenario does not apply, or it is already guarded against elsewhere."
+const VERDICT_LADDER_RECALL =
+  "When genuinely uncertain between PLAUSIBLE and REFUTED, prefer PLAUSIBLE — a false positive costs a reviewer a few seconds, a false negative costs a real bug. Only mark REFUTED when you are confident the finding is wrong."
+const CLEANUP_PRECEDENCE =
+  "\nCleanup findings are secondary to correctness: only surface a cleanup finding if it is clear-cut and worth a reviewer's attention, not a stylistic preference.\n"
+const SWEEP_GAP_FOCUS =
+  "interactions between the changed files (not just each file in isolation), error paths and rare inputs the main pass tends to skip, and any file touched by the diff but not yet reviewed by a finder."
 
 // ─── Schemas ───
 const SCOPE_SCHEMA = {
