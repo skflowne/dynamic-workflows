@@ -50,6 +50,34 @@ test("runWorkflowTool resolves named workflows from registry", async () => {
   assert.deepEqual(output.result, { value: "result:hello named" });
 });
 
+test("runWorkflowTool never overwrites the user's own source file (persists a separate copy)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-src-"));
+  const persist = await mkdtemp(path.join(tmpdir(), "codex-workflow-persist-"));
+  try {
+    const userFile = path.join(dir, "mine.ts");
+    await writeFile(userFile, script, "utf8");
+    const before = await readFile(userFile, "utf8");
+
+    const runner = new ScriptedAgentRunner((call) => `r:${call.prompt}`);
+    const output = await runWorkflowTool(
+      { scriptPath: "mine.ts", args: { name: "keep" } },
+      { runner, cwd: dir, persistDir: persist },
+    );
+
+    // The user's source file is byte-identical after the run — the tool must never write back to it.
+    assert.equal(await readFile(userFile, "utf8"), before);
+    // Provenance: the returned/recorded scriptPath still points at the user's file (the resume source).
+    assert.equal(output.scriptPath, userFile);
+    // A separate immutable snapshot copy lives under persistDir.
+    const snapshot = path.join(persist, `${output.runId}.workflow.js`);
+    assert.equal(await readFile(snapshot, "utf8"), script);
+    assert.deepEqual(output.result, { value: "r:hello keep" });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(persist, { recursive: true, force: true });
+  }
+});
+
 test("runWorkflowTool resolves scriptPath and uses resumeFromRunId as run id", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-path-"));
   try {

@@ -208,9 +208,15 @@ export async function persistWorkflowScript(
 ): Promise<string | undefined> {
   if (!persistDir) return existingPath;
   await mkdir(persistDir, { recursive: true });
-  const scriptPath = existingPath ?? path.join(persistDir, `${runId}.workflow.js`);
-  await writeFile(scriptPath, script, "utf8");
-  return scriptPath;
+  // Always write the snapshot to a run-owned copy under persistDir — NEVER back to `existingPath`.
+  // When `run ./my-workflow.ts` is invoked, resolveWorkflowInput hands the user's own source path back
+  // as `existingPath`; writing to it would clobber the user's file (fails on read-only dirs, churns
+  // mtime/watchers, and can overwrite concurrent edits or library-caller-supplied alternate content).
+  const persistedCopy = path.join(persistDir, `${runId}.workflow.js`);
+  await writeFile(persistedCopy, script, "utf8");
+  // `existingPath` stays read-only provenance: when the run came from a real file, that file is the
+  // resume source (and remains editable for iterate-then-rerun); otherwise the snapshot copy is.
+  return existingPath ?? persistedCopy;
 }
 
 function workflowOutput<T>(

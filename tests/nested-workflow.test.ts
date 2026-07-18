@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { runWorkflow, ScriptedAgentRunner, WorkflowRegistry } from "../src/index.js";
+import type { WorkflowAgentRunner } from "../src/index.js";
 import { buildWorkflowResolver } from "../src/workflow-tool.js";
 
 const CHILD = `export const meta = { name: 'child', description: 'child workflow' }
@@ -88,6 +89,59 @@ return await workflow('child', {})
       ),
     /requires a resolver/,
   );
+});
+
+test("runWorkflow tears down a fire-and-forget nested workflow left in flight (no orphan)", async () => {
+  // The root fires a nested workflow() WITHOUT awaiting it; that nested run's agent blocks until aborted.
+  // A root-side gate agent only resolves once the nested agent has actually started, so the nested Bun
+  // child is provably in flight when the root returns. On teardown the nested promise (tracked in
+  // inFlight) is awaited and the nested child (inheriting ctx.agentSignal) is killed — its blocking agent
+  // is aborted — rather than leaking an orphaned Bun child that re-arms its idle watchdog forever.
+  let nestedAborted = false;
+  let markNestedStarted!: () => void;
+  const nestedStarted = new Promise<void>((resolve) => {
+    markNestedStarted = resolve;
+  });
+
+  const registry = new WorkflowRegistry();
+  registry.register(
+    `export const meta = { name: 'child_hang', description: 'blocks until aborted' }
+return await agent('hang forever', { label: 'hang' })
+`,
+    "built-in",
+  );
+
+  const runner: WorkflowAgentRunner = {
+    run(call, signal) {
+      if (call.prompt === "hang forever") {
+        return new Promise((_resolve, reject) => {
+          markNestedStarted();
+          const onAbort = () => {
+            nestedAborted = true;
+            reject(new Error("aborted"));
+          };
+          if (signal?.aborted) return onAbort();
+          signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      // The root gate: do not let the root finish until the nested agent has started.
+      return nestedStarted.then(() => "go");
+    },
+  };
+
+  const result = await runWorkflow<{ ok: boolean }>(
+    `export const meta = { name: 'ff_nested', description: 'fire and forget nested workflow' }
+workflow('child_hang', {})
+await agent('root gate', { label: 'gate' })
+return { ok: true }
+`,
+    { runner, resolveWorkflow: buildWorkflowResolver(registry), concurrency: 4 },
+  );
+
+  assert.deepEqual(result.result, { ok: true });
+  // The nested agent was in flight and got aborted on teardown (proving the nested child was killed,
+  // not orphaned) — and the run completed instead of hanging on the un-awaited nested workflow.
+  assert.equal(nestedAborted, true);
 });
 
 test("runWorkflow cancels fire-and-forget agents left in flight at finish", async () => {

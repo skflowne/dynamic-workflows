@@ -10,6 +10,8 @@ import {
   ScriptedAgentRunner,
   WorkflowAbortError,
   WorkflowAgentCapError,
+  WorkflowBudgetExceededError,
+  WorkflowInputError,
 } from "../src/index.js";
 import type { WorkflowAgentMeta, WorkflowAgentRunner } from "../src/index.js";
 
@@ -445,4 +447,223 @@ return Promise.all([0, 1, 2].map((n) => agent('p' + n, { label: 'p' + n })))
       ),
     /agent\(\) call cap reached \(2\)[\s\S]*remaining\(\) returns Infinity/,
   );
+});
+
+test("budget counts real tokens burned by failed (validation-rejected) attempts", async () => {
+  // Every turn completes and reports 50 real output tokens, but returns non-JSON so schema validation
+  // rejects it — a completed-but-rejected turn. All three attempts burned tokens; spent must reflect that.
+  const runner: WorkflowAgentRunner = {
+    async run(_call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      onMeta?.({ outputTokens: 50 });
+      return "not json";
+    },
+  };
+
+  const result = await runWorkflow<{ v: unknown; spent: number }>(
+    `export const meta = { name: 'burn_failed', description: 'Failed attempts burn tokens' }
+const v = await agent('x', {
+  label: 'x',
+  schema: { type: 'object', required: ['a'], properties: { a: { type: 'string' } } },
+})
+return { v, spent: budget.spent() }
+`,
+    { runner, agentMaxAttempts: 3 },
+  );
+
+  assert.equal(result.result.v, null);
+  assert.equal(result.failures.length, 1);
+  // 3 attempts x 50 tokens each — not 0 (which is what the old success-only accounting recorded).
+  assert.equal(result.result.spent, 150);
+});
+
+test("a throwing onProgress(completed) does not re-run or re-spend the agent", async () => {
+  let invocations = 0;
+  const runner = new ScriptedAgentRunner(() => {
+    invocations++;
+    return "ok";
+  });
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'progress_throw', description: 'Throwing onProgress' }
+return agent('x', { label: 'x' })
+`,
+    {
+      runner,
+      agentMaxAttempts: 3,
+      onProgress: (event) => {
+        if (event.type === "agent" && event.state === "completed") throw new Error("boom");
+      },
+    },
+  );
+
+  // The callback threw AFTER a successful model turn; C7 makes it best-effort so the agent is not retried.
+  assert.equal(invocations, 1);
+  assert.equal(result.result, "ok");
+  assert.equal(result.failures.length, 0);
+});
+
+test("a failing journal.put does not re-run the agent (best-effort cache write)", async () => {
+  let invocations = 0;
+  const runner = new ScriptedAgentRunner(() => {
+    invocations++;
+    return "ok";
+  });
+  const journal = {
+    get: () => undefined,
+    put: () => {
+      throw new Error("disk full");
+    },
+  };
+
+  const result = await runWorkflow(
+    `export const meta = { name: 'put_throw', description: 'Throwing journal.put' }
+return agent('x', { label: 'x' })
+`,
+    { runner, agentMaxAttempts: 3, journal },
+  );
+
+  assert.equal(invocations, 1);
+  assert.equal(result.result, "ok");
+  assert.equal(result.failures.length, 0);
+});
+
+test("parallel() rethrows a fatal agent-cap error instead of collapsing it to null", async () => {
+  const runner = new ScriptedAgentRunner(async (call) => {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    return call.prompt;
+  });
+
+  // The 3rd agent() hits the cap → a fatal error that must survive the IPC boundary (via the structured
+  // `fatal` flag) and be rethrown by parallel(), hard-failing the run rather than becoming a null item.
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'cap_parallel', description: 'Cap inside parallel' }
+return parallel([0, 1, 2].map((n) => () => agent('p' + n, { label: 'p' + n })))
+`,
+        { runner, concurrency: 1, maxAgents: 2 },
+      ),
+    /agent\(\) call cap reached/,
+  );
+});
+
+test("agent() throws WorkflowBudgetExceededError once the token budget is exhausted", async () => {
+  // In-process, ctx.runAgent throws this dedicated type (src/runtime.ts); once it crosses the
+  // Bun-child IPC boundary the type is flattened to a generic WorkflowInputError, so (like the
+  // agent-cap error) the message text is the real observable contract below.
+  assert.ok(new WorkflowBudgetExceededError("x") instanceof Error);
+
+  // Every turn reports 50 real output tokens; a budget of 40 is exhausted before the first
+  // agent() call even completes its retry loop — the throw happens synchronously in ctx.runAgent,
+  // before any live run, so no runner turn is actually spent here.
+  const runner: WorkflowAgentRunner = {
+    async run(call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      onMeta?.({ outputTokens: 50 });
+      return call.prompt;
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'budget_exhausted', description: 'Budget exhausted throws' }
+const a = await agent('first', { label: 'first' })
+const b = await agent('second', { label: 'second' })
+return { a, b }
+`,
+        { runner, tokenBudget: 40 },
+      ),
+    // Once the error crosses the Bun-child IPC boundary it is flattened to a generic
+    // WorkflowInputError (message-only contract, same as the cap error above); the distinctive
+    // "workflow token budget exhausted" text — which in-process is a WorkflowBudgetExceededError,
+    // see src/runtime.ts's ctx.runAgent — is what's observable here.
+    /workflow token budget exhausted/,
+  );
+});
+
+test("parallel() rethrows a fatal budget-exceeded error instead of collapsing it to null", async () => {
+  const runner: WorkflowAgentRunner = {
+    async run(call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      onMeta?.({ outputTokens: 50 });
+      return call.prompt;
+    },
+  };
+
+  // The lone `await agent('warm', ...)` burns 50 tokens against a 40-token budget, so by the time
+  // parallel() synchronously dispatches its 3 thunks, remainingBudget() is already <= 0 for every
+  // one of them (the budget check in ctx.runAgent runs synchronously before the concurrency limiter,
+  // so gating on `spent` mid-flight inside parallel() itself is not observable — this is the
+  // deterministic way to make the budget check fail for calls issued from inside parallel()).
+  // Like the cap test above, this fatal error must survive the IPC boundary (structured `fatal`
+  // flag) and be rethrown by parallel(), hard-failing the run rather than becoming a null item.
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'budget_parallel', description: 'Budget exceeded inside parallel' }
+await agent('warm', { label: 'warm' })
+return parallel([0, 1, 2].map((n) => () => agent('p' + n, { label: 'p' + n })))
+`,
+        { runner, tokenBudget: 40 },
+      ),
+    /workflow token budget exhausted/,
+  );
+});
+
+test("Bun-child idle watchdog kills a workflow that busy-waits without calling agent()", async () => {
+  // No agent()/workflow() call is ever made, so the child never sends an IPC request and the parent's
+  // idle watchdog (armed whenever the child is not waiting on a parent-handled request) must fire on
+  // its own. The busy-wait uses short setTimeout ticks (not a tight synchronous loop) so the child's
+  // event loop stays responsive enough to be killed and exit cleanly once the parent settles.
+  const runner = new ScriptedAgentRunner(() => "unused");
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'idle_watchdog', description: 'Busy-wait with no agent calls' }
+const start = Date.now()
+while (Date.now() - start < 5000) {
+  await new Promise((resolve) => setTimeout(resolve, 10))
+}
+return 'done'
+`,
+        { runner, workflowIdleTimeoutMs: 300 },
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof WorkflowInputError);
+      assert.match((err as Error).message, /Bun workflow made no progress for 300ms/);
+      return true;
+    },
+  );
+});
+
+test("auto-labeled agents hash stably regardless of run-global arrival index (resume cache)", async () => {
+  const journal = new InMemoryWorkflowJournal();
+  let sharedRuns = 0;
+  const runner = new ScriptedAgentRunner((call) => {
+    if (call.prompt === "shared") sharedRuns++;
+    return `r:${call.prompt}`;
+  });
+
+  // Run 1: 'shared' is the only agent → arrival index 1 → auto label "agent 1".
+  await runWorkflow(
+    `export const meta = { name: 'idx_a', description: 'shared first' }
+return agent('shared')
+`,
+    { runner, journal, runId: "wf_idx" },
+  );
+
+  // Run 2 (same runId + journal): two fillers run first, so 'shared' now has arrival index 3 → auto
+  // label "agent 3". If the auto label were part of the cache key this would MISS and re-run the agent.
+  const second = await runWorkflow(
+    `export const meta = { name: 'idx_b', description: 'shared last' }
+await agent('filler-1')
+await agent('filler-2')
+return agent('shared')
+`,
+    { runner, journal, runId: "wf_idx" },
+  );
+
+  assert.equal(second.result, "r:shared");
+  // 'shared' ran once (run 1); run 2 was a cache hit despite a different arrival index / display label.
+  assert.equal(sharedRuns, 1);
 });
