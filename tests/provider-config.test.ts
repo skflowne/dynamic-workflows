@@ -89,7 +89,7 @@ test("accepts the runner-injectable knobs (baseInstructions/args/web-search/yolo
   const config = validateProvidersConfig(
     {
       providers: {
-        c: { backend: "codex", baseInstructions: "be terse", webSearch: false, networkAccess: false, webSearchMode: "off" },
+        c: { backend: "codex", baseInstructions: "be terse", webSearch: false, networkAccess: false, webSearchMode: "disabled" },
         g: { backend: "gemini", yolo: false, args: ["--foo", "bar"], baseInstructions: "x" },
         p: { backend: "pi", approve: false, contextFiles: true, args: ["--baz"] },
       },
@@ -118,6 +118,49 @@ test("rejects backend-mismatched and wrong-typed knobs", () => {
   );
   assert.throws(() => validateProvidersConfig({ providers: { x: { backend: "codex", webSearch: "yes" } } }, "t"), /field "webSearch" must be a boolean/);
   assert.throws(() => validateProvidersConfig({ providers: { x: { backend: "pi", args: "nope" } } }, "t"), /field "args" must be a string array/);
+});
+
+test("D4: rejects an unknown top-level config key (e.g. a `defualt` typo)", () => {
+  assert.throws(
+    () => validateProvidersConfig({ providers: { a: { backend: "codex" } }, defualt: "a" }, "t"),
+    /unknown top-level field "defualt"/,
+  );
+});
+
+test("D5: rejects bad enum values for codex sandbox/approval/reasoning/webSearchMode at load time", () => {
+  assert.throws(
+    () => validateProvidersConfig({ providers: { x: { backend: "codex", sandbox: "yolo" } } }, "t"),
+    /field "sandbox" must be one of/,
+  );
+  assert.throws(
+    () => validateProvidersConfig({ providers: { x: { backend: "codex", approval: "always" } } }, "t"),
+    /field "approval" must be one of/,
+  );
+  assert.throws(
+    () => validateProvidersConfig({ providers: { x: { backend: "codex", reasoning: "hgih" } } }, "t"),
+    /field "reasoning" must be one of/,
+  );
+  assert.throws(
+    () => validateProvidersConfig({ providers: { x: { backend: "codex", webSearchMode: "always-on" } } }, "t"),
+    /field "webSearchMode" must be one of/,
+  );
+});
+
+test("D5: rejects a bad pi `thinking` value, and a pi `baseUrl` without `model`, at load time", () => {
+  assert.throws(
+    () => validateProvidersConfig({ providers: { x: { backend: "pi", thinking: "hgih" } } }, "t"),
+    /field "thinking" must be one of/,
+  );
+  assert.throws(
+    () => validateProvidersConfig({ providers: { x: { backend: "pi", baseUrl: "http://x", api: "openai-completions" } } }, "t"),
+    /with `baseUrl` requires `model`/,
+  );
+  // Valid once a model is present.
+  const config = validateProvidersConfig(
+    { providers: { x: { backend: "pi", baseUrl: "http://x", model: "m", api: "openai-completions" } } },
+    "t",
+  );
+  assert.equal(config.providers.x?.baseUrl, "http://x");
 });
 
 test("buildModelIndex maps each provider's model and extra models", () => {

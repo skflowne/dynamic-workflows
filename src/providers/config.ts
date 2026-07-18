@@ -75,7 +75,12 @@ export interface LoadedProviderConfig {
 }
 
 const BACKENDS: ProviderBackend[] = ["codex", "gemini", "pi"];
-const PI_API_SHAPES = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
+/** Single source of truth for enum-valued provider-def fields; the CLI imports these instead of redeclaring them. */
+export const PI_API_SHAPES = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
+export const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
+export const APPROVAL_MODES = ["never", "on-request", "on-failure", "untrusted"];
+export const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
+export const WEB_SEARCH_MODES = ["disabled", "cached", "live"];
 const COMMON_FIELDS = ["backend", "model", "models", "agentTimeoutMs", "baseInstructions"];
 const BACKEND_FIELDS: Record<ProviderBackend, string[]> = {
   codex: ["sandbox", "approval", "reasoning", "webSearch", "networkAccess", "webSearchMode"],
@@ -173,6 +178,11 @@ export function validateProvidersConfig(raw: unknown, source: string): Providers
     throw new WorkflowInputError(`${where}: default export must be an object`);
   }
   const obj = raw as Record<string, unknown>;
+  for (const key of Object.keys(obj)) {
+    if (key !== "providers" && key !== "default") {
+      throw new WorkflowInputError(`${where}: unknown top-level field "${key}" (allowed: providers, default)`);
+    }
+  }
   const providersRaw = obj.providers;
   if (typeof providersRaw !== "object" || providersRaw === null || Array.isArray(providersRaw)) {
     throw new WorkflowInputError(`${where}: \`providers\` must be an object of name → definition`);
@@ -240,7 +250,24 @@ function validateProviderDef(name: string, raw: unknown, where: string): Provide
   if (def.api !== undefined && !PI_API_SHAPES.includes(def.api as string)) {
     throw new WorkflowInputError(`${where}: provider "${name}" field "api" must be one of: ${PI_API_SHAPES.join(", ")}`);
   }
+  if (backend === "codex") {
+    assertEnumField(where, name, "sandbox", def.sandbox, SANDBOX_MODES);
+    assertEnumField(where, name, "approval", def.approval, APPROVAL_MODES);
+    assertEnumField(where, name, "reasoning", def.reasoning, REASONING_EFFORTS);
+    assertEnumField(where, name, "webSearchMode", def.webSearchMode, WEB_SEARCH_MODES);
+  } else if (backend === "pi") {
+    assertEnumField(where, name, "thinking", def.thinking, REASONING_EFFORTS);
+    if (def.baseUrl !== undefined && !def.model) {
+      throw new WorkflowInputError(`${where}: provider "${name}" with \`baseUrl\` requires \`model\` (the model id sent to the endpoint)`);
+    }
+  }
   return def as unknown as ProviderDef;
+}
+
+function assertEnumField(where: string, name: string, key: string, value: unknown, allowed: string[]): void {
+  if (value !== undefined && !allowed.includes(value as string)) {
+    throw new WorkflowInputError(`${where}: provider "${name}" field "${key}" must be one of: ${allowed.join(", ")} (got ${JSON.stringify(value)})`);
+  }
 }
 
 /** Validate that `name` is a real provider, returning it. Throws {@link WorkflowInputError} otherwise. */

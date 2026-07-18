@@ -22,8 +22,13 @@ import type {
   WorkflowRunnerResolver,
 } from "../types.js";
 import {
+  APPROVAL_MODES,
   discoverProviderConfig,
   loadProviderConfig,
+  PI_API_SHAPES,
+  REASONING_EFFORTS,
+  SANDBOX_MODES,
+  WEB_SEARCH_MODES,
   type LoadedProviderConfig,
   type ProviderDef,
 } from "../providers/config.js";
@@ -87,12 +92,8 @@ export interface RunFlags {
   "no-web"?: boolean;
 }
 
-const SANDBOX_MODES = ["read-only", "workspace-write", "danger-full-access"];
-const APPROVAL_MODES = ["never", "on-request", "on-failure", "untrusted"];
-const REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
 const AGENT_BACKENDS = ["codex", "gemini", "pi"] as const;
 type AgentBackend = (typeof AGENT_BACKENDS)[number];
-const PI_API_SHAPES = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
 
 /** `codex-workflow run <file>` */
 export async function runCommand(target: string | undefined, flags: RunFlags): Promise<number> {
@@ -152,10 +153,17 @@ export async function resumeCommand(runId: string | undefined, flags: RunFlags):
   // Reload the same provider config and re-select the same default so the re-run agents route
   // identically. The journal cache key embeds each agent's provider/model, so cached agents replay
   // regardless; a drifted config only affects re-run agents (warned at run time).
-  if (flags.config === undefined && record.runner?.configPath !== undefined) flags.config = record.runner.configPath;
+  let configFromRecordPath: string | undefined;
+  if (flags.config === undefined && record.runner?.configPath !== undefined) {
+    flags.config = record.runner.configPath;
+    configFromRecordPath = record.runner.configPath;
+  }
   if (flags.provider === undefined && record.runner?.defaultProvider !== undefined) flags.provider = record.runner.defaultProvider;
 
-  return executeRun(input, runId, cwd, flags, { resumeRecord: record });
+  return executeRun(input, runId, cwd, flags, {
+    resumeRecord: record,
+    ...(configFromRecordPath !== undefined ? { configFromRecordPath } : {}),
+  });
 }
 
 /**
@@ -167,7 +175,7 @@ async function executeRun(
   runId: string,
   cwd: string,
   flags: RunFlags,
-  options: { resumeRecord?: RunRecord } = {},
+  options: { resumeRecord?: RunRecord; configFromRecordPath?: string } = {},
 ): Promise<number> {
   const json = flags.json === true;
   const mode: ProgressMode = json || flags.quiet ? "silent" : flags["no-progress"] ? "plain" : "pretty";
@@ -178,8 +186,13 @@ async function executeRun(
   const dataDir = workflowDataDir();
   let runner: WorkflowAgentRunner | WorkflowRunnerResolver;
   let loadedConfig: LoadedProviderConfig | undefined;
+  let numericOptions: ControllerNumericOptions;
   try {
-    parseAgentTimeoutFlag(flags["agent-timeout"]); // validate up front; throws on a negative value
+    // Validate every numeric/enum-shaped flag up front, before anything is persisted (the run record,
+    // the events file, the viewer) — a usage error here must exit cleanly with no side effects, rather
+    // than surfacing mid-run as an unhandled throw that leaves an orphaned "running" record (see D1).
+    parseAgentTimeoutFlag(flags["agent-timeout"]); // throws on a negative value
+    numericOptions = parseControllerNumericFlags(flags);
     loadedConfig = await loadProviderConfigForRun(cwd, dataDir, flags);
     if (loadedConfig) {
       process.stderr.write(`${dim("▸")} Providers: ${dim(loadedConfig.path)} (${Object.keys(loadedConfig.config.providers).length})\n`);
@@ -190,7 +203,17 @@ async function executeRun(
     }
     runner = buildAgentRunnerResolver(cwd, flags, dataDir, loadedConfig);
   } catch (error) {
-    process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+    const message = error instanceof Error ? error.message : String(error);
+    // A config path inherited from the run record (not typed by the user this invocation) gets a
+    // message that says so, rather than the generic "--config file not found" (which implies --config
+    // was passed here).
+    if (options.configFromRecordPath && message === `--config file not found: ${options.configFromRecordPath}`) {
+      process.stderr.write(
+        `error: provider config recorded for run ${runId} no longer exists at ${options.configFromRecordPath}; pass --config <newpath>\n`,
+      );
+      return 2;
+    }
+    process.stderr.write(`error: ${message}\n`);
     return 2;
   }
   const runsPath = runsDir(dataDir);
@@ -240,7 +263,12 @@ async function executeRun(
       ...(input.scriptPath ? { scriptPath: path.resolve(String(input.scriptPath)) } : {}),
     };
     const protectPriorRecordOnFailure = options.resumeRecord?.status === "completed";
-    if (!options.resumeRecord) await runStore.save(baseRecord);
+    // Always persist a "running" snapshot at start — including on resume — so the on-disk record
+    // reflects reality while the run is live (otherwise a resumed run's record keeps its old terminal
+    // status, and the web server's orphan reaper can delete the live run's events file mid-run). On
+    // failure of a protected resume (see below), the prior terminal record is restored rather than left
+    // stuck at "running".
+    await runStore.save(baseRecord);
 
     // Live-event bus: every progress event is appended to `runs/<id>.events.jsonl` as the single
     // cross-process liveness transport. Any server — this run's in-process viewer AND a standalone
@@ -315,11 +343,7 @@ async function executeRun(
       signal: abort.signal,
       persistDir: runsDir(dataDir),
       journalDir: journalDir(dataDir),
-      ...numericFlag("concurrency", flags.concurrency),
-      ...numericFlag("maxAgents", flags["max-agents"]),
-      ...agentAttemptsFlag(flags["agent-retries"]),
-      ...numericFlag("tokenBudget", flags.budget),
-      ...numericFlag("workflowIdleTimeoutMs", flags["idle-timeout"]),
+      ...numericOptions,
       ...(flags.bun ? { bunPath: flags.bun } : {}),
     });
 
@@ -360,7 +384,9 @@ async function executeRun(
       clearInterruptHandlers();
       renderer.finish();
       if (interrupted || error instanceof WorkflowAbortError) {
-        if (!protectPriorRecordOnFailure) await runStore.save({ ...baseRecord, status: "cancelled", completedAt: Date.now() });
+        await runStore.save(
+          protectPriorRecordOnFailure ? (options.resumeRecord as RunRecord) : { ...baseRecord, status: "cancelled", completedAt: Date.now() },
+        );
         await finishEvents({ type: "run-finished", status: "cancelled" });
         process.stderr.write(`\n${yellow("⊘")} Cancelled ${dim(`(${runId})`)} — partial progress saved.\n`);
         process.stderr.write(`${dim(`  Resume (reuse completed agents): codex-workflow resume ${runId}`)}\n`);
@@ -369,7 +395,9 @@ async function executeRun(
         return 130;
       }
       const message = error instanceof Error ? error.message : String(error);
-      if (!protectPriorRecordOnFailure) await runStore.save({ ...baseRecord, status: "failed", completedAt: Date.now(), error: message });
+      await runStore.save(
+        protectPriorRecordOnFailure ? (options.resumeRecord as RunRecord) : { ...baseRecord, status: "failed", completedAt: Date.now(), error: message },
+      );
       await finishEvents({ type: "run-finished", status: "failed", error: message });
       process.stderr.write(`\nworkflow failed: ${message}\n`);
       await releaseRunLock();
@@ -589,8 +617,12 @@ export async function doctorCommand(flags: RunFlags): Promise<number> {
   const dataDir = workflowDataDir();
   const cwd = path.resolve(flags.cwd ?? process.cwd());
 
-  // Provider config is required for `run`. Validate it and collect the backends it actually uses.
+  // Provider config is required for `run`. Validate it and collect the backends it actually uses —
+  // and the exact gemini/pi command each configured provider resolves to, so the probes below check
+  // what a real run would actually invoke, not just the env-var/default fallback (see D6).
   const usedBackends = new Set<string>();
+  const geminiCommands = new Set<string>();
+  const piCommands = new Set<string>();
   try {
     const configPath = await discoverProviderConfig(cwd, dataDir, flags.config);
     if (!configPath) {
@@ -598,24 +630,41 @@ export async function doctorCommand(flags: RunFlags): Promise<number> {
     } else {
       const { config } = await loadProviderConfig(configPath);
       const names = Object.keys(config.providers);
-      for (const p of Object.values(config.providers)) usedBackends.add(p.backend);
+      for (const p of Object.values(config.providers)) {
+        usedBackends.add(p.backend);
+        if (p.backend === "gemini") geminiCommands.add(p.geminiCommand ?? process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini");
+        if (p.backend === "pi") piCommands.add(p.piCommand ?? process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi");
+      }
       required(true, `provider config (${names.length}): ${dim(configPath)}`);
       process.stdout.write(`    ${dim(`providers: ${names.join(", ")}${config.default ? ` · default: ${config.default}` : ""} · backends: ${[...usedBackends].join(", ")}`)}\n`);
     }
   } catch (error) {
     required(false, "provider config", error instanceof Error ? error.message : String(error));
   }
+  // No config loaded (or it declares no gemini/pi provider): fall back to the env-var/default command
+  // so an anonymous/single-backend setup still gets an informational probe.
+  if (geminiCommands.size === 0) geminiCommands.add(process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini");
+  if (piCommands.size === 0) piCommands.add(process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi");
 
   // Probe each backend CLI; required when the config uses it, otherwise just informational.
   const codex = await tryExec("codex", ["--version"]);
-  const auth = await pathExists(path.join(os.homedir(), ".codex", "auth.json"));
-  const gemini = await tryExec(process.env.CODEX_WORKFLOW_GEMINI_COMMAND ?? "gemini", ["--version"]);
-  const pi = await tryExec(process.env.CODEX_WORKFLOW_PI_COMMAND ?? "pi", ["--version"]);
+  // codex auth also works via an API-key env var (not just `codex login`), so an absent auth.json is
+  // only a hint, never a hard failure on its own.
+  const authFile = await pathExists(path.join(os.homedir(), ".codex", "auth.json"));
+  const codexAuthOk = authFile || Boolean(process.env.OPENAI_API_KEY);
   const check = (used: boolean, good: boolean, label: string, hint: string) => (used ? required(good, label, hint) : optional(good, label, hint));
 
-  check(usedBackends.has("codex"), codex.ok && auth, `Codex CLI + auth${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Install Codex CLI and run `codex login`.");
-  check(usedBackends.has("gemini"), gemini.ok, `Gemini CLI${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, "Install the Gemini CLI, or set CODEX_WORKFLOW_GEMINI_COMMAND.");
-  check(usedBackends.has("pi"), pi.ok, `pi CLI${pi.ok ? ` (${pi.out.trim()})` : ""}`, "Install pi (npm i -g @earendil-works/pi-coding-agent), or set CODEX_WORKFLOW_PI_COMMAND.");
+  check(usedBackends.has("codex"), codex.ok, `Codex CLI${codex.ok ? ` (${codex.out.trim()})` : ""}`, "Install the Codex CLI: https://github.com/openai/codex");
+  optional(codexAuthOk, "Codex auth", "Run `codex login`, or set OPENAI_API_KEY (or your provider's own env-based auth).");
+
+  for (const cmd of geminiCommands) {
+    const gemini = await tryExec(cmd, ["--version"]);
+    check(usedBackends.has("gemini"), gemini.ok, `Gemini CLI (${cmd})${gemini.ok ? ` (${gemini.out.trim()})` : ""}`, `Install the Gemini CLI at "${cmd}", or fix the provider's geminiCommand / CODEX_WORKFLOW_GEMINI_COMMAND.`);
+  }
+  for (const cmd of piCommands) {
+    const pi = await tryExec(cmd, ["--version"]);
+    check(usedBackends.has("pi"), pi.ok, `pi CLI (${cmd})${pi.ok ? ` (${pi.out.trim()})` : ""}`, `Install pi at "${cmd}" (npm i -g @earendil-works/pi-coding-agent), or fix the provider's piCommand / CODEX_WORKFLOW_PI_COMMAND.`);
+  }
 
   process.stdout.write(`${green("✓")} data dir: ${dataDir}\n`);
   process.stdout.write(`${dim("·")} viewer: ${dim("starts in-process per `run` (random port); `codex-workflow serve` browses history")}\n`);
@@ -766,7 +815,7 @@ function buildCodexRunner(cwd: string, flags: RunFlags): WorkflowAgentRunner {
   // Web search + network access default on (a provider config may opt out per provider).
   options.webSearchEnabled = flags.webSearch ?? true;
   options.networkAccessEnabled = flags.networkAccess ?? true;
-  if (flags.webSearchMode) options.webSearchMode = flags.webSearchMode as ThreadOptions["webSearchMode"];
+  if (flags.webSearchMode) options.webSearchMode = assertOneOf(flags.webSearchMode, WEB_SEARCH_MODES, "webSearchMode") as ThreadOptions["webSearchMode"];
   return new CodexSdkAgentRunner(options);
 }
 
@@ -856,19 +905,52 @@ class FakeAgentRunner implements WorkflowAgentRunner {
   }
 }
 
-function numericFlag<K extends string>(key: K, raw: string | undefined): Partial<Record<K, number>> {
-  if (raw === undefined) return {};
-  const value = Number(raw);
-  if (!Number.isFinite(value)) throw new WorkflowInputError(`${key} must be a number, got "${raw}"`);
-  return { [key]: value } as Record<K, number>;
+interface ControllerNumericOptions {
+  concurrency?: number;
+  maxAgents?: number;
+  agentMaxAttempts?: number;
+  tokenBudget?: number;
+  workflowIdleTimeoutMs?: number;
 }
 
-/** `--agent-retries <n>` → agentMaxAttempts = n + 1 (n retries means n+1 total attempts). */
-function agentAttemptsFlag(raw: string | undefined): { agentMaxAttempts?: number } {
-  if (raw === undefined) return {};
-  const retries = Number(raw);
-  if (!Number.isFinite(retries) || retries < 0) throw new WorkflowInputError(`--agent-retries must be a non-negative number, got "${raw}"`);
-  return { agentMaxAttempts: Math.trunc(retries) + 1 };
+/**
+ * Validate + parse every numeric run flag up front (see D1: these used to be evaluated lazily inside
+ * the `WorkflowController` constructor, after the run record was saved and the events file opened —
+ * a bad flag there escaped every catch and left an orphaned "running" record).
+ */
+function parseControllerNumericFlags(flags: RunFlags): ControllerNumericOptions {
+  const options: ControllerNumericOptions = {};
+  const concurrency = parseNumericFlag("--concurrency", flags.concurrency, { min: 1 });
+  if (concurrency !== undefined) options.concurrency = concurrency;
+  const maxAgents = parseNumericFlag("--max-agents", flags["max-agents"], { min: 1 });
+  if (maxAgents !== undefined) options.maxAgents = maxAgents;
+  const budget = parseNumericFlag("--budget", flags.budget, { min: 0, exclusiveMin: true });
+  if (budget !== undefined) options.tokenBudget = budget;
+  const idleTimeout = parseNumericFlag("--idle-timeout", flags["idle-timeout"], { min: 0 });
+  if (idleTimeout !== undefined) options.workflowIdleTimeoutMs = idleTimeout;
+  // `--agent-retries <n>` → agentMaxAttempts = n + 1 (n retries means n+1 total attempts).
+  const retries = parseNumericFlag("--agent-retries", flags["agent-retries"], { min: 0 });
+  if (retries !== undefined) options.agentMaxAttempts = Math.trunc(retries) + 1;
+  return options;
+}
+
+/** Parses a numeric CLI flag with a clean usage-error message (exit 2, no stack) on a bad value. */
+function parseNumericFlag(
+  flag: string,
+  raw: string | undefined,
+  bounds: { min?: number; exclusiveMin?: boolean } = {},
+): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) throw new WorkflowInputError(`${flag} must be a number, got "${raw}"`);
+  if (bounds.min !== undefined) {
+    const bad = bounds.exclusiveMin ? value <= bounds.min : value < bounds.min;
+    if (bad) {
+      const cmp = bounds.exclusiveMin ? `> ${bounds.min}` : `>= ${bounds.min}`;
+      throw new WorkflowInputError(`${flag} must be ${cmp}, got "${raw}"`);
+    }
+  }
+  return value;
 }
 
 function looksLikeWorkflowPath(target: string): boolean {

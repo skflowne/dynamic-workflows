@@ -146,6 +146,53 @@ return { a, b }
   ]);
 });
 
+test("D2: an ambiguous model is disambiguated by the run-level default (--provider), which outranks config.default", () => {
+  // claude-opus-4-8 is served by claude-smart AND claude-alt; config.default is codex-default (doesn't
+  // serve it), but the run-level default (--provider claude-alt) does — it must win over config.default.
+  const { factories, forProviderCalls } = recorder();
+  const resolve = buildRunnerResolver(CONFIG, factories, { defaultProvider: "claude-alt" });
+  resolve({ model: "claude-opus-4-8" });
+  assert.deepEqual(forProviderCalls, [{ name: "claude-alt", model: "claude-opus-4-8" }]);
+});
+
+test("D2: config.default still disambiguates when no run-level default is set", () => {
+  const withDefault = validateProvidersConfig(
+    {
+      providers: {
+        a: { backend: "pi", model: "m" },
+        b: { backend: "pi", model: "m" },
+      },
+      default: "a",
+    },
+    "test",
+  );
+  const { factories, forProviderCalls } = recorder();
+  buildRunnerResolver(withDefault, factories)({ model: "m" });
+  assert.deepEqual(forProviderCalls, [{ name: "a", model: "m" }]);
+});
+
+test("D3: runner cache keys use a NUL separator so provider/model name splits don't collide", () => {
+  const { factories, forProviderCalls } = recorder();
+  const config = validateProvidersConfig(
+    {
+      providers: {
+        a: { backend: "codex", model: "b c" }, // ("a", "b c")
+        "a b": { backend: "codex", model: "c" }, // ("a b", "c") — same "a b c" if joined with a space
+      },
+    },
+    "test",
+  );
+  const resolve = buildRunnerResolver(config, factories);
+  resolve({ provider: "a" });
+  resolve({ provider: "a b" });
+  // Two distinct (provider, model) pairs must build two distinct runners, not share a collided cache key.
+  assert.equal(forProviderCalls.length, 2);
+  assert.deepEqual(forProviderCalls, [
+    { name: "a", model: "b c" },
+    { name: "a b", model: "c" },
+  ]);
+});
+
 test("an unknown provider hard-fails the run (not a null agent result)", async () => {
   await assert.rejects(
     runWorkflow(

@@ -158,7 +158,8 @@ const valueAfter = (flag) => {
   const index = args.indexOf(flag);
   return index >= 0 ? args[index + 1] : undefined;
 };
-const prompt = valueAfter("-p") || valueAfter("--prompt") || "";
+// The prompt is fed on stdin (-p "" forces headless mode reading stdin), not via -p's argument.
+const prompt = require("node:fs").readFileSync(0, "utf8");
 const model = valueAfter("--model") || valueAfter("-m") || "none";
 console.log(JSON.stringify({
   session_id: "cli-gemini-session",
@@ -202,6 +203,74 @@ test("CLI rejects a negative --agent-timeout", async () => {
     const result = await runCli(["run", wfPath, "--agent-timeout=-5", "--cwd", dir], dir, { fakeAgent: false });
     assert.equal(result.code, 2, result.stdout);
     assert.match(result.stderr, /--agent-timeout must be a non-negative number/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("D1: CLI rejects a bad --concurrency cleanly (exit 2, no stack trace, no orphaned run record)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-numeric-"));
+  try {
+    const wfPath = path.join(dir, "wf.js");
+    await writeFile(wfPath, "export const meta = { name: 'x', description: 'x' }\nreturn 'x'\n", "utf8");
+    // Every numeric flag is validated up front, before the run record is saved or the events file is
+    // opened — so a bad value never leaves an orphaned "running" record, and the process must actually
+    // exit (a leaked viewer server previously kept it alive forever).
+    const result = await runCli(["run", wfPath, "--concurrency", "abc", "--cwd", dir], dir);
+    assert.equal(result.code, 2, result.stdout);
+    assert.match(result.stderr, /^error: --concurrency must be a number/m);
+    assert.doesNotMatch(result.stderr, /at executeRun|at numericFlag|\.js:\d+:\d+\)/); // no raw stack trace
+
+    const runs = await runCli(["runs", "--json", "--cwd", dir], dir);
+    assert.equal(runs.code, 0, runs.stderr);
+    const records = JSON.parse(runs.stdout) as Array<{ status: string }>;
+    assert.ok(records.every((r) => r.status !== "running")); // no orphaned "running" record
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("D1: CLI rejects out-of-range numeric flags (--max-agents 0, --budget 0, --agent-retries -1)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-ranges-"));
+  try {
+    const wfPath = path.join(dir, "wf.js");
+    await writeFile(wfPath, "export const meta = { name: 'x', description: 'x' }\nreturn 'x'\n", "utf8");
+
+    const maxAgents = await runCli(["run", wfPath, "--max-agents", "0", "--cwd", dir], dir);
+    assert.equal(maxAgents.code, 2, maxAgents.stdout);
+    assert.match(maxAgents.stderr, /--max-agents must be >= 1/);
+
+    const budget = await runCli(["run", wfPath, "--budget", "0", "--cwd", dir], dir);
+    assert.equal(budget.code, 2, budget.stdout);
+    assert.match(budget.stderr, /--budget must be > 0/);
+
+    const retries = await runCli(["run", wfPath, "--agent-retries", "-1", "--cwd", dir], dir);
+    assert.equal(retries.code, 2, retries.stdout);
+    assert.match(retries.stderr, /--agent-retries must be >= 0/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("D7: resume with a deleted recorded config gives a clear error naming the run, not a generic --config message", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-cli-resume-noconfig-"));
+  try {
+    const cfgPath = path.join(dir, "codex-workflow.config.ts");
+    await writeFile(cfgPath, `export default { providers: { main: { backend: 'codex', model: 'gpt-5-codex' } }, default: 'main' }\n`, "utf8");
+    const wfPath = path.join(dir, "wf.js");
+    await writeFile(wfPath, "export const meta = { name: 'x', description: 'x' }\nreturn 'x'\n", "utf8");
+
+    const run = await runCli(["run", wfPath, "--json", "--cwd", dir], dir);
+    assert.equal(run.code, 0, run.stderr);
+    const { runId } = JSON.parse(run.stdout) as { runId: string };
+
+    // The config the run used is gone; the user never passed --config on this resume invocation, so the
+    // error must say the config was recorded for this run (not a generic "--config file not found").
+    await rm(cfgPath);
+    const resumed = await runCli(["resume", runId, "--cwd", dir], dir);
+    assert.equal(resumed.code, 2, resumed.stdout);
+    assert.match(resumed.stderr, new RegExp(`provider config recorded for run ${runId} no longer exists at`));
+    assert.doesNotMatch(resumed.stderr, /^error: --config file not found/m);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -86,10 +86,44 @@ resume restores the workflow's script path / name and args from the run record
 (reusing completed agents from its journal); --args and other flags override.
 `;
 
+// node:util's parseArgs treats `--flag -5` as ambiguous (a dash-prefixed token could be another
+// flag) and throws before our own range validation ever runs. Rewrite `--flag -5` to `--flag=-5`
+// for the string-typed numeric flags so a negative value reaches numericFlag()'s clear error
+// instead of parseArgs's generic "argument is ambiguous" message.
+const NUMERIC_FLAGS = new Set([
+  "concurrency",
+  "budget",
+  "max-agents",
+  "agent-retries",
+  "agent-timeout",
+  "port",
+  "idle-timeout",
+]);
+
+function preprocessNegativeNumericArgs(argv: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const next = argv[i + 1];
+    if (arg !== undefined && arg.startsWith("--") && !arg.includes("=") && NUMERIC_FLAGS.has(arg.slice(2)) && next !== undefined && /^-\d/.test(next)) {
+      out.push(`${arg}=${next}`);
+      i++;
+      continue;
+    }
+    if (arg !== undefined) out.push(arg);
+  }
+  return out;
+}
+
 async function main(): Promise<number> {
   let parsed;
   try {
-    parsed = parseArgs({ args: process.argv.slice(2), options: OPTIONS, allowPositionals: true, strict: true });
+    parsed = parseArgs({
+      args: preprocessNegativeNumericArgs(process.argv.slice(2)),
+      options: OPTIONS,
+      allowPositionals: true,
+      strict: true,
+    });
   } catch (error) {
     process.stderr.write(`error: ${error instanceof Error ? error.message : String(error)}\n\nRun \`codex-workflow --help\` for usage.\n`);
     return 2;
