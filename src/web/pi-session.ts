@@ -13,7 +13,16 @@ export interface PiSessionLink {
 export interface PiSessionOptions {
   sessionsDir?: string;
   now?: number;
+  /**
+   * Shared cache for the recursive sessions-tree walk, keyed by sessionsDir. Callers that link many
+   * agents in one request tick (e.g. the /tokens endpoint) should create one Map and pass it to every
+   * call so the tree is walked once per tick instead of once per agent.
+   */
+  cache?: PiFileListCache;
 }
+
+/** sessionsDir -> in-flight/complete listing of every session file under it (unfiltered by window). */
+export type PiFileListCache = Map<string, Promise<Array<{ path: string; mtimeMs: number }>>>;
 
 const WINDOW_BEFORE_MS = 5_000;
 const WINDOW_AFTER_MS = 60_000;
@@ -41,7 +50,7 @@ export async function linkPiAgent(
   // time window (this is what lets `resume` link a cached agent whose file was written during the
   // ORIGINAL run, before record.startedAt was reset). pi puts the full uuid in the filename.
   if (entry.sessionId) {
-    const all = await collectPiSessionFiles(sessionsDir);
+    const all = await collectPiSessionFiles(sessionsDir, undefined, options.cache);
     const filenameHit = all.find((candidate) => path.basename(candidate.path).includes(entry.sessionId as string));
     if (filenameHit) return { sessionPath: filenameHit.path, sessionId: entry.sessionId };
 
@@ -55,7 +64,7 @@ export async function linkPiAgent(
   // time window so the fuzzy match can't grab an unrelated run that reused the same prompt.
   const windowStart = record.startedAt - WINDOW_BEFORE_MS;
   const windowEnd = (record.completedAt ?? now) + WINDOW_AFTER_MS;
-  const candidates = await collectPiSessionFiles(sessionsDir, { start: windowStart, end: windowEnd });
+  const candidates = await collectPiSessionFiles(sessionsDir, { start: windowStart, end: windowEnd }, options.cache);
   for (const candidate of candidates) {
     const info = await readPiSessionInfo(candidate.path);
     if (info.subagentText?.includes(entry.prompt)) {
@@ -164,7 +173,25 @@ function piAssistantBlocks(content: unknown): CodexSessionItem[] {
 async function collectPiSessionFiles(
   sessionsDir: string,
   window?: { start: number; end: number },
+  cache?: PiFileListCache,
 ): Promise<Array<{ path: string; mtimeMs: number }>> {
+  const all = await listAllPiSessionFiles(sessionsDir, cache);
+  return window ? all.filter((c) => c.mtimeMs >= window.start && c.mtimeMs <= window.end) : all;
+}
+
+// Full unfiltered walk, memoized per sessionsDir when a cache is supplied so a request that links many
+// agents (e.g. the /tokens endpoint) walks the tree once instead of once per agent.
+function listAllPiSessionFiles(sessionsDir: string, cache?: PiFileListCache): Promise<Array<{ path: string; mtimeMs: number }>> {
+  if (!cache) return walkPiSessionFiles(sessionsDir);
+  let pending = cache.get(sessionsDir);
+  if (!pending) {
+    pending = walkPiSessionFiles(sessionsDir);
+    cache.set(sessionsDir, pending);
+  }
+  return pending;
+}
+
+async function walkPiSessionFiles(sessionsDir: string): Promise<Array<{ path: string; mtimeMs: number }>> {
   const out: Array<{ path: string; mtimeMs: number }> = [];
   await walk(sessionsDir, async (filePath) => {
     if (!filePath.endsWith(".jsonl")) return;
@@ -174,7 +201,6 @@ async function collectPiSessionFiles(
     } catch {
       return;
     }
-    if (window && (mtimeMs < window.start || mtimeMs > window.end)) return;
     out.push({ path: filePath, mtimeMs });
   });
   return out.sort((a, b) => a.mtimeMs - b.mtimeMs);

@@ -1,6 +1,6 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import type { RunRecord } from "../run-store.js";
+import { sanitizeRunId, type RunRecord } from "../run-store.js";
 import type { AgentFailure, WorkflowJournalEntry } from "../types.js";
 
 /**
@@ -140,23 +140,37 @@ function safeStringify(value: unknown): string {
   }
 }
 
+// Journal files are immutable once written (a fresh run/agent always gets a fresh key), so per-run
+// parsed entries are cached by filename and only re-read when a new file shows up. Keyed by the
+// resolved directory (already unique per journalDir+runId) so distinct data dirs never collide.
+const journalFileCache = new Map<string, Map<string, WorkflowJournalEntry>>();
+
 /** Reads every journal entry for a run from `<journalDir>/<runId>/*.json`. */
 export async function readJournalEntries(journalDir: string, runId: string): Promise<WorkflowJournalEntry[]> {
-  const dir = path.join(journalDir, runId);
+  const dir = path.join(journalDir, sanitizeRunId(runId));
   let files: string[];
   try {
     files = await readdir(dir);
   } catch {
     return [];
   }
-  const entries: WorkflowJournalEntry[] = [];
-  for (const file of files) {
-    if (!file.endsWith(".json")) continue;
+  let cache = journalFileCache.get(dir);
+  if (!cache) {
+    cache = new Map();
+    journalFileCache.set(dir, cache);
+  }
+  const jsonFiles = new Set(files.filter((file) => file.endsWith(".json")));
+  // Drop cached entries for files that no longer exist (rare, but keeps the cache from growing stale).
+  for (const cachedFile of cache.keys()) {
+    if (!jsonFiles.has(cachedFile)) cache.delete(cachedFile);
+  }
+  for (const file of jsonFiles) {
+    if (cache.has(file)) continue;
     try {
-      entries.push(JSON.parse(await readFile(path.join(dir, file), "utf8")) as WorkflowJournalEntry);
+      cache.set(file, JSON.parse(await readFile(path.join(dir, file), "utf8")) as WorkflowJournalEntry);
     } catch {
-      // skip unreadable entry
+      // skip unreadable entry — left uncached so the next call retries it
     }
   }
-  return entries;
+  return [...cache.values()];
 }

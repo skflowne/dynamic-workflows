@@ -13,7 +13,16 @@ export interface GeminiSessionLink {
 export interface GeminiSessionOptions {
   sessionsDir?: string;
   now?: number;
+  /**
+   * Shared cache for the recursive sessions-tree walk, keyed by sessionsDir. Callers that link many
+   * agents in one request tick (e.g. the /tokens endpoint) should create one Map and pass it to every
+   * call so the tree is walked once per tick instead of once per agent.
+   */
+  cache?: GeminiFileListCache;
 }
+
+/** sessionsDir -> in-flight/complete listing of every session file under it (unfiltered by window). */
+export type GeminiFileListCache = Map<string, Promise<Array<{ path: string; mtimeMs: number }>>>;
 
 const WINDOW_BEFORE_MS = 5_000;
 const WINDOW_AFTER_MS = 60_000;
@@ -42,7 +51,7 @@ export async function linkGeminiAgent(
   // the ORIGINAL run: resume reuses the runId but resets record.startedAt to now, so the original
   // file's mtime falls outside this run's window. The filename carries the sessionId's first segment.
   if (entry.sessionId) {
-    const all = await collectGeminiSessionFiles(sessionsDir);
+    const all = await collectGeminiSessionFiles(sessionsDir, undefined, options.cache);
     const short = entry.sessionId.split("-")[0] ?? entry.sessionId;
     const filenameHit = all.find((candidate) => path.basename(candidate.path).includes(short));
     if (filenameHit) return { sessionPath: filenameHit.path, sessionId: entry.sessionId };
@@ -57,7 +66,7 @@ export async function linkGeminiAgent(
   // window so the fuzzy match can't grab an unrelated run that happened to reuse the same prompt.
   const windowStart = record.startedAt - WINDOW_BEFORE_MS;
   const windowEnd = (record.completedAt ?? now) + WINDOW_AFTER_MS;
-  const candidates = await collectGeminiSessionFiles(sessionsDir, { start: windowStart, end: windowEnd });
+  const candidates = await collectGeminiSessionFiles(sessionsDir, { start: windowStart, end: windowEnd }, options.cache);
   for (const candidate of candidates) {
     const info = await readGeminiSessionInfo(candidate.path);
     if (info.subagentText?.includes(entry.prompt)) {
@@ -109,7 +118,25 @@ export function parseGeminiSession(raw: string): ParsedCodexSession {
 async function collectGeminiSessionFiles(
   sessionsDir: string,
   window?: { start: number; end: number },
+  cache?: GeminiFileListCache,
 ): Promise<Array<{ path: string; mtimeMs: number }>> {
+  const all = await listAllGeminiSessionFiles(sessionsDir, cache);
+  return window ? all.filter((c) => c.mtimeMs >= window.start && c.mtimeMs <= window.end) : all;
+}
+
+// Full unfiltered walk, memoized per sessionsDir when a cache is supplied so a request that links many
+// agents (e.g. the /tokens endpoint) walks the tree once instead of once per agent.
+function listAllGeminiSessionFiles(sessionsDir: string, cache?: GeminiFileListCache): Promise<Array<{ path: string; mtimeMs: number }>> {
+  if (!cache) return walkGeminiSessionFiles(sessionsDir);
+  let pending = cache.get(sessionsDir);
+  if (!pending) {
+    pending = walkGeminiSessionFiles(sessionsDir);
+    cache.set(sessionsDir, pending);
+  }
+  return pending;
+}
+
+async function walkGeminiSessionFiles(sessionsDir: string): Promise<Array<{ path: string; mtimeMs: number }>> {
   const out: Array<{ path: string; mtimeMs: number }> = [];
   await walk(sessionsDir, async (filePath) => {
     const base = path.basename(filePath);
@@ -120,7 +147,6 @@ async function collectGeminiSessionFiles(
     } catch {
       return;
     }
-    if (window && (mtimeMs < window.start || mtimeMs > window.end)) return;
     out.push({ path: filePath, mtimeMs });
   });
   return out.sort((a, b) => a.mtimeMs - b.mtimeMs);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import test from "node:test";
 import { mkdtemp, mkdir, writeFile, appendFile, utimes, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -16,10 +17,23 @@ function dayDir(base: string, ts: number): string {
   return path.join(base, String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, "0"), String(d.getDate()).padStart(2, "0"));
 }
 
-async function get(url: string): Promise<{ status: number; json: any }> {
-  const res = await fetch(url);
+async function get(url: string, init?: RequestInit): Promise<{ status: number; json: any }> {
+  const res = await fetch(url, init);
   const text = await res.text();
   return { status: res.status, json: text ? JSON.parse(text) : undefined };
+}
+
+// `fetch`/undici treats "Host" as a forbidden header and silently ignores an override, so a raw
+// node:http request is the only way to actually exercise a spoofed Host header end to end.
+async function getWithHost(port: number, pathname: string, hostHeader: string): Promise<{ status: number }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: "127.0.0.1", port, path: pathname, method: "GET", headers: { Host: hostHeader } }, (res) => {
+      res.resume();
+      res.on("end", () => resolve({ status: res.statusCode ?? 0 }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
 }
 
 test("web server exposes runs, run view, agent detail, and the linked Codex session", async () => {
@@ -454,6 +468,112 @@ test("in-process: server tails events written through the real RunEventLog", asy
   } finally {
     await log.close();
     await log.remove();
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("web server rejects requests with a non-localhost Host header (DNS-rebinding guard)", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-web-host-"));
+  const server = createWebServer({ cwd, version: "9.9.9" });
+  try {
+    const bound = await server.listen(0);
+    const port = bound.port;
+
+    const foreign = await getWithHost(port, "/api/health", "evil.example.com");
+    assert.equal(foreign.status, 403);
+
+    const foreignWithPort = await getWithHost(port, "/api/health", `evil.example.com:${port}`);
+    assert.equal(foreignWithPort.status, 403);
+
+    for (const host of ["127.0.0.1", `127.0.0.1:${port}`, "localhost", `localhost:${port}`, "[::1]", `[::1]:${port}`]) {
+      const ok = await getWithHost(port, "/api/health", host);
+      assert.equal(ok.status, 200, `expected 200 for Host: ${host}`);
+    }
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("web server projects /api/runs to a summary shape without result/logs/args/failures", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-web-summary-"));
+  const server = createWebServer({ cwd, version: "9.9.9" });
+  try {
+    const runId = "wf_summary";
+    const record: RunRecord = {
+      runId,
+      name: "summary demo",
+      status: "completed",
+      source: "named",
+      startedAt: START,
+      completedAt: START + 1000,
+      durationMs: 1000,
+      agentCount: 2,
+      cacheHits: 1,
+      failureCount: 0,
+      logs: ["a log line"],
+      args: { foo: "bar" },
+      result: { big: "payload" },
+      failures: [],
+    };
+    await mkdir(path.join(cwd, ".codex-workflow", "runs"), { recursive: true });
+    await writeFile(path.join(cwd, ".codex-workflow", "runs", `${runId}.json`), JSON.stringify(record), "utf8");
+
+    const bound = await server.listen(0);
+    const runs = await get(`${bound.url}/api/runs`);
+    assert.equal(runs.status, 200);
+    assert.equal(runs.json.length, 1);
+    const summary = runs.json[0];
+    assert.equal(summary.runId, runId);
+    assert.equal(summary.name, "summary demo");
+    assert.equal(summary.agentCount, 2);
+    assert.equal(summary.cacheHits, 1);
+    assert.equal(summary.durationMs, 1000);
+    assert.equal("result" in summary, false, "summary must not include the (potentially huge) result field");
+    assert.equal("logs" in summary, false, "summary must not include logs");
+    assert.equal("args" in summary, false, "summary must not include args");
+    assert.equal("failures" in summary, false, "summary must not include failure detail");
+
+    // The single-run detail endpoint still has the full record.
+    const detail = await get(`${bound.url}/api/runs/${runId}`);
+    assert.deepEqual(detail.json.record.result, { big: "payload" });
+    assert.deepEqual(detail.json.record.logs, ["a log line"]);
+  } finally {
+    await server.close();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("web server serves newly-added journal agents without re-reading unchanged ones (journal cache)", async () => {
+  const cwd = await mkdtemp(path.join(tmpdir(), "cw-web-journal-cache-"));
+  const server = createWebServer({ cwd, version: "9.9.9" });
+  try {
+    const runId = "wf_journal_cache";
+    const record: RunRecord = { runId, name: "journal cache", status: "running", source: "scriptPath", startedAt: START, phases: ["Only"] };
+    await mkdir(path.join(cwd, ".codex-workflow", "runs"), { recursive: true });
+    await writeFile(path.join(cwd, ".codex-workflow", "runs", `${runId}.json`), JSON.stringify(record), "utf8");
+
+    const journalDir = path.join(cwd, ".codex-workflow", "journal", runId);
+    await mkdir(journalDir, { recursive: true });
+    const entryA: WorkflowJournalEntry = { key: "a", runId, prompt: "prompt a", options: { label: "a", phase: "Only" }, result: "a", createdAt: START + 1 };
+    await writeFile(path.join(journalDir, "a.json"), JSON.stringify(entryA), "utf8");
+
+    const bound = await server.listen(0);
+
+    const first = await get(`${bound.url}/api/runs/${runId}`);
+    assert.equal(first.json.view.agents.length, 1);
+    assert.equal(first.json.view.agents[0].key, "a");
+
+    // A second agent shows up later (as it would while a run is in progress) — it must be picked up
+    // without needing the first, already-cached file to change.
+    const entryB: WorkflowJournalEntry = { key: "b", runId, prompt: "prompt b", options: { label: "b", phase: "Only" }, result: "b", createdAt: START + 2 };
+    await writeFile(path.join(journalDir, "b.json"), JSON.stringify(entryB), "utf8");
+
+    const second = await get(`${bound.url}/api/runs/${runId}`);
+    const keys = second.json.view.agents.map((a: any) => a.key).sort();
+    assert.deepEqual(keys, ["a", "b"]);
+  } finally {
     await server.close();
     await rm(cwd, { recursive: true, force: true });
   }

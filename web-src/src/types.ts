@@ -114,6 +114,25 @@ export interface RunDetailResponse {
   live: LiveEvent[];
 }
 
+/**
+ * Lightweight projection of a RunRecord returned by `/api/runs` (the list). Deliberately omits
+ * `result`/`logs`/`args`/`failures` — those only come back from `/api/runs/:id` (the single-run
+ * detail fetch), which is what the run view actually renders.
+ */
+export interface RunSummary {
+  runId: string;
+  name: string;
+  description?: string;
+  status: RunRecordStatus;
+  source: string;
+  startedAt: number;
+  completedAt?: number;
+  durationMs?: number;
+  agentCount?: number;
+  cacheHits?: number;
+  failureCount?: number;
+}
+
 export interface WorkflowProgressAgent {
   type: "agent";
   backend?: string;

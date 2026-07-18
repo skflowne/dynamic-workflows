@@ -13,6 +13,7 @@ import type {
   PhaseView,
   RunDetailResponse,
   RunRecord,
+  RunSummary,
   RunTokenSummary,
   SessionItem,
   SessionMeta,
@@ -20,6 +21,8 @@ import type {
   WorkflowProgressAgent,
   WorkflowProgressEvent,
 } from "./types";
+
+const MAX_LIVE_LOGS = 1000;
 
 type DrawerTab = "result" | "prompt" | "session";
 
@@ -32,7 +35,9 @@ interface LoadState<T> {
 const emptyLoad = <T,>(): LoadState<T> => ({ loading: false });
 
 export default function App(): ReactNode {
-  const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [streamStale, setStreamStale] = useState(false);
   const [filter, setFilter] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [runData, setRunData] = useState<RunDetailResponse | null>(null);
@@ -52,6 +57,7 @@ export default function App(): ReactNode {
   const selectedRunIdRef = useRef<string | null>(null);
   const runDataRef = useRef<RunDetailResponse | null>(null);
   const selectSeqRef = useRef(0);
+  const drawerSeqRef = useRef(0);
   const refetchTimerRef = useRef<number | null>(null);
   const tokenTimerRef = useRef<number | null>(null);
   const tokenRefetchTimerRef = useRef<number | null>(null);
@@ -80,6 +86,7 @@ export default function App(): ReactNode {
   }, []);
 
   const closeDrawer = useCallback(() => {
+    drawerSeqRef.current++; // invalidate any in-flight openDrawer() fetch
     if (sessionTimerRef.current !== null) window.clearInterval(sessionTimerRef.current);
     sessionTimerRef.current = null;
     setDrawerKey(null);
@@ -91,9 +98,17 @@ export default function App(): ReactNode {
   }, []);
 
   const loadRuns = useCallback(async () => {
-    const records = await fetchJson<RunRecord[]>("/api/runs");
-    setRuns(records);
-    return records;
+    try {
+      const records = await fetchJson<RunSummary[]>("/api/runs");
+      setRuns(records);
+      setRunsError(null);
+      return records;
+    } catch (error) {
+      // Caught here (not left to reject) so callers that chain off loadRuns() — in particular the
+      // mount effect resolving a /runs/:id deep link — still run even when the sidebar list fails.
+      setRunsError(errorMessage(error));
+      return [];
+    }
   }, []);
 
   const selectRun = useCallback(
@@ -197,7 +212,10 @@ export default function App(): ReactNode {
     (event: WorkflowProgressEvent | undefined) => {
       if (!event) return;
       if (event.type === "log") {
-        setLiveLogs((prev) => [...prev, event.message]);
+        // Cap at MAX_LIVE_LOGS: an unbounded `[...prev, x]` on every log line makes each append copy
+        // an ever-growing array (O(n) per event, O(n^2) over the life of a long/chatty run). Slicing to
+        // a fixed window keeps each copy — and the rendered log pane — bounded.
+        setLiveLogs((prev) => (prev.length >= MAX_LIVE_LOGS ? [...prev.slice(prev.length - MAX_LIVE_LOGS + 1), event.message] : [...prev, event.message]));
         return;
       }
       if (event.type === "agent" && event.key) {
@@ -237,6 +255,9 @@ export default function App(): ReactNode {
     async (key: string) => {
       const runId = selectedRunIdRef.current;
       if (!runId) return;
+      // Guard against a drawer-open race: if the user opens agent A then agent B before A's fetch
+      // resolves, A's response must not clobber B's already-loading (or loaded) drawer state.
+      const seq = ++drawerSeqRef.current;
       lastFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setDrawerKey(key);
       setActiveTab("result");
@@ -244,9 +265,9 @@ export default function App(): ReactNode {
       setDrawerEntry({ loading: true });
       try {
         const entry = await fetchJson<AgentDetail>(`/api/runs/${encodeURIComponent(runId)}/agents/${encodeURIComponent(key)}`);
-        if (selectedRunIdRef.current === runId) setDrawerEntry({ value: entry, loading: false });
+        if (seq === drawerSeqRef.current && selectedRunIdRef.current === runId) setDrawerEntry({ value: entry, loading: false });
       } catch (error) {
-        setDrawerEntry({ error: errorMessage(error), loading: false });
+        if (seq === drawerSeqRef.current) setDrawerEntry({ error: errorMessage(error), loading: false });
       }
     },
     [],
@@ -299,11 +320,19 @@ export default function App(): ReactNode {
   useEffect(() => {
     const es = new EventSource("/api/stream");
     es.onmessage = (event) => {
+      setStreamStale(false);
       try {
         handleLive(JSON.parse(event.data) as LiveEvent);
       } catch {
         // Ignore malformed stream frames.
       }
+    };
+    es.onopen = () => setStreamStale(false);
+    es.onerror = () => {
+      // The browser's EventSource auto-reconnects on its own; just mark the stream stale so the live
+      // indicator reflects it. The 3s polls (pollRunning / refreshTokenSummary / patchSelectedRun) keep
+      // the view current in the meantime.
+      setStreamStale(true);
     };
     return () => es.close();
   }, [handleLive]);
@@ -408,7 +437,7 @@ export default function App(): ReactNode {
     [stopTokenAutoRefresh],
   );
 
-  const liveActive = runData?.record.status === "running";
+  const liveActive = runData?.record.status === "running" && !streamStale;
   const visibleAgentCount = merged.reduce((sum, phase) => sum + phase.agents.length, 0);
 
   return (
@@ -423,6 +452,8 @@ export default function App(): ReactNode {
 
       <Sidebar
         runs={runs}
+        error={runsError}
+        onRetry={() => void loadRuns()}
         filter={filter}
         selectedRunId={selectedRunId}
         open={sidebarOpen}
@@ -479,7 +510,9 @@ export default function App(): ReactNode {
 }
 
 function Sidebar(props: {
-  runs: RunRecord[];
+  runs: RunSummary[];
+  error: string | null;
+  onRetry: () => void;
   filter: string;
   selectedRunId: string | null;
   open: boolean;
@@ -508,9 +541,17 @@ function Sidebar(props: {
       <div className="sidebar-search">
         <input type="search" placeholder="Filter runs..." autoComplete="off" value={props.filter} onChange={(event) => props.onFilter(event.currentTarget.value)} />
       </div>
+      {props.error ? (
+        <div className="sidebar-error" role="alert">
+          <span>Failed to load run history: {props.error}</span>
+          <button type="button" onClick={props.onRetry}>
+            Retry
+          </button>
+        </div>
+      ) : null}
       <nav className="run-list" aria-label="Run history">
         {filtered.length === 0 ? (
-          <div className="muted-note">No matching runs.</div>
+          <div className="muted-note">{props.error ? "Could not load runs." : "No matching runs."}</div>
         ) : (
           filtered.map((run) => {
             const agents = run.agentCount != null ? `${run.agentCount} agents` : run.status === "running" ? "running..." : "";

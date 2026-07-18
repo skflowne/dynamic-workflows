@@ -7,8 +7,8 @@ import { piSessionsDir as defaultPiSessionsDir } from "../paths.js";
 import { FileRunStore, type RunRecord } from "../run-store.js";
 import type { WorkflowAgentOptions, WorkflowJournalEntry } from "../types.js";
 import { runEventsPath } from "./event-log.js";
-import { linkGeminiAgent, parseGeminiSessionFile } from "./gemini-session.js";
-import { linkPiAgent, parsePiSessionFile } from "./pi-session.js";
+import { linkGeminiAgent, parseGeminiSessionFile, type GeminiFileListCache, type GeminiSessionLink } from "./gemini-session.js";
+import { linkPiAgent, parsePiSessionFile, type PiFileListCache, type PiSessionLink } from "./pi-session.js";
 import { buildRunView, readJournalEntries } from "./run-aggregator.js";
 import { linkRun } from "./session-linker.js";
 import { parseCodexSessionFile, type CodexSessionMeta, type CodexSessionUsage, type ParsedCodexSession } from "./session-parser.js";
@@ -80,6 +80,41 @@ interface AgentTokenSample {
   usage?: CodexSessionUsage;
 }
 
+/**
+ * Lightweight projection of a {@link RunRecord} for the run list — deliberately omits `result`,
+ * `logs`, `args`, and `failures` (unbounded / heavy fields), which only the single-run detail
+ * endpoint (`/api/runs/:id`) needs. The sidebar only ever reads the fields below.
+ */
+export interface RunSummary {
+  runId: string;
+  name: string;
+  description?: string;
+  status: RunRecord["status"];
+  source: RunRecord["source"];
+  startedAt: number;
+  completedAt?: number;
+  durationMs?: number;
+  agentCount?: number;
+  cacheHits?: number;
+  failureCount?: number;
+}
+
+function toRunSummary(record: RunRecord): RunSummary {
+  return {
+    runId: record.runId,
+    name: record.name,
+    ...(record.description !== undefined ? { description: record.description } : {}),
+    status: record.status,
+    source: record.source,
+    startedAt: record.startedAt,
+    ...(record.completedAt !== undefined ? { completedAt: record.completedAt } : {}),
+    ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+    ...(record.agentCount !== undefined ? { agentCount: record.agentCount } : {}),
+    ...(record.cacheHits !== undefined ? { cacheHits: record.cacheHits } : {}),
+    ...(record.failureCount !== undefined ? { failureCount: record.failureCount } : {}),
+  };
+}
+
 export interface WorkflowWebServer {
   server: http.Server;
   listen(port: number, host?: string): Promise<{ port: number; url: string }>;
@@ -110,6 +145,67 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
   // In-memory liveness: per-run event buffers (for replay) + global SSE subscribers.
   const buffers = new Map<string, LiveEvent[]>();
   const subscribers = new Set<http.ServerResponse>();
+  // Buffers are dropped a grace period after a run finishes so a long-lived `serve` process doesn't
+  // accumulate every run's full event history forever.
+  const bufferEvictionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  // ---- Session-linking / -parsing caches (per server instance, i.e. per running process). ----
+  // Parsed-session cache keyed by file path + mtime + size: session usage only changes on append, so
+  // re-parsing an unchanged file on every /tokens poll (every 3s, plus a 700ms-debounced refetch per
+  // agent event) is wasted work across a whole run's worth of agents.
+  const sessionParseCache = new Map<string, { mtimeMs: number; size: number; session: ParsedCodexSession }>();
+  async function parseSessionCached(filePath: string, parse: (p: string) => Promise<ParsedCodexSession>): Promise<ParsedCodexSession> {
+    let info: { mtimeMs: number; size: number };
+    try {
+      const st = await stat(filePath);
+      info = { mtimeMs: st.mtimeMs, size: st.size };
+    } catch {
+      return parse(filePath);
+    }
+    const cached = sessionParseCache.get(filePath);
+    if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.session;
+    const session = await parse(filePath);
+    sessionParseCache.set(filePath, { ...info, session });
+    return session;
+  }
+
+  // Agent -> linked session-file cache for the gemini/pi backends (Codex already caches this to disk
+  // via `linksDir`; this mirrors that in-memory). Only positive links are cached — a running agent may
+  // not have written its session file yet, so a miss must be retried on the next poll.
+  const geminiLinkCache = new Map<string, Map<string, GeminiSessionLink>>();
+  const piLinkCache = new Map<string, Map<string, PiSessionLink>>();
+  function runCache<T>(store: Map<string, Map<string, T>>, runId: string): Map<string, T> {
+    let entry = store.get(runId);
+    if (!entry) {
+      entry = new Map();
+      store.set(runId, entry);
+    }
+    return entry;
+  }
+  async function cachedLinkGemini(
+    record: RunRecord,
+    entry: WorkflowJournalEntry,
+    opts: { sessionsDir?: string; cache?: GeminiFileListCache },
+  ): Promise<GeminiSessionLink | undefined> {
+    const cache = runCache(geminiLinkCache, record.runId);
+    const hit = cache.get(entry.key);
+    if (hit) return hit;
+    const link = await linkGeminiAgent(record, entry, opts);
+    if (link) cache.set(entry.key, link);
+    return link;
+  }
+  async function cachedLinkPi(
+    record: RunRecord,
+    entry: WorkflowJournalEntry,
+    opts: { sessionsDir?: string; cache?: PiFileListCache },
+  ): Promise<PiSessionLink | undefined> {
+    const cache = runCache(piLinkCache, record.runId);
+    const hit = cache.get(entry.key);
+    if (hit) return hit;
+    const link = await linkPiAgent(record, entry, opts);
+    if (link) cache.set(entry.key, link);
+    return link;
+  }
 
   // Fan one event into the replay buffer + every live SSE subscriber. Used by both the file tailer
   // (the normal path) and the public broadcast() (tests/programmatic).
@@ -119,8 +215,30 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
     if (buffer.length > MAX_BUFFER) buffer.splice(0, buffer.length - MAX_BUFFER);
     buffers.set(event.runId, buffer);
     const data = `data: ${JSON.stringify(event)}\n\n`;
-    for (const res of subscribers) res.write(data);
+    for (const res of subscribers) {
+      if (res.writableEnded) {
+        subscribers.delete(res);
+        continue;
+      }
+      res.write(data);
+    }
+    if (event.type === "run-finished") scheduleBufferEviction(event.runId);
   };
+
+  // Drop a finished run's buffer (and its link caches) a grace period after it completes — keeps a
+  // long-lived `serve` process's memory bounded to recently-active runs instead of its whole history.
+  function scheduleBufferEviction(runId: string): void {
+    const existing = bufferEvictionTimers.get(runId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      bufferEvictionTimers.delete(runId);
+      buffers.delete(runId);
+      geminiLinkCache.delete(runId);
+      piLinkCache.delete(runId);
+    }, ORPHAN_GRACE_MS);
+    if (typeof timer.unref === "function") timer.unref();
+    bufferEvictionTimers.set(runId, timer);
+  }
 
   // ---- File tailer: the single liveness transport (see header). ----
   const offsets = new Map<string, number>(); // events file -> bytes consumed
@@ -279,6 +397,14 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
   });
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Bound to 127.0.0.1, but a browser can still be tricked into pointing an arbitrary Host header at
+    // this loopback port (DNS rebinding) and read run data (prompts, results, args, session traces)
+    // cross-origin. Reject anything whose Host isn't a localhost/loopback variant before routing.
+    if (!isLocalHost(req.headers.host)) {
+      sendJson(res, 403, { error: "forbidden host" });
+      return;
+    }
+
     const url = new URL(req.url ?? "/", "http://localhost");
     const segments = url.pathname.split("/").filter(Boolean);
 
@@ -300,7 +426,7 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       if (segments[1] === "runs" && segments.length === 2) {
         const records = await Promise.all((await store.list()).map(overlayLiveRecord));
         records.sort((a, b) => b.startedAt - a.startedAt);
-        sendJson(res, 200, records);
+        sendJson(res, 200, records.map(toRunSummary));
         return;
       }
       if (segments[1] === "runs" && segments.length >= 3) {
@@ -323,16 +449,19 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       return;
     }
     const record = await overlayLiveRecord(storedRecord);
+
+    // GET /api/runs/:id/events — served straight from the in-memory replay buffer; nothing here needs
+    // the journal, so skip the read entirely (this route is the SPA's most frequently polled one).
+    if (rest.length === 1 && rest[0] === "events") {
+      sendJson(res, 200, buffers.get(runId) ?? []);
+      return;
+    }
+
     const entries = await readJournalEntries(journalDir, runId);
 
     // GET /api/runs/:id
     if (rest.length === 0) {
       sendJson(res, 200, { record, view: buildRunView(record, entries), live: buffers.get(runId) ?? [] });
-      return;
-    }
-    // GET /api/runs/:id/events
-    if (rest.length === 1 && rest[0] === "events") {
-      sendJson(res, 200, buffers.get(runId) ?? []);
       return;
     }
     // GET /api/runs/:id/tokens
@@ -350,13 +479,13 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       }
       if (rest[2] === "session") {
         if (entry.backend === "gemini") {
-          const link = await linkGeminiAgent(record, entry, { ...(options.geminiSessionsDir ? { sessionsDir: options.geminiSessionsDir } : {}) });
+          const link = await cachedLinkGemini(record, entry, { ...(options.geminiSessionsDir ? { sessionsDir: options.geminiSessionsDir } : {}) });
           if (!link) {
             sendJson(res, 404, { error: "no linked Gemini session for this agent" });
             return;
           }
           try {
-            const session = await parseGeminiSessionFile(link.sessionPath);
+            const session = await parseSessionCached(link.sessionPath, parseGeminiSessionFile);
             sendJson(res, 200, { sessionPath: link.sessionPath, ...session });
           } catch (error) {
             sendJson(res, 404, { error: `could not read Gemini session: ${error instanceof Error ? error.message : String(error)}` });
@@ -364,13 +493,13 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
           return;
         }
         if (entry.backend === "pi") {
-          const link = await linkPiAgent(record, entry, { sessionsDir: piSessionsDir });
+          const link = await cachedLinkPi(record, entry, { sessionsDir: piSessionsDir });
           if (!link) {
             sendJson(res, 404, { error: "no linked pi session for this agent" });
             return;
           }
           try {
-            const session = await parsePiSessionFile(link.sessionPath);
+            const session = await parseSessionCached(link.sessionPath, parsePiSessionFile);
             sendJson(res, 200, { sessionPath: link.sessionPath, ...session });
           } catch (error) {
             sendJson(res, 404, { error: `could not read pi session: ${error instanceof Error ? error.message : String(error)}` });
@@ -385,7 +514,7 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
           return;
         }
         try {
-          const session = await parseCodexSessionFile(link.sessionPath);
+          const session = await parseSessionCached(link.sessionPath, parseCodexSessionFile);
           sendJson(res, 200, { sessionPath: link.sessionPath, ...session });
         } catch (error) {
           sendJson(res, 404, { error: `could not read session: ${error instanceof Error ? error.message : String(error)}` });
@@ -405,8 +534,13 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
       codexEntries.length > 0
         ? await linkRun(record, codexEntries, { linksDir, ...(options.sessionsDir ? { sessionsDir: options.sessionsDir } : {}) })
         : {};
+    // One recursive sessions-tree walk per gemini/pi backend, shared by every agent sampled in this
+    // request tick, instead of one walk per agent (the /tokens endpoint is polled every 3s and
+    // debounce-refetched per agent event, so this matters a lot on a run with many agents).
+    const geminiWalkCache: GeminiFileListCache = new Map();
+    const piWalkCache: PiFileListCache = new Map();
 
-    const samples = await Promise.all(entries.map((entry) => tokenSampleForAgent(record, entry, codexLinks)));
+    const samples = await Promise.all(entries.map((entry) => tokenSampleForAgent(record, entry, codexLinks, geminiWalkCache, piWalkCache)));
     const groups = new Map<string, AgentTokenGroup>();
     const totals: CodexSessionUsage = {};
     let withUsage = 0;
@@ -477,10 +611,12 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
     record: RunRecord,
     entry: WorkflowJournalEntry,
     codexLinks: Record<string, { sessionPath: string; sessionId?: string }>,
+    geminiWalkCache: GeminiFileListCache,
+    piWalkCache: PiFileListCache,
   ): Promise<AgentTokenSample> {
     const backend = agentBackend(record, entry);
     try {
-      const session = await parseLinkedSession(record, entry, backend, codexLinks);
+      const session = await parseLinkedSession(record, entry, backend, codexLinks, geminiWalkCache, piWalkCache);
       return tokenSampleFromSession(record, entry, backend, session);
     } catch {
       return tokenSampleFromSession(record, entry, backend, undefined);
@@ -492,17 +628,22 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
     entry: WorkflowJournalEntry,
     backend: string,
     codexLinks: Record<string, { sessionPath: string; sessionId?: string }>,
+    geminiWalkCache: GeminiFileListCache,
+    piWalkCache: PiFileListCache,
   ): Promise<ParsedCodexSession | undefined> {
     if (backend === "gemini") {
-      const link = await linkGeminiAgent(record, entry, { ...(options.geminiSessionsDir ? { sessionsDir: options.geminiSessionsDir } : {}) });
-      return link ? parseGeminiSessionFile(link.sessionPath) : undefined;
+      const link = await cachedLinkGemini(record, entry, {
+        ...(options.geminiSessionsDir ? { sessionsDir: options.geminiSessionsDir } : {}),
+        cache: geminiWalkCache,
+      });
+      return link ? parseSessionCached(link.sessionPath, parseGeminiSessionFile) : undefined;
     }
     if (backend === "pi") {
-      const link = await linkPiAgent(record, entry, { sessionsDir: piSessionsDir });
-      return link ? parsePiSessionFile(link.sessionPath) : undefined;
+      const link = await cachedLinkPi(record, entry, { sessionsDir: piSessionsDir, cache: piWalkCache });
+      return link ? parseSessionCached(link.sessionPath, parsePiSessionFile) : undefined;
     }
     const link = codexLinks[entry.key];
-    return link ? parseCodexSessionFile(link.sessionPath) : undefined;
+    return link ? parseSessionCached(link.sessionPath, parseCodexSessionFile) : undefined;
   }
 
   function openStream(res: http.ServerResponse): void {
@@ -513,7 +654,16 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
     });
     res.write(": connected\n\n");
     subscribers.add(res);
-    const ping = setInterval(() => res.write(": ping\n\n"), 25_000);
+    res.on("error", () => {
+      /* a subscriber's socket erroring is not the server's problem; 'close' below still fires cleanup */
+    });
+    const ping = setInterval(() => {
+      if (res.writableEnded) {
+        clearInterval(ping);
+        return;
+      }
+      res.write(": ping\n\n");
+    }, 25_000);
     res.on("close", () => {
       clearInterval(ping);
       subscribers.delete(res);
@@ -558,6 +708,8 @@ export function createWebServer(options: WebServerOptions): WorkflowWebServer {
         pollTimer = undefined;
         watcher?.close();
         watcher = undefined;
+        for (const timer of bufferEvictionTimers.values()) clearTimeout(timer);
+        bufferEvictionTimers.clear();
         for (const res of subscribers) res.end();
         subscribers.clear();
         server.close(() => resolve());
@@ -677,11 +829,20 @@ async function serveStatic(pathname: string, res: http.ServerResponse, webDir: s
     sendJson(res, 404, { error: "web assets not built" });
     return;
   }
+  const stream = createReadStream(target);
+  // The asset can vanish between the isFile() check and open() (e.g. `build:web` rewriting hashed
+  // assets while the in-process viewer is up). An unhandled 'error' here would crash the whole
+  // process, killing the workflow run the viewer is attached to — so bail out (before or after headers
+  // went out) instead of letting it propagate.
+  stream.on("error", () => {
+    if (!res.headersSent) sendJson(res, 500, { error: "failed to read asset" });
+    else res.destroy();
+  });
   res.writeHead(200, {
     "content-type": MIME[path.extname(target)] ?? "application/octet-stream",
     "cache-control": "no-cache",
   });
-  createReadStream(target).pipe(res);
+  stream.pipe(res);
 }
 
 async function isFile(p: string): Promise<boolean> {
@@ -694,6 +855,23 @@ async function fileExists(p: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Accepts localhost / 127.0.0.1 / ::1, with or without a trailing `:port`. Rejects everything else. */
+function isLocalHost(hostHeader: string | undefined): boolean {
+  if (!hostHeader) return false;
+  if (hostHeader === "::1" || hostHeader === "localhost" || hostHeader === "127.0.0.1") return true;
+  let hostname = hostHeader;
+  if (hostname.startsWith("[")) {
+    // IPv6 literal, optionally with a port: "[::1]:1234"
+    const end = hostname.indexOf("]");
+    hostname = end >= 0 ? hostname.slice(1, end) : hostname;
+  } else {
+    // Not a bracketed IPv6 literal, so at most one colon (host:port) is expected.
+    const colon = hostname.indexOf(":");
+    if (colon >= 0) hostname = hostname.slice(0, colon);
+  }
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
 }
 
 function sendJson(res: http.ServerResponse, status: number, value: unknown): void {
