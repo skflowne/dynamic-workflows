@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { WorkflowInputError } from "../errors.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner } from "../types.js";
 import { buildSubagentPrompt } from "./prompt.js";
-import { agentTimeoutError, DEFAULT_AGENT_TIMEOUT_MS, startAgentTimeout } from "./turn-control.js";
+import { spawnAgentProcess } from "./spawn-process.js";
+import { DEFAULT_AGENT_TIMEOUT_MS, startAgentTimeout } from "./turn-control.js";
 import { createDetachedWorktree } from "./worktree.js";
 
 /** Output buffer ceilings — a runaway pi turn (e.g. tool-spam loop) must never OOM the parent. */
@@ -107,33 +108,71 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
 
     const timeoutMs = this.options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
     const timeout = startAgentTimeout(timeoutMs, signal);
+    const command = this.options.command ?? "pi";
+    const promptBytes = Buffer.byteLength(prompt);
 
     try {
       await this.ensureModelsConfig();
-      const result = await runPiProcess(buildPiArgs(prompt, this.options), {
-        command: this.options.command ?? "pi",
+      const raw = await spawnAgentProcess({
+        command,
+        args: buildPiArgs(prompt, this.options),
         cwd: workingDirectory,
         env: this.spawnEnv(),
+        maxStdoutBytes: MAX_STDOUT_BYTES,
+        maxStderrBytes: MAX_STDERR_BYTES,
+        label: "pi",
         signal: timeout.signal,
         timedOut: timeout.timedOut,
         timeoutMs,
+        normalizeSpawnError: (error) => normalizePiSpawnError(error, command, promptBytes),
       });
-      if (result.sessionId) onMeta?.({ backend: "pi", sessionId: result.sessionId });
-      if (typeof result.outputTokens === "number") onMeta?.({ outputTokens: result.outputTokens });
+
+      // pi exits 0 even when the model turn errored, so success/failure is decided by the LAST assistant
+      // message's stopReason, NOT the exit code.
+      const parsed = parsePiEvents(raw.stdout);
+      // Report session + tokens BEFORE any throw so a failed/errored turn is still traceable and its
+      // real token spend isn't lost.
+      if (parsed.sessionId) onMeta?.({ backend: "pi", sessionId: parsed.sessionId });
+      if (typeof parsed.outputTokens === "number") onMeta?.({ outputTokens: parsed.outputTokens });
+      if (parsed.error) throw new Error(`pi agent failed: ${parsed.error}`);
+      if (!parsed.hasAssistant) {
+        const detail =
+          cleanErrorText(raw.stderr) || `exit code ${raw.code ?? "unknown"}${raw.signal ? `, signal ${raw.signal}` : ""}`;
+        throw new Error(`pi produced no assistant response: ${detail}`);
+      }
       // A turn can legitimately end on a text-less assistant message (only thinking/tool-call blocks).
       // With a schema that empty string would die in JSON parsing downstream with a cryptic message —
       // fail here with the real reason instead, so the runtime's retry loop logs something actionable.
-      if (call.options.schema !== undefined && result.response === "") {
+      if (call.options.schema !== undefined && parsed.response === "") {
         throw new Error("pi returned no text content (final assistant message had only thinking/tool-call blocks); cannot satisfy agent({schema})");
       }
-      return result.response;
+      return parsed.response;
     } finally {
       timeout.clear();
       if (worktree) await worktree.cleanup(onMeta);
     }
   }
 
-  /** Writes `<agentDir>/models.json` with a synthetic OpenAI/Anthropic-compatible provider when `baseUrl` is set. */
+  /**
+   * The agent-config home pi reads (`PI_CODING_AGENT_DIR`). For a custom `baseUrl` this is a per-config
+   * SUBDIRECTORY of the base agentDir, keyed by a stable hash of (baseUrl, api, model): the registry
+   * builds one runner per provider:model and each memoizes its models.json write, so without isolation
+   * two concurrent custom providers would overwrite each other's single `<agentDir>/models.json` and one
+   * provider's request could be routed to the other's endpoint. The key material (the API key) is NEVER
+   * part of the hash and never written to disk — it's injected per-spawn via CUSTOM_API_KEY_ENV — so two
+   * runners sharing an identical (baseUrl, api, model) can safely share a directory.
+   */
+  private resolvedAgentDir(): string | undefined {
+    if (!this.options.agentDir) return undefined;
+    if (!this.options.baseUrl) return this.options.agentDir;
+    const key = createHash("sha256")
+      .update(JSON.stringify([this.options.baseUrl, this.options.api ?? "openai-completions", this.options.model ?? ""]))
+      .digest("hex")
+      .slice(0, 16);
+    return path.join(this.options.agentDir, `custom-${key}`);
+  }
+
+  /** Writes `<resolvedAgentDir>/models.json` with a synthetic OpenAI/Anthropic-compatible provider when `baseUrl` is set. */
   private ensureModelsConfig(): Promise<void> {
     if (!this.options.baseUrl) return Promise.resolve();
     if (!this.options.agentDir) {
@@ -145,7 +184,7 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
       return Promise.reject(new WorkflowInputError("pi backend: baseUrl requires a --model (the model id sent to the endpoint)"));
     }
     if (!this.modelsConfigReady) {
-      this.modelsConfigReady = writePiModelsConfig(this.options.agentDir, {
+      this.modelsConfigReady = writePiModelsConfig(this.resolvedAgentDir() as string, {
         baseUrl: this.options.baseUrl,
         api: this.options.api ?? "openai-completions",
         model: this.options.model,
@@ -157,7 +196,8 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
 
   private spawnEnv(): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
-    if (this.options.agentDir) env.PI_CODING_AGENT_DIR = this.options.agentDir;
+    const agentDir = this.resolvedAgentDir();
+    if (agentDir) env.PI_CODING_AGENT_DIR = agentDir;
     // For a custom baseUrl, the generated models.json resolves the key from this env var (never written to disk).
     if (this.options.baseUrl && this.options.apiKey) env[CUSTOM_API_KEY_ENV] = this.options.apiKey;
     return env;
@@ -227,91 +267,6 @@ export async function writePiModelsConfig(
   await writeFile(path.join(agentDir, "models.json"), `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
-async function runPiProcess(
-  args: string[],
-  options: {
-    command: string;
-    cwd: string;
-    env: NodeJS.ProcessEnv;
-    signal: AbortSignal | undefined;
-    timedOut: () => boolean;
-    timeoutMs: number;
-  },
-): Promise<{ response: string; sessionId?: string; outputTokens?: number }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(options.command, args, {
-      cwd: options.cwd,
-      env: options.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let stdout = "";
-    let stderr = "";
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let settled = false;
-
-    const settle = (error: unknown, value?: { response: string; sessionId?: string; outputTokens?: number }) => {
-      if (settled) return;
-      settled = true;
-      options.signal?.removeEventListener("abort", abort);
-      if (error) reject(error);
-      else resolve(value ?? { response: "" });
-    };
-
-    const abort = () => {
-      child.kill("SIGTERM");
-      settle(options.timedOut() ? agentTimeoutError(options.timeoutMs) : new Error("agent aborted"));
-    };
-
-    const overflow = (stream: string, limit: number) => {
-      child.kill("SIGTERM");
-      settle(new Error(`pi ${stream} exceeded ${limit} bytes — aborting to avoid unbounded buffering`));
-    };
-
-    if (options.signal?.aborted) {
-      abort();
-      return;
-    }
-    options.signal?.addEventListener("abort", abort, { once: true });
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) return overflow("stdout", MAX_STDOUT_BYTES);
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      stderrBytes += chunk.length;
-      if (stderrBytes > MAX_STDERR_BYTES) return overflow("stderr", MAX_STDERR_BYTES);
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", (error) => settle(normalizePiSpawnError(error, options.command)));
-    child.on("exit", (code, signalName) => {
-      if (settled) return;
-      // pi exits 0 even when the model turn errored, so success/failure is decided by the LAST assistant
-      // message's stopReason, NOT the exit code (see the events parse below).
-      const parsed = parsePiEvents(stdout);
-      if (parsed.error) {
-        settle(new Error(`pi agent failed: ${parsed.error}`));
-        return;
-      }
-      if (parsed.hasAssistant) {
-        settle(undefined, {
-          response: parsed.response,
-          ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
-          ...(parsed.outputTokens !== undefined ? { outputTokens: parsed.outputTokens } : {}),
-        });
-        return;
-      }
-      // No parseable assistant turn at all → surface stderr / exit status as the failure.
-      const detail = cleanErrorText(stderr) || `exit code ${code ?? "unknown"}${signalName ? `, signal ${signalName}` : ""}`;
-      settle(new Error(`pi produced no assistant response: ${detail}`));
-    });
-  });
-}
-
 interface ParsedPiEvents {
   response: string;
   sessionId?: string;
@@ -361,7 +316,15 @@ export function parsePiEvents(raw: string): ParsedPiEvents {
   }
 
   if (lastAssistant && (lastAssistant.stopReason === "error" || lastAssistant.errorMessage)) {
-    return { response: "", hasAssistant, ...(sessionId ? { sessionId } : {}), error: cleanPiErrorMessage(lastAssistant.errorMessage) };
+    // Carry sessionId + accumulated outputTokens on the error path too, so a failed turn stays traceable
+    // and its real token spend (from earlier tool-using turns) isn't lost.
+    return {
+      response: "",
+      hasAssistant,
+      ...(sessionId ? { sessionId } : {}),
+      ...(outputTokens !== undefined ? { outputTokens } : {}),
+      error: cleanPiErrorMessage(lastAssistant.errorMessage),
+    };
   }
   return {
     response: lastAssistant ? assistantText(lastAssistant.content) : "",
@@ -427,11 +390,17 @@ function cleanErrorText(text: string): string {
     .slice(0, 2000);
 }
 
-function normalizePiSpawnError(error: Error, command: string): Error {
+function normalizePiSpawnError(error: Error, command: string, promptBytes: number): Error {
   const code = (error as NodeJS.ErrnoException).code;
   if (code === "ENOENT") {
     return new WorkflowInputError(
       `pi CLI not found at "${command}". Install it (npm i -g @earendil-works/pi-coding-agent), add it to PATH, or pass --pi-command <path> / command in the library API.`,
+    );
+  }
+  if (code === "E2BIG") {
+    // pi takes the prompt as a positional argv, so a huge fan-in prompt can exceed the OS ARG_MAX limit.
+    return new Error(
+      `pi prompt too large for argv (${promptBytes} bytes; exceeds the OS ARG_MAX limit) — reduce the fan-in size or shorten the prompt.`,
     );
   }
   return error;

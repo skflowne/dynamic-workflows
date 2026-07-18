@@ -80,6 +80,10 @@ export class CodexSdkAgentRunner implements WorkflowAgentRunner {
       try {
         turn = await thread.run(buildPrompt(call, this.options.baseInstructions, Boolean(worktree)), turnOptions);
       } catch (error) {
+        // thread.id (the Codex session/rollout UUID) is populated once the turn starts, so a
+        // failed/timed-out turn can still have one — report it here too, otherwise the web viewer
+        // can't link the trace of exactly the runs you most need to inspect.
+        if (thread.id) onMeta?.({ sessionId: thread.id });
         // A timeout aborts via our own controller (not the run-level signal) — surface a clear message
         // so the runtime treats it as a retryable agent failure rather than a workflow cancellation.
         if (timeout.timedOut()) throw agentTimeoutError(timeoutMs);
@@ -102,11 +106,21 @@ export class CodexSdkAgentRunner implements WorkflowAgentRunner {
  * `additionalProperties: false` and a `required` listing all of its properties. Properties that were
  * optional in the original schema are made nullable in the strict copy so the model can satisfy
  * OpenAI strict mode without changing the caller-visible loose schema semantics. Recurses through
- * `properties`, `items`, and `anyOf`/`oneOf`/`allOf`. Leaves non-object schemas untouched.
+ * `properties`, `items`, and `anyOf`/`oneOf`/`allOf`; `$defs`/`definitions`/`patternProperties` are
+ * treated as maps of name -> subschema (recursed into their values only, so a def/pattern literally
+ * named "properties" or "required" can't be mistaken for this node's own keys). A schema-valued
+ * `additionalProperties` (e.g. `Record<string, T>`) is preserved (recursively strictified) rather
+ * than forced to `false` — OpenAI strict mode may reject that outright, which is preferable to
+ * silently limiting the model to `{}`. Leaves non-object schemas untouched.
  */
 export function toStrictJsonSchema(schema: unknown): unknown {
   return strictify(schema);
 }
+
+// Keys whose *value* is a map of name -> subschema, not a schema node itself. Recursing into them
+// as if they were schema nodes corrupts a def/pattern named e.g. "properties" or "required" (its
+// value would be run through strictifyProperties/treated as this node's own additionalProperties).
+const MAP_OF_SCHEMAS_KEYS = new Set(["$defs", "definitions", "patternProperties"]);
 
 function strictify(node: unknown): unknown {
   if (Array.isArray(node)) return node.map(strictify);
@@ -116,16 +130,30 @@ function strictify(node: unknown): unknown {
   const originalRequired = stringSet(original.required);
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(original)) {
-    out[key] = key === "properties" ? strictifyProperties(value, originalRequired) : strictify(value);
+    if (key === "properties") {
+      out[key] = strictifyProperties(value, originalRequired);
+    } else if (MAP_OF_SCHEMAS_KEYS.has(key)) {
+      out[key] = strictifyMapOfSchemas(value);
+    } else {
+      out[key] = strictify(value);
+    }
   }
+
+  // additionalProperties may itself be a schema (map-type object, e.g. Record<string, T>) rather
+  // than a boolean. Forcing it to `false` would silently make the strict copy accept only `{}`,
+  // causing the model to emit empty objects that then fail loose-schema validation on retry after
+  // retry. Preserve a schema-valued additionalProperties (already recursively strictified above by
+  // the loop's `strictify(value)` branch) instead — OpenAI strict mode may reject such a schema
+  // outright, which is an explicit, visible failure, unlike silently dropping the caller's data.
+  const hasSchemaAdditionalProperties = out.additionalProperties !== null && typeof out.additionalProperties === "object";
 
   const type = out.type;
   const isObjectType = type === "object" || (Array.isArray(type) && type.includes("object"));
   if (out.properties && typeof out.properties === "object") {
-    out.additionalProperties = false;
+    if (!hasSchemaAdditionalProperties) out.additionalProperties = false;
     out.required = Object.keys(out.properties as Record<string, unknown>);
   } else if (isObjectType) {
-    out.additionalProperties = false;
+    if (!hasSchemaAdditionalProperties) out.additionalProperties = false;
   }
   return out;
 }
@@ -137,6 +165,17 @@ function strictifyProperties(value: unknown, required: Set<string>): unknown {
   for (const [name, subschema] of Object.entries(value as Record<string, unknown>)) {
     const strict = strictify(subschema);
     out[name] = required.has(name) ? strict : nullableSchema(strict);
+  }
+  return out;
+}
+
+// `$defs` / `definitions` / `patternProperties` are maps of name -> subschema too, but unlike
+// `properties` their entries are never made optional/nullable — just strictify each value in place.
+function strictifyMapOfSchemas(value: unknown): unknown {
+  if (!value || typeof value !== "object") return value;
+  const out: Record<string, unknown> = {};
+  for (const [name, subschema] of Object.entries(value as Record<string, unknown>)) {
+    out[name] = strictify(subschema);
   }
   return out;
 }
@@ -153,6 +192,21 @@ function nullableSchema(schema: unknown): unknown {
   }
 
   const out: Record<string, unknown> = { ...(schema as Record<string, unknown>) };
+
+  // `type: [X, "null"]` alone doesn't help if `enum`/`const` still only lists the original values —
+  // null would be allowed by `type` but rejected by `enum`, a self-contradictory schema. Fold null
+  // into the value constraint itself instead.
+  let enumTouched = false;
+  if (Array.isArray(out.enum)) {
+    out.enum = [...out.enum, null];
+    enumTouched = true;
+  } else if ("const" in out) {
+    const constValue = out.const;
+    delete out.const;
+    out.enum = [constValue, null];
+    enumTouched = true;
+  }
+
   if (typeof out.type === "string") {
     out.type = [out.type, "null"];
     return out;
@@ -169,6 +223,7 @@ function nullableSchema(schema: unknown): unknown {
     out.oneOf = [...out.oneOf, { type: "null" }];
     return out;
   }
+  if (enumTouched) return out;
   return { anyOf: [out, { type: "null" }] };
 }
 

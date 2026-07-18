@@ -38,10 +38,12 @@ export async function createDetachedWorktree(baseCwd: string): Promise<Worktree 
       // it did. `--porcelain` lists modified + untracked entries; a non-empty result means dirty.
       let dirty = false;
       try {
-        const { stdout } = await exec("git", ["-C", dir, "status", "--porcelain"]);
+        // Large maxBuffer: a big agent diff can produce far more than the 1MB default of --porcelain,
+        // and an overflow throw would otherwise be caught below and misclassified as clean.
+        const { stdout } = await exec("git", ["-C", dir, "status", "--porcelain"], { maxBuffer: 64 * 1024 * 1024 });
         dirty = stdout.trim().length > 0;
       } catch {
-        dirty = false; // If status fails, fall through to removal.
+        dirty = true; // Conservative: if status fails, preserve the worktree rather than destroy output.
       }
       if (dirty) {
         onMeta?.({ worktreePath: dir, worktreePreserved: true });

@@ -1,9 +1,9 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { WorkflowInputError } from "../errors.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner } from "../types.js";
 import { buildSubagentPrompt } from "./prompt.js";
-import { agentTimeoutError, DEFAULT_AGENT_TIMEOUT_MS, startAgentTimeout } from "./turn-control.js";
+import { spawnAgentProcess, type SpawnAgentResult } from "./spawn-process.js";
+import { DEFAULT_AGENT_TIMEOUT_MS, startAgentTimeout } from "./turn-control.js";
 import { createDetachedWorktree } from "./worktree.js";
 
 /** Output buffer ceilings — a runaway Gemini turn (e.g. YOLO tool spam) must never OOM the parent. */
@@ -64,19 +64,27 @@ export class GeminiCliAgentRunner implements WorkflowAgentRunner {
 
     const sessionId = resolveGeminiSessionId(this.options.args);
     onMeta?.({ backend: "gemini", ...(sessionId ? { sessionId } : {}) });
+    const command = this.options.command ?? "gemini";
 
     try {
-      const result = await runGeminiProcess(
-        buildGeminiArgs(prompt, this.options.model, this.options, sessionId),
-        {
-          command: this.options.command ?? "gemini",
-          cwd: workingDirectory,
-          parseJsonWrapper: this.options.jsonOutput !== false,
-          signal: timeout.signal,
-          timedOut: timeout.timedOut,
-          timeoutMs,
-        },
-      );
+      // The prompt goes on stdin (Gemini appends `-p` to stdin input) so a huge fan-in prompt can't
+      // blow past the OS ARG_MAX limit and isn't visible in `ps`; `-p ""` forces headless mode.
+      const raw = await spawnAgentProcess({
+        command,
+        args: buildGeminiArgs(this.options.model, this.options, sessionId),
+        cwd: workingDirectory,
+        env: process.env,
+        stdin: prompt,
+        maxStdoutBytes: MAX_STDOUT_BYTES,
+        maxStderrBytes: MAX_STDERR_BYTES,
+        label: "Gemini CLI",
+        signal: timeout.signal,
+        timedOut: timeout.timedOut,
+        timeoutMs,
+        normalizeSpawnError: (error) => normalizeGeminiSpawnError(error, command),
+      });
+      const result = parseGeminiResult(raw, this.options.jsonOutput !== false);
+      if (result.error) throw new Error(result.error);
       if (result.sessionId) onMeta?.({ backend: "gemini", sessionId: result.sessionId });
       if (typeof result.outputTokens === "number") onMeta?.({ outputTokens: result.outputTokens });
       return result.response;
@@ -88,7 +96,6 @@ export class GeminiCliAgentRunner implements WorkflowAgentRunner {
 }
 
 function buildGeminiArgs(
-  prompt: string,
   model: string | undefined,
   options: GeminiCliAgentRunnerOptions,
   sessionId: string | undefined,
@@ -98,7 +105,8 @@ function buildGeminiArgs(
   if (options.yolo !== false) args.push("-y");
   if (options.jsonOutput !== false) args.push("-o", "json");
   if (sessionId !== undefined && !hasGeminiSessionSelector(args)) args.push("--session-id", sessionId);
-  args.push("-p", prompt);
+  // Empty `-p` triggers headless mode; the actual prompt is fed on stdin (see run()).
+  args.push("-p", "");
   return args;
 }
 
@@ -132,95 +140,33 @@ function optionValue(args: string[] | undefined, name: string): string | undefin
   return undefined;
 }
 
-async function runGeminiProcess(
-  args: string[],
-  options: {
-    command: string;
-    cwd: string;
-    parseJsonWrapper: boolean;
-    signal: AbortSignal | undefined;
-    timedOut: () => boolean;
-    timeoutMs: number;
-  },
-): Promise<{ response: unknown; sessionId?: string; outputTokens?: number }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(options.command, args, {
-      cwd: options.cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+interface GeminiParseResult {
+  response: unknown;
+  sessionId?: string;
+  outputTokens?: number;
+  /** Set when the turn failed; the caller throws it (kept out of the happy path so meta is reported). */
+  error?: string;
+}
 
-    let stdout = "";
-    let stderr = "";
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let settled = false;
-
-    const settle = (error: unknown, value?: { response: unknown; sessionId?: string; outputTokens?: number }) => {
-      if (settled) return;
-      settled = true;
-      options.signal?.removeEventListener("abort", abort);
-      if (error) reject(error);
-      else resolve(value ?? { response: "" });
+function parseGeminiResult(raw: SpawnAgentResult, parseJsonWrapper: boolean): GeminiParseResult {
+  const parsed = parseJsonWrapper ? parseGeminiOutput(raw.stdout) ?? parseGeminiOutput(raw.stderr) : undefined;
+  if (parsed) {
+    const error = geminiErrorMessage(parsed);
+    if (error) return { response: "", error };
+    // `response` is normally a string; if Gemini returns a structured object we pass it through
+    // unchanged to normalizeAgentResult (saves a JSON round-trip when agent({schema}) is used).
+    return {
+      response: typeof parsed.response === "string" ? parsed.response : parsed.response ?? "",
+      ...metaFromGeminiJson(parsed),
     };
+  }
 
-    const abort = () => {
-      child.kill("SIGTERM");
-      settle(options.timedOut() ? agentTimeoutError(options.timeoutMs) : new Error("agent aborted"));
-    };
+  const text = raw.stdout.trim();
+  if (raw.code === 0 && text) return { response: text };
 
-    const overflow = (stream: string, limit: number) => {
-      child.kill("SIGTERM");
-      settle(new Error(`Gemini CLI ${stream} exceeded ${limit} bytes — aborting to avoid unbounded buffering`));
-    };
-
-    if (options.signal?.aborted) {
-      abort();
-      return;
-    }
-    options.signal?.addEventListener("abort", abort, { once: true });
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > MAX_STDOUT_BYTES) return overflow("stdout", MAX_STDOUT_BYTES);
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      if (settled) return;
-      stderrBytes += chunk.length;
-      if (stderrBytes > MAX_STDERR_BYTES) return overflow("stderr", MAX_STDERR_BYTES);
-      stderr += chunk.toString("utf8");
-    });
-    child.on("error", (error) => settle(normalizeGeminiSpawnError(error, options.command)));
-    child.on("exit", (code, signal) => {
-      if (settled) return;
-      const parsed = options.parseJsonWrapper ? parseGeminiOutput(stdout) ?? parseGeminiOutput(stderr) : undefined;
-      if (parsed) {
-        const error = geminiErrorMessage(parsed);
-        if (error) {
-          settle(new Error(error));
-          return;
-        }
-        // `response` is normally a string; if Gemini returns a structured object we pass it through
-        // unchanged to normalizeAgentResult (saves a JSON round-trip when agent({schema}) is used).
-        settle(undefined, {
-          response: typeof parsed.response === "string" ? parsed.response : parsed.response ?? "",
-          ...metaFromGeminiJson(parsed),
-        });
-        return;
-      }
-
-      const text = stdout.trim();
-      if (code === 0 && text) {
-        settle(undefined, { response: text });
-        return;
-      }
-
-      const detail = cleanErrorText(stderr) || text || `exit code ${code ?? "unknown"}${signal ? `, signal ${signal}` : ""}`;
-      settle(new Error(`Gemini CLI failed: ${detail}`));
-    });
-  });
+  const detail =
+    cleanErrorText(raw.stderr) || text || `exit code ${raw.code ?? "unknown"}${raw.signal ? `, signal ${raw.signal}` : ""}`;
+  return { response: "", error: `Gemini CLI failed: ${detail}` };
 }
 
 function parseGeminiOutput(text: string): GeminiJsonOutput | undefined {
@@ -323,7 +269,10 @@ function sumModelOutputTokens(stats: unknown): number | undefined {
     const tokens = (model as { tokens?: unknown }).tokens;
     if (!tokens || typeof tokens !== "object") continue;
     const record = tokens as Record<string, unknown>;
-    const value = numberField(record, "candidates") ?? numberField(record, "output") ?? numberField(record, "total");
+    // `candidates` (and `output`) are generation-only. NEVER fall back to `total`, which includes input
+    // tokens and would inflate budget.spent(); when neither is present, leave it undefined so the
+    // runtime falls back to estimateTokens.
+    const value = numberField(record, "candidates") ?? numberField(record, "output");
     if (typeof value === "number") {
       total += value;
       found = true;

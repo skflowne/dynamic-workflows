@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PiCliAgentRunner, runWorkflow } from "../src/index.js";
@@ -9,6 +9,26 @@ import type { WorkflowAgentCall, WorkflowAgentMeta } from "../src/index.js";
 
 function makeCall(prompt: string, options: Partial<WorkflowAgentCall["options"]> = {}): WorkflowAgentCall {
   return { prompt, options: { label: "pi", ...options }, index: 1, runId: "wf_pi_test", cacheKey: "k" };
+}
+
+/** Recursively finds the single generated models.json under `agentDir` (now nested in a per-config subdir). */
+async function findModelsConfigPath(agentDir: string): Promise<string | undefined> {
+  const entries = await readdir(agentDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(agentDir, entry.name);
+    if (entry.isFile() && entry.name === "models.json") return full;
+    if (entry.isDirectory()) {
+      const nested = await findModelsConfigPath(full);
+      if (nested) return nested;
+    }
+  }
+  return undefined;
+}
+
+async function readModelsConfig(agentDir: string): Promise<string> {
+  const found = await findModelsConfigPath(agentDir);
+  if (!found) throw new Error(`no models.json under ${agentDir}`);
+  return readFile(found, "utf8");
 }
 
 /**
@@ -145,8 +165,9 @@ test("PiCliAgentRunner materializes models.json for a custom base URL and inject
       result,
       "provider=custom;baseUrl=https://api.deepseek.com;apiRef=$CODEX_WORKFLOW_PI_API_KEY;keyEnv=sk-secret;modelId=deepseek-v4-flash",
     );
-    // The literal key must never be written to the models.json on disk.
-    const onDisk = await readFile(path.join(agentDir, "models.json"), "utf8");
+    // The literal key must never be written to the models.json on disk. (For a custom baseUrl the file
+    // lives in a per-config subdir of agentDir, so find it recursively.)
+    const onDisk = await readModelsConfig(agentDir);
     assert.doesNotMatch(onDisk, /sk-secret/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -189,6 +210,92 @@ test("PiCliAgentRunner fails clearly when a schema turn ends with a text-less as
     // Without a schema the empty string is a legitimate result and must pass through.
     const plain = await runner.run(makeCall("just do it"), undefined, () => {});
     assert.equal(plain, "");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("PiCliAgentRunner rejects with the canonical agentTimeoutMs message when a turn hangs", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-pi-timeout-"));
+  try {
+    const fakePi = path.join(dir, "fake-pi");
+    // Never produces the JSON event stream — sleeps well past the tiny agentTimeoutMs below, so the
+    // runner's own timeout (not a user abort, and not pi's exit-code-0-on-error quirk) must fire and
+    // reject with the shared turn-control message (src/runners/turn-control.ts `agentTimeoutError`),
+    // which the runtime treats as a retryable agent failure — the message text is the observable
+    // contract across the Bun-child IPC boundary.
+    await writeFile(
+      fakePi,
+      `#!/usr/bin/env node
+process.on("SIGTERM", () => process.exit(1));
+setInterval(() => {}, 1000);
+`,
+      "utf8",
+    );
+    await chmod(fakePi, 0o755);
+
+    const runner = new PiCliAgentRunner({ command: fakePi, cwd: dir, model: "m", agentTimeoutMs: 300 });
+    await assert.rejects(
+      () => runner.run(makeCall("payload"), undefined, () => {}),
+      /agent exceeded agentTimeoutMs \(300ms\)/,
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("PiCliAgentRunner isolates models.json per custom baseUrl (concurrent providers don't clobber)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-pi-isolation-"));
+  try {
+    // Two runners share ONE base agentDir but have different baseUrls. Each must land in its own subdir
+    // so provider A's request can never be routed to provider B's endpoint.
+    const agentDir = path.join(dir, "home");
+    const fakePi = await writeFakePi(dir, {
+      bodyExpr: `(() => {
+        const cfg = JSON.parse(fs.readFileSync(env.PI_CODING_AGENT_DIR + "/models.json", "utf8"));
+        return "baseUrl=" + cfg.providers.custom.baseUrl + ";dir=" + env.PI_CODING_AGENT_DIR;
+      })()`,
+    });
+
+    const runnerA = new PiCliAgentRunner({ command: fakePi, cwd: dir, agentDir, baseUrl: "https://a.example.com", model: "m", apiKey: "ka" });
+    const runnerB = new PiCliAgentRunner({ command: fakePi, cwd: dir, agentDir, baseUrl: "https://b.example.com", model: "m", apiKey: "kb" });
+
+    // Run both; the second must NOT have overwritten the first's models.json.
+    const [resA, resB] = await Promise.all([
+      runnerA.run(makeCall("a"), undefined, () => {}),
+      runnerB.run(makeCall("b"), undefined, () => {}),
+    ]);
+
+    assert.match(String(resA), /baseUrl=https:\/\/a\.example\.com/);
+    assert.match(String(resB), /baseUrl=https:\/\/b\.example\.com/);
+    // Distinct PI_CODING_AGENT_DIR subdirs → each config is preserved independently on disk.
+    const dirA = String(resA).split("dir=")[1] ?? "";
+    const dirB = String(resB).split("dir=")[1] ?? "";
+    assert.ok(dirA && dirB, "expected both agent dirs to be reported");
+    assert.notEqual(dirA, dirB);
+    assert.equal(JSON.parse(await readFile(path.join(dirA, "models.json"), "utf8")).providers.custom.baseUrl, "https://a.example.com");
+    assert.equal(JSON.parse(await readFile(path.join(dirB, "models.json"), "utf8")).providers.custom.baseUrl, "https://b.example.com");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("PiCliAgentRunner reports session + tokens before throwing on a stopReason:error turn (A9)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-pi-errmeta-"));
+  try {
+    const fakePi = await writeFakePi(dir, {
+      bodyExpr: `""`,
+      stopReason: "error",
+      usageOutput: 33,
+      errorMessage: JSON.stringify({ error: { message: "boom", code: 500 } }),
+    });
+
+    const metas: WorkflowAgentMeta[] = [];
+    const runner = new PiCliAgentRunner({ command: fakePi, cwd: dir, model: "m", agentTimeoutMs: 5000 });
+    await assert.rejects(() => runner.run(makeCall("x"), undefined, (meta) => metas.push(meta)), /pi agent failed:.*boom/);
+    // Even on the error path, the failed turn stays traceable: sessionId + real token spend are reported.
+    assert.ok(metas.some((m) => m.sessionId === "019eaf6c-79c5-70e0-8b8c-a7b688facbdd"), `expected sessionId meta, got ${JSON.stringify(metas)}`);
+    assert.ok(metas.some((m) => m.outputTokens === 33), `expected outputTokens=33 meta, got ${JSON.stringify(metas)}`);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
