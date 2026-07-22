@@ -25,3 +25,11 @@ export class WorkflowAbortError extends Error {
     this.name = "WorkflowAbortError";
   }
 }
+
+/** A backend process produced more output than can be handled safely. Retrying the same turn is not useful. */
+export class AgentOutputLimitExceededError extends Error {
+  constructor(message = "Agent output limit exceeded") {
+    super(message);
+    this.name = "AgentOutputLimitExceededError";
+  }
+}

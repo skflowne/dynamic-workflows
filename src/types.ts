@@ -42,6 +42,8 @@ export interface WorkflowAgentOptions {
    * anonymous backend is used. See {@link WorkflowRunnerResolver}.
    */
   provider?: string;
+  /** Total attempts for this call. Overrides the run-wide agentMaxAttempts; mutation agents should use 1. */
+  maxAttempts?: number;
   isolation?: "worktree" | "remote" | string;
   agentType?: string;
 }

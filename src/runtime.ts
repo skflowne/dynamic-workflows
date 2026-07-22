@@ -4,7 +4,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Ajv } from "ajv/dist/ajv.js";
-import { WorkflowAbortError, WorkflowAgentCapError, WorkflowBudgetExceededError, WorkflowInputError } from "./errors.js";
+import {
+  AgentOutputLimitExceededError,
+  WorkflowAbortError,
+  WorkflowAgentCapError,
+  WorkflowBudgetExceededError,
+  WorkflowInputError,
+} from "./errors.js";
 import { cloneJournalResult, journalEntryFromCall, workflowAgentCacheKey } from "./journal.js";
 import { parseWorkflowScript } from "./parser.js";
 import type {
@@ -260,9 +266,11 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
       // rather than being retried into a `null` failure. Cached agents never reach this.
       const runner = resolveRunner(callOptions);
 
-      const maxAttempts = ctx.agentMaxAttempts;
+      const maxAttempts = callOptions.maxAttempts ?? ctx.agentMaxAttempts;
+      let attemptsMade = 0;
       let lastMessage = "";
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        attemptsMade = attempt;
         if (ctx.internalAbort.signal.aborted) throw new WorkflowAbortError();
         throwIfUserAborted();
 
@@ -306,6 +314,9 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
           if (typeof outputTokens === "number") state.spent += outputTokens;
           inFlight.delete(runPromise);
           lastMessage = error instanceof Error ? error.message : String(error);
+          // Output overflow is deterministic for the completed tool-heavy turn and mutation agents may
+          // already have changed their checkout. Replaying the same turn is both wasteful and unsafe.
+          if (error instanceof AgentOutputLimitExceededError) break;
           if (attempt < maxAttempts) {
             emitLog(`agent ${label} attempt ${attempt}/${maxAttempts} failed: ${lastMessage}; retrying`);
             await abortableDelay(retryBackoffMs(attempt), ctx.agentSignal);
@@ -344,14 +355,14 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
         return result;
       }
 
-      // Retries exhausted: record the failure and return null so `.filter(Boolean)` works (Claude parity).
-      emitLog(`agent ${label} failed after ${maxAttempts} attempt(s): ${lastMessage}`);
+      // Failed or stopped on a non-retryable error: record it and return null so `.filter(Boolean)` works.
+      emitLog(`agent ${label} failed after ${attemptsMade} attempt(s): ${lastMessage}`);
       state.failures.push({
         label,
         ...(assignedPhase !== undefined ? { phase: assignedPhase } : {}),
         index,
         key: cacheKey,
-        attempts: maxAttempts,
+        attempts: attemptsMade,
         error: lastMessage,
       });
       options.onProgress?.(agentProgress(label, assignedPhase, "failed", { error: lastMessage, index, key: cacheKey }));
@@ -864,6 +875,12 @@ function normalizeAgentOptions(value: unknown): WorkflowAgentOptions {
   setOptionalString(normalized, "phase", options.phase, "agent phase");
   setOptionalString(normalized, "model", options.model, "agent model");
   setOptionalString(normalized, "provider", options.provider, "agent provider");
+  if (options.maxAttempts !== undefined) {
+    if (typeof options.maxAttempts !== "number" || !Number.isInteger(options.maxAttempts) || options.maxAttempts < 1) {
+      throw new TypeError("agent maxAttempts must be a positive integer");
+    }
+    normalized.maxAttempts = options.maxAttempts;
+  }
   setOptionalString(normalized, "isolation", options.isolation, "agent isolation");
   setOptionalString(normalized, "agentType", options.agentType, "agent type");
   return normalized;

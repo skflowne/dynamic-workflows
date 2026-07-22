@@ -1,4 +1,10 @@
-export { WorkflowAbortError, WorkflowAgentCapError, WorkflowBudgetExceededError, WorkflowInputError } from "./errors.js";
+export {
+  AgentOutputLimitExceededError,
+  WorkflowAbortError,
+  WorkflowAgentCapError,
+  WorkflowBudgetExceededError,
+  WorkflowInputError,
+} from "./errors.js";
 export {
   cloneJournalResult,
   FileWorkflowJournal,
@@ -23,7 +29,7 @@ export { CodexSdkAgentRunner } from "./runners/codex-sdk.js";
 export type { CodexSdkAgentRunnerOptions } from "./runners/codex-sdk.js";
 export { GeminiCliAgentRunner } from "./runners/gemini-cli.js";
 export type { GeminiCliAgentRunnerOptions } from "./runners/gemini-cli.js";
-export { PiCliAgentRunner } from "./runners/pi-cli.js";
+export { PiCliAgentRunner, PiEventStreamParser } from "./runners/pi-cli.js";
 export type { PiCliAgentRunnerOptions } from "./runners/pi-cli.js";
 export { ScriptedAgentRunner } from "./runners/scripted.js";
 export type { ScriptedAgentHandler } from "./runners/scripted.js";

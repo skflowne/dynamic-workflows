@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  AgentOutputLimitExceededError,
   FileWorkflowJournal,
   InMemoryWorkflowJournal,
   runWorkflow,
@@ -330,6 +331,49 @@ return { value }
   assert.equal(attempts, 3);
   assert.equal(result.result.value, "recovered");
   assert.equal(result.failures.length, 0);
+});
+
+test("agent maxAttempts overrides the run-wide retry count for mutation calls", async () => {
+  let attempts = 0;
+  const runner = new ScriptedAgentRunner(() => {
+    attempts++;
+    throw new Error("mutation failed");
+  });
+
+  const result = await runWorkflow<{ value: unknown }>(
+    `export const meta = { name: 'per_call_attempts', description: 'Per-call retry override' }
+const value = await agent('mutate', { label: 'mutate', maxAttempts: 1 })
+return { value }
+`,
+    { runner, agentMaxAttempts: 3 },
+  );
+
+  assert.equal(attempts, 1);
+  assert.equal(result.result.value, null);
+  assert.equal(result.failures[0]?.attempts, 1);
+});
+
+test("runWorkflow does not retry a deterministic agent output overflow", async () => {
+  let attempts = 0;
+  const runner = new ScriptedAgentRunner(() => {
+    attempts++;
+    throw new AgentOutputLimitExceededError("pi stdout overflow");
+  });
+
+  const result = await runWorkflow<{ value: unknown }>(
+    `export const meta = { name: 'overflow_no_retry', description: 'Do not retry output overflow' }
+const value = await agent('mutation-heavy', { label: 'mutation-heavy' })
+return { value }
+`,
+    { runner, agentMaxAttempts: 3 },
+  );
+
+  assert.equal(attempts, 1);
+  assert.equal(result.result.value, null);
+  assert.equal(result.failures.length, 1);
+  assert.equal(result.failures[0]?.attempts, 1);
+  assert.match(result.failures[0]?.error ?? "", /stdout overflow/);
+  assert.doesNotMatch(result.logs.join("\n"), /retrying/);
 });
 
 test("runWorkflow returns null and records a failure after exhausting retries", async () => {
