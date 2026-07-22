@@ -30,8 +30,10 @@ export interface PiCliAgentRunnerOptions {
   model?: string;
   /** `--provider`. Ignored when `baseUrl` is set (a synthetic `custom` provider is generated instead). */
   provider?: string;
-  /** API key. Passed via `--api-key` for built-in providers, or injected via env for a custom `baseUrl`. */
+  /** API key. Used only with `apiKeyEnv` for a built-in provider or injected into the synthetic custom provider. */
   apiKey?: string;
+  /** Provider-native credential environment variable for a built-in pi provider. */
+  apiKeyEnv?: string;
   /**
    * Custom OpenAI-compatible (or Anthropic-compatible) endpoint. pi has no `--base-url` flag, so when
    * this is set the runner materializes a `models.json` under `agentDir` describing a synthetic provider
@@ -112,7 +114,6 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
     const timeoutMs = this.options.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
     const timeout = startAgentTimeout(timeoutMs, signal);
     const command = this.options.command ?? "pi";
-    const promptBytes = Buffer.byteLength(prompt);
 
     try {
       await this.ensureModelsConfig();
@@ -121,9 +122,12 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
       try {
         raw = await spawnAgentProcess({
           command,
-          args: buildPiArgs(prompt, this.options),
+          args: buildPiArgs(this.options),
           cwd: workingDirectory,
           env: this.spawnEnv(),
+          // pi's non-interactive mode combines stdin into its initial message, keeping potentially
+          // sensitive prompts out of the OS-visible argv list.
+          stdin: prompt,
           // The event parser retains only the final assistant state, not the complete tool-heavy stream.
           maxStdoutBytes: 0,
           maxStderrBytes: MAX_STDERR_BYTES,
@@ -133,7 +137,7 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
           signal: timeout.signal,
           timedOut: timeout.timedOut,
           timeoutMs,
-          normalizeSpawnError: (error) => normalizePiSpawnError(error, command, promptBytes),
+          normalizeSpawnError: (error) => normalizePiSpawnError(error, command),
         });
       } catch (error) {
         // Preserve session linkage and tokens accumulated before a streaming/parser failure.
@@ -141,13 +145,17 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
         throw error;
       }
 
-      // pi exits 0 even when the model turn errored, so success/failure is decided by the LAST assistant
-      // message's stopReason, NOT the exit code.
+      // pi may exit 0 when the model turn errored, so inspect the final assistant message as well as
+      // the process status below.
       const parsed = eventParser.finish();
       // Report session + tokens BEFORE any throw so a failed/errored turn is still traceable and its
       // real token spend isn't lost.
       reportPiMeta(parsed, onMeta);
       if (parsed.error) throw new Error(`pi agent failed: ${parsed.error}`);
+      if (raw.code !== 0) {
+        const detail = cleanErrorText(raw.stderr) || `exit code ${raw.code ?? "unknown"}${raw.signal ? `, signal ${raw.signal}` : ""}`;
+        throw new Error(`pi CLI failed: ${detail}`);
+      }
       if (!parsed.hasAssistant) {
         const detail =
           cleanErrorText(raw.stderr) || `exit code ${raw.code ?? "unknown"}${raw.signal ? `, signal ${raw.signal}` : ""}`;
@@ -213,11 +221,17 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
     if (agentDir) env.PI_CODING_AGENT_DIR = agentDir;
     // For a custom baseUrl, the generated models.json resolves the key from this env var (never written to disk).
     if (this.options.baseUrl && this.options.apiKey) env[CUSTOM_API_KEY_ENV] = this.options.apiKey;
+    if (!this.options.baseUrl && this.options.apiKey) {
+      if (!this.options.apiKeyEnv) {
+        throw new WorkflowInputError("pi backend: apiKey for a built-in provider requires apiKeyEnv so it is not exposed in argv");
+      }
+      env[this.options.apiKeyEnv] = this.options.apiKey;
+    }
     return env;
   }
 }
 
-function buildPiArgs(prompt: string, options: PiCliAgentRunnerOptions): string[] {
+function buildPiArgs(options: PiCliAgentRunnerOptions): string[] {
   const args = [...(options.args ?? [])];
   args.push("-p", "--mode", "json");
   if (options.contextFiles !== true) args.push("--no-context-files");
@@ -228,7 +242,6 @@ function buildPiArgs(prompt: string, options: PiCliAgentRunnerOptions): string[]
   } else {
     if (options.provider) args.push("--provider", options.provider);
     if (options.model) args.push("--model", options.model);
-    if (options.apiKey) args.push("--api-key", options.apiKey);
   }
 
   if (options.thinking) args.push("--thinking", options.thinking);
@@ -240,8 +253,6 @@ function buildPiArgs(prompt: string, options: PiCliAgentRunnerOptions): string[]
   if (options.approve !== false) args.push("--approve");
   if (options.sessionDir) args.push("--session-dir", options.sessionDir);
 
-  // Prompt is a positional argument; keep it last so it can't be parsed as a flag value.
-  args.push(prompt);
   return args;
 }
 
@@ -453,7 +464,7 @@ function cleanErrorText(text: string): string {
     .slice(0, 2000);
 }
 
-function normalizePiSpawnError(error: Error, command: string, promptBytes: number): Error {
+function normalizePiSpawnError(error: Error, command: string): Error {
   const code = (error as NodeJS.ErrnoException).code;
   if (code === "ENOENT") {
     return new WorkflowInputError(
@@ -461,10 +472,7 @@ function normalizePiSpawnError(error: Error, command: string, promptBytes: numbe
     );
   }
   if (code === "E2BIG") {
-    // pi takes the prompt as a positional argv, so a huge fan-in prompt can exceed the OS ARG_MAX limit.
-    return new Error(
-      `pi prompt too large for argv (${promptBytes} bytes; exceeds the OS ARG_MAX limit) — reduce the fan-in size or shorten the prompt.`,
-    );
+    return new Error("pi command arguments exceed the OS ARG_MAX limit; reduce configured extra arguments.");
   }
   return error;
 }

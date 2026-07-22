@@ -296,6 +296,39 @@ require("node:fs").writeFileSync(${JSON.stringify(readyFile)}, "ok");
   }
 });
 
+test("GeminiCliAgentRunner terminates tool descendants on abort", { skip: process.platform === "win32" ? "POSIX process-group assertion" : false }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-gemini-tree-"));
+  try {
+    const fakeGemini = path.join(dir, "fake-gemini");
+    const childPidPath = path.join(dir, "child.pid");
+    await writeFile(
+      fakeGemini,
+      `#!/usr/bin/env node
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+process.on("SIGTERM", () => {});
+const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+fs.writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));
+setInterval(() => {}, 1000);
+`,
+      "utf8",
+    );
+    await chmod(fakeGemini, 0o755);
+
+    const runner = new GeminiCliAgentRunner({ command: fakeGemini, cwd: dir, agentTimeoutMs: 60000 });
+    const controller = new AbortController();
+    const pending = runner.run(makeCall("payload"), controller.signal, () => {});
+    while (!existsSync(childPidPath)) await delay(20);
+    const childPid = Number(await (await import("node:fs/promises")).readFile(childPidPath, "utf8"));
+
+    controller.abort();
+    await assert.rejects(() => pending, /agent aborted/);
+    await assert.rejects(async () => process.kill(childPid, 0), /ESRCH/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test(
   "GeminiCliAgentRunner executes a live Gemini CLI agent turn",
   { skip: process.env.RUN_GEMINI_CLI_LIVE === "1" ? false : "Set RUN_GEMINI_CLI_LIVE=1 to run the live Gemini CLI test." },

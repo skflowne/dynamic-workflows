@@ -67,6 +67,8 @@ export interface RunFlags {
   "pi-provider"?: string;
   "base-url"?: string;
   "api-key"?: string;
+  /** Provider-native environment variable name for a pi built-in provider credential. */
+  piApiKeyEnv?: string;
   "pi-api"?: string;
   thinking?: string;
   tools?: string;
@@ -779,8 +781,13 @@ function providerDefToFlags(def: ProviderDef, effectiveModel: string | undefined
     if (def.baseUrl) flags["base-url"] = def.baseUrl;
     if (def.api) flags["pi-api"] = def.api;
     if (def.apiKeyEnv) {
-      const key = process.env[def.apiKeyEnv];
-      if (key) flags["api-key"] = key; // in-memory only; never written to a record or the generated models.json
+      flags.piApiKeyEnv = def.apiKeyEnv;
+      // Built-in pi providers read their native credential environment variables directly. Only a
+      // generated custom-endpoint config needs the value copied into its synthetic env variable.
+      if (def.baseUrl) {
+        const key = process.env[def.apiKeyEnv];
+        if (key) flags["api-key"] = key;
+      }
     }
     if (def.thinking) flags.thinking = def.thinking;
     if (def.tools?.length) flags.tools = def.tools.join(",");
@@ -844,6 +851,7 @@ function buildPiRunner(cwd: string, flags: RunFlags, dataDir: string): WorkflowA
     options.agentDir = piHomeDir(dataDir);
   }
   if (flags["api-key"]) options.apiKey = flags["api-key"];
+  if (flags.piApiKeyEnv) options.apiKeyEnv = flags.piApiKeyEnv;
   if (flags["pi-api"]) {
     options.api = assertOneOf(flags["pi-api"], PI_API_SHAPES, "api") as NonNullable<PiCliAgentRunnerOptions["api"]>;
   }

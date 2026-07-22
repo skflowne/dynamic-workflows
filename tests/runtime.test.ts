@@ -116,6 +116,17 @@ return {
   }
 });
 
+test("runWorkflow receives a large final Bun IPC result after process close", async () => {
+  const result = await runWorkflow<string>(
+    `export const meta = { name: 'large_ipc_result', description: 'Large final result' }
+return 'x'.repeat(500000)
+`,
+    { runner: new ScriptedAgentRunner(() => "unused") },
+  );
+
+  assert.equal(result.result.length, 500000);
+});
+
 test("parallel rejects promise arrays like Claude workflow runtime", async () => {
   await assert.rejects(
     () =>
@@ -421,6 +432,74 @@ return { a, b, spent: budget.spent() }
   // length/4 estimate). Total stays 100 — proving real usage feeds spent and cache hits are free.
   assert.equal(result.result.spent, 100);
   assert.equal(result.cacheHits, 1);
+});
+
+test("budget permits a cached agent after live turns exhaust it", async () => {
+  const journal = new InMemoryWorkflowJournal();
+  const runner: WorkflowAgentRunner = {
+    async run(call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      onMeta?.({ outputTokens: 100 });
+      return call.prompt;
+    },
+  };
+
+  const result = await runWorkflow<{ a: string; b: string; spent: number }>(
+    `export const meta = { name: 'budget_cached', description: 'Cached result remains free' }
+const a = await agent('same', { label: 'same' })
+const b = await agent('same', { label: 'same' })
+return { a, b, spent: budget.spent() }
+`,
+    { runner, journal, tokenBudget: 100 },
+  );
+
+  assert.deepEqual(result.result, { a: 'same', b: 'same', spent: 100 });
+  assert.equal(result.cacheHits, 1);
+});
+
+test("budget stops retries after a failed attempt exhausts it", async () => {
+  let attempts = 0;
+  const runner: WorkflowAgentRunner = {
+    async run(_call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      attempts++;
+      onMeta?.({ outputTokens: 50 });
+      return "not json";
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'budget_retry', description: 'Retries observe budget' }
+return agent('x', { label: 'x', schema: { type: 'object', required: ['a'], properties: { a: { type: 'string' } } } })
+`,
+        { runner, tokenBudget: 50, agentMaxAttempts: 3 },
+      ),
+    /workflow token budget exhausted/,
+  );
+  assert.equal(attempts, 1);
+});
+
+test("budget serializes live parallel agents and rejects queued calls after exhaustion", async () => {
+  let calls = 0;
+  const runner: WorkflowAgentRunner = {
+    async run(call, _signal, onMeta?: (meta: WorkflowAgentMeta) => void) {
+      calls++;
+      onMeta?.({ outputTokens: 50 });
+      return call.prompt;
+    },
+  };
+
+  await assert.rejects(
+    () =>
+      runWorkflow(
+        `export const meta = { name: 'budget_parallel_queue', description: 'Queued calls observe budget' }
+return parallel(['a', 'b', 'c'].map((prompt) => () => agent(prompt, { label: prompt })))
+`,
+        { runner, concurrency: 3, tokenBudget: 50 },
+      ),
+    /workflow token budget exhausted/,
+  );
+  assert.equal(calls, 1);
 });
 
 test("runWorkflow progress exposes running agent detail before journal write", async () => {

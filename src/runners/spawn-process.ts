@@ -53,6 +53,7 @@ export function spawnAgentProcess(options: SpawnAgentOptions): Promise<SpawnAgen
     const child = spawn(options.command, options.args, {
       cwd: options.cwd,
       env: options.env,
+      detached: process.platform !== "win32",
       stdio: [options.stdin !== undefined ? "pipe" : "ignore", "pipe", "pipe"],
     });
 
@@ -90,10 +91,10 @@ export function spawnAgentProcess(options: SpawnAgentOptions): Promise<SpawnAgen
     const terminate = (error: unknown) => {
       if (settled || pendingError !== undefined) return;
       pendingError = error;
-      child.kill("SIGTERM");
+      killProcessTree(child.pid, "SIGTERM");
       killTimer = setTimeout(() => {
         killTimer = undefined;
-        child.kill("SIGKILL");
+        killProcessTree(child.pid, "SIGKILL");
       }, SIGKILL_GRACE_MS);
       killTimer.unref?.();
     };
@@ -155,4 +156,18 @@ export function spawnAgentProcess(options: SpawnAgentOptions): Promise<SpawnAgen
       child.stdin.end(options.stdin);
     }
   });
+}
+
+function killProcessTree(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (!pid) return;
+  if (process.platform === "win32") {
+    const args = signal === "SIGKILL" ? ["/pid", String(pid), "/t", "/f"] : ["/pid", String(pid), "/t"];
+    spawn("taskkill", args, { stdio: "ignore" }).unref();
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // The process group may already have exited.
+  }
 }

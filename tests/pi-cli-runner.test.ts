@@ -48,7 +48,7 @@ const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const has = (name) => args.includes(name);
 const env = process.env;
-const prompt = args[args.length - 1] || "";
+const prompt = fs.readFileSync(0, "utf8");
 const text = String(${opts.bodyExpr});
 const content = ${opts.contentJson ?? (opts.stopReason === "error" ? "[]" : `[{ type: "thinking", thinking: "deciding" }, { type: "text", text }]`)};
 const assistant = {
@@ -103,6 +103,28 @@ test("PiCliAgentRunner parses the JSON event stream, returns assistant text, rep
   }
 });
 
+test("PiCliAgentRunner keeps built-in credentials and prompts out of argv", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-pi-argv-"));
+  try {
+    const fakePi = await writeFakePi(dir, {
+      bodyExpr: `["argvHasKey=" + args.includes("secret-key"), "apiFlag=" + has("--api-key"), "envKey=" + env.TEST_PI_API_KEY, "prompt=" + prompt].join(";")`,
+    });
+    const runner = new PiCliAgentRunner({
+      command: fakePi,
+      cwd: dir,
+      model: "m",
+      apiKey: "secret-key",
+      apiKeyEnv: "TEST_PI_API_KEY",
+    });
+
+    const result = await runner.run(makeCall("sensitive prompt"), undefined, () => {});
+    assert.match(String(result), /^argvHasKey=false;apiFlag=false;envKey=secret-key;prompt=/);
+    assert.match(String(result), /sensitive prompt$/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("PiCliAgentRunner treats a stopReason:error turn as a failure even though pi exits 0", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-pi-err-"));
   try {
@@ -114,6 +136,28 @@ test("PiCliAgentRunner treats a stopReason:error turn as a failure even though p
 
     const runner = new PiCliAgentRunner({ command: fakePi, cwd: dir, model: "m", agentTimeoutMs: 5000 });
     await assert.rejects(() => runner.run(makeCall("x"), undefined, () => {}), /pi agent failed:.*Connection error/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("PiCliAgentRunner rejects a non-zero exit after an assistant event", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-pi-exit-"));
+  try {
+    const fakePi = path.join(dir, "fake-pi");
+    await writeFile(
+      fakePi,
+      `#!/usr/bin/env node
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "stop" } }));
+console.error("backend crashed");
+process.exit(1);
+`,
+      "utf8",
+    );
+    await chmod(fakePi, 0o755);
+
+    const runner = new PiCliAgentRunner({ command: fakePi, cwd: dir, model: "m" });
+    await assert.rejects(() => runner.run(makeCall("x"), undefined, () => {}), /pi CLI failed: backend crashed/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

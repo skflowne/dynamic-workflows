@@ -85,6 +85,8 @@ type ChildMessage = ChildRequestMessage | ChildEventMessage | ChildResultMessage
 interface RunContext {
   state: RuntimeState;
   limiter: <T>(fn: () => Promise<T>) => Promise<T>;
+  /** Serializes live turns when a shared token budget is active. */
+  budgetLimiter: <T>(fn: () => Promise<T>) => Promise<T>;
   maxAgents: number;
   /** Total attempts per agent (1 = no retry). */
   agentMaxAttempts: number;
@@ -161,6 +163,9 @@ export async function runWorkflow<T = unknown>(
 function createRunContext(options: WorkflowRunOptions, runId: string): RunContext {
   const state: RuntimeState = { logs: [], phases: [], agentCount: 0, nextAgentIndex: 0, cacheHits: 0, spent: 0, failures: [] };
   const limiter = createLimiter(resolveConcurrency(options.concurrency));
+  // Token usage is known only after a turn finishes. Serialize live turns under a budget so calls
+  // queued behind a completed turn cannot start against stale `spent` state.
+  const budgetLimiter = createLimiter(1);
   const internalAbort = new AbortController();
   const agentSignal = options.signal ? anySignal([internalAbort.signal, options.signal]) : internalAbort.signal;
   const inFlight = new Set<Promise<unknown>>();
@@ -189,6 +194,7 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
   const ctx: RunContext = {
     state,
     limiter,
+    budgetLimiter,
     maxAgents: options.maxAgents ?? 1000,
     agentMaxAttempts: Math.max(1, Math.trunc(options.agentMaxAttempts ?? 3)),
     tokenBudget: options.tokenBudget,
@@ -213,10 +219,6 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
         `Workflow agent() call cap reached (${ctx.maxAgents}). This usually means a loop using budget.remaining() never terminates because no token budget was set — remaining() returns Infinity when budget.total is null. Add a hard iteration cap to the loop, or pass a token budget.`,
       );
     }
-    if (ctx.tokenBudget !== null && ctx.tokenBudget !== undefined && remainingBudget(ctx.tokenBudget, state) <= 0) {
-      throw new WorkflowBudgetExceededError("workflow token budget exhausted");
-    }
-
     const assignedPhase = agentOptions.phase;
     state.agentCount++;
     const index = ++state.nextAgentIndex;
@@ -261,10 +263,17 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
         return result;
       }
 
-      // Pick the runner for this call (provider/model routing). Thrown here — after the cache check,
-      // before the retry loop — so an unknown provider / ambiguous model hard-fails like cap/budget,
-      // rather than being retried into a `null` failure. Cached agents never reach this.
-      const runner = resolveRunner(callOptions);
+      const runUncached = async () => {
+        // Cache hits above are free. Live turns are serialized when a budget is configured, so this
+        // observes all prior completed/rejected attempts before dispatching a new turn.
+        if (ctx.tokenBudget !== null && ctx.tokenBudget !== undefined && remainingBudget(ctx.tokenBudget, state) <= 0) {
+          throw new WorkflowBudgetExceededError("workflow token budget exhausted");
+        }
+
+        // Pick the runner for this call (provider/model routing). Thrown here — after the cache check,
+        // before the retry loop — so an unknown provider / ambiguous model hard-fails like cap/budget,
+        // rather than being retried into a `null` failure. Cached agents never reach this.
+        const runner = resolveRunner(callOptions);
 
       const maxAttempts = callOptions.maxAttempts ?? ctx.agentMaxAttempts;
       let attemptsMade = 0;
@@ -273,6 +282,9 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
         attemptsMade = attempt;
         if (ctx.internalAbort.signal.aborted) throw new WorkflowAbortError();
         throwIfUserAborted();
+        if (ctx.tokenBudget !== null && ctx.tokenBudget !== undefined && remainingBudget(ctx.tokenBudget, state) <= 0) {
+          throw new WorkflowBudgetExceededError("workflow token budget exhausted");
+        }
 
         let sessionId: string | undefined;
         let backend: string | undefined;
@@ -365,8 +377,13 @@ function createRunContext(options: WorkflowRunOptions, runId: string): RunContex
         attempts: attemptsMade,
         error: lastMessage,
       });
-      options.onProgress?.(agentProgress(label, assignedPhase, "failed", { error: lastMessage, index, key: cacheKey }));
-      return null;
+        options.onProgress?.(agentProgress(label, assignedPhase, "failed", { error: lastMessage, index, key: cacheKey }));
+        return null;
+      };
+
+      return ctx.tokenBudget !== null && ctx.tokenBudget !== undefined
+        ? ctx.budgetLimiter(runUncached)
+        : runUncached();
     });
   };
 
@@ -730,7 +747,9 @@ async function runBunChild(runnerPath: string, options: BunChildOptions): Promis
       if (isClosedPipeError(error)) return;
       settle(error);
     });
-    child.on("exit", (code, signal) => {
+    // `exit` can precede final stdio delivery. Wait for `close` so a large final IPC result is
+    // parsed before deciding that a successful Bun process omitted its result.
+    child.on("close", (code, signal) => {
       if (settled) return;
       if (code === 0) {
         settle(new WorkflowInputError("Bun workflow exited without producing a result"));
