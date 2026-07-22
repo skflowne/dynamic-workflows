@@ -4,6 +4,7 @@ dist/
 *.tsbuildinfo
 .DS_Store
 .codex-workflow/
+.pi-subagents/
 .vscode/
 
 # Local research / reverse-engineering notes — not for publication.
