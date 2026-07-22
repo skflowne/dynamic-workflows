@@ -1,15 +1,18 @@
 import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { WorkflowInputError } from "../errors.js";
+import { AgentOutputLimitExceededError, WorkflowInputError } from "../errors.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta, WorkflowAgentRunner } from "../types.js";
 import { buildSubagentPrompt } from "./prompt.js";
-import { spawnAgentProcess } from "./spawn-process.js";
+import { spawnAgentProcess, type SpawnAgentResult } from "./spawn-process.js";
 import { DEFAULT_AGENT_TIMEOUT_MS, startAgentTimeout } from "./turn-control.js";
 import { createDetachedWorktree } from "./worktree.js";
 
-/** Output buffer ceilings — a runaway pi turn (e.g. tool-spam loop) must never OOM the parent. */
-const MAX_STDOUT_BYTES = 64 * 1024 * 1024;
+/**
+ * Pi stdout is an NDJSON event stream and is parsed incrementally instead of retained in full. Cap a
+ * single unterminated event so one pathological tool result still cannot grow memory without bound.
+ */
+const MAX_EVENT_LINE_BYTES = 16 * 1024 * 1024;
 const MAX_STDERR_BYTES = 4 * 1024 * 1024;
 
 /** Env var the generated models.json references for the custom provider's API key (keeps it off disk). */
@@ -113,27 +116,37 @@ export class PiCliAgentRunner implements WorkflowAgentRunner {
 
     try {
       await this.ensureModelsConfig();
-      const raw = await spawnAgentProcess({
-        command,
-        args: buildPiArgs(prompt, this.options),
-        cwd: workingDirectory,
-        env: this.spawnEnv(),
-        maxStdoutBytes: MAX_STDOUT_BYTES,
-        maxStderrBytes: MAX_STDERR_BYTES,
-        label: "pi",
-        signal: timeout.signal,
-        timedOut: timeout.timedOut,
-        timeoutMs,
-        normalizeSpawnError: (error) => normalizePiSpawnError(error, command, promptBytes),
-      });
+      const eventParser = new PiEventStreamParser();
+      let raw: SpawnAgentResult;
+      try {
+        raw = await spawnAgentProcess({
+          command,
+          args: buildPiArgs(prompt, this.options),
+          cwd: workingDirectory,
+          env: this.spawnEnv(),
+          // The event parser retains only the final assistant state, not the complete tool-heavy stream.
+          maxStdoutBytes: 0,
+          maxStderrBytes: MAX_STDERR_BYTES,
+          onStdoutText: (text) => eventParser.push(text),
+          retainStdout: false,
+          label: "pi",
+          signal: timeout.signal,
+          timedOut: timeout.timedOut,
+          timeoutMs,
+          normalizeSpawnError: (error) => normalizePiSpawnError(error, command, promptBytes),
+        });
+      } catch (error) {
+        // Preserve session linkage and tokens accumulated before a streaming/parser failure.
+        reportPiMeta(eventParser.snapshot(), onMeta);
+        throw error;
+      }
 
       // pi exits 0 even when the model turn errored, so success/failure is decided by the LAST assistant
       // message's stopReason, NOT the exit code.
-      const parsed = parsePiEvents(raw.stdout);
+      const parsed = eventParser.finish();
       // Report session + tokens BEFORE any throw so a failed/errored turn is still traceable and its
       // real token spend isn't lost.
-      if (parsed.sessionId) onMeta?.({ backend: "pi", sessionId: parsed.sessionId });
-      if (typeof parsed.outputTokens === "number") onMeta?.({ outputTokens: parsed.outputTokens });
+      reportPiMeta(parsed, onMeta);
       if (parsed.error) throw new Error(`pi agent failed: ${parsed.error}`);
       if (!parsed.hasAssistant) {
         const detail =
@@ -267,6 +280,11 @@ export async function writePiModelsConfig(
   await writeFile(path.join(agentDir, "models.json"), `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
+function reportPiMeta(parsed: ParsedPiEvents, onMeta: ((meta: WorkflowAgentMeta) => void) | undefined): void {
+  if (parsed.sessionId) onMeta?.({ backend: "pi", sessionId: parsed.sessionId });
+  if (typeof parsed.outputTokens === "number") onMeta?.({ outputTokens: parsed.outputTokens });
+}
+
 interface ParsedPiEvents {
   response: string;
   sessionId?: string;
@@ -282,56 +300,101 @@ interface ParsedPiEvents {
  * text of the LAST assistant message (the final answer), and the summed `usage.output` across all
  * assistant messages (a tool-using turn produces several). Surfaces the final turn's error, if any.
  */
-export function parsePiEvents(raw: string): ParsedPiEvents {
-  let sessionId: string | undefined;
-  let lastAssistant: PiAssistantMessage | undefined;
-  let outputTokens: number | undefined;
-  let hasAssistant = false;
+export class PiEventStreamParser {
+  private pending = "";
+  private sessionId: string | undefined;
+  private lastAssistant: PiAssistantMessage | undefined;
+  private outputTokens: number | undefined;
+  private hasAssistant = false;
 
-  for (const line of raw.split("\n")) {
+  push(text: string): void {
+    this.pending += text;
+    let newline = this.pending.indexOf("\n");
+    while (newline >= 0) {
+      const line = this.pending.slice(0, newline);
+      this.pending = this.pending.slice(newline + 1);
+      this.consumeLine(line);
+      newline = this.pending.indexOf("\n");
+    }
+    this.assertPendingLineIsBounded();
+  }
+
+  finish(): ParsedPiEvents {
+    if (this.pending) {
+      this.consumeLine(this.pending);
+      this.pending = "";
+    }
+    return this.result();
+  }
+
+  /** Metadata and completed assistant state parsed so far, excluding any partial current line. */
+  snapshot(): ParsedPiEvents {
+    return this.result();
+  }
+
+  private consumeLine(line: string): void {
+    if (Buffer.byteLength(line) > MAX_EVENT_LINE_BYTES) {
+      throw new AgentOutputLimitExceededError(
+        `pi NDJSON event exceeded ${MAX_EVENT_LINE_BYTES} bytes — aborting to avoid unbounded buffering`,
+      );
+    }
     const trimmed = line.trim();
-    if (!trimmed) continue;
+    if (!trimmed) return;
     let event: Record<string, unknown>;
     try {
       event = JSON.parse(trimmed) as Record<string, unknown>;
     } catch {
-      continue; // tolerate non-JSON noise / partial trailing lines
+      return; // tolerate non-JSON noise / partial trailing lines
     }
     const type = event.type as string | undefined;
     if (type === "session" && typeof event.id === "string") {
-      sessionId = event.id;
-      continue;
+      this.sessionId = event.id;
+      return;
     }
     // Each assistant message is finalized once, in a `message_end`. turn_end/agent_end repeat the same
     // message, so summing usage off message_end only keeps the token total from being double-counted.
     if (type === "message_end") {
       const message = asAssistantMessage(event.message);
       if (message) {
-        hasAssistant = true;
-        lastAssistant = message;
+        this.hasAssistant = true;
+        this.lastAssistant = message;
         const out = message.usage?.output;
-        if (typeof out === "number") outputTokens = (outputTokens ?? 0) + out;
+        if (typeof out === "number") this.outputTokens = (this.outputTokens ?? 0) + out;
       }
     }
   }
 
-  if (lastAssistant && (lastAssistant.stopReason === "error" || lastAssistant.errorMessage)) {
-    // Carry sessionId + accumulated outputTokens on the error path too, so a failed turn stays traceable
-    // and its real token spend (from earlier tool-using turns) isn't lost.
+  private result(): ParsedPiEvents {
+    if (this.lastAssistant && (this.lastAssistant.stopReason === "error" || this.lastAssistant.errorMessage)) {
+      return {
+        response: "",
+        hasAssistant: this.hasAssistant,
+        ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+        ...(this.outputTokens !== undefined ? { outputTokens: this.outputTokens } : {}),
+        error: cleanPiErrorMessage(this.lastAssistant.errorMessage),
+      };
+    }
     return {
-      response: "",
-      hasAssistant,
-      ...(sessionId ? { sessionId } : {}),
-      ...(outputTokens !== undefined ? { outputTokens } : {}),
-      error: cleanPiErrorMessage(lastAssistant.errorMessage),
+      response: this.lastAssistant ? assistantText(this.lastAssistant.content) : "",
+      hasAssistant: this.hasAssistant,
+      ...(this.sessionId ? { sessionId: this.sessionId } : {}),
+      ...(this.outputTokens !== undefined ? { outputTokens: this.outputTokens } : {}),
     };
   }
-  return {
-    response: lastAssistant ? assistantText(lastAssistant.content) : "",
-    hasAssistant,
-    ...(sessionId ? { sessionId } : {}),
-    ...(outputTokens !== undefined ? { outputTokens } : {}),
-  };
+
+  private assertPendingLineIsBounded(): void {
+    if (Buffer.byteLength(this.pending) > MAX_EVENT_LINE_BYTES) {
+      throw new AgentOutputLimitExceededError(
+        `pi NDJSON event exceeded ${MAX_EVENT_LINE_BYTES} bytes — aborting to avoid unbounded buffering`,
+      );
+    }
+  }
+}
+
+export function parsePiEvents(raw: string): ParsedPiEvents {
+  const parser = new PiEventStreamParser();
+  parser.push(raw);
+  return parser.finish();
 }
 
 function asAssistantMessage(value: unknown): PiAssistantMessage | undefined {

@@ -249,7 +249,8 @@ return { findings: findings.flat().filter(Boolean) }
 ```
 
 - `agent(prompt, opts?)` — spawn one subagent. Options: `label`, `phase`, `schema` (JSON Schema →
-  validated structured output), `provider`, `model`, `agentType`, `isolation: 'worktree'` (runs in a
+  validated structured output), `provider`, `model`, `agentType`, `maxAttempts` (per-call override;
+  use `1` for mutation agents that must not be replayed), `isolation: 'worktree'` (runs in a
   fresh detached git worktree). `provider` selects a configured provider and `model` routes to the
   provider declaring that model id (see [Provider config](#provider-config)); a `model` no provider
   declares is ignored (the call falls through to `--provider`/`config.default`), so Claude workflows with

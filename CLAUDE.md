@@ -86,7 +86,9 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 ### Agent failure / retry / budget semantics (Claude parity)
 - **`agent()` retries then returns `null` (it does NOT throw on failure).** `ctx.runAgent` wraps the
   runner + `normalizeAgentResult` in a retry loop (`agentMaxAttempts`, default 3; `--agent-retries n`
-  → `n+1`). Schema-validation failures are retryable too. On exhaustion it records the failure on
+  → `n+1`; per-call `agent({maxAttempts})` overrides it). Schema-validation failures are retryable too.
+  `AgentOutputLimitExceededError` is non-retryable because replaying a tool-heavy mutation turn is unsafe.
+  On exhaustion (or a non-retryable failure) it records the failure on
   `state.failures` and returns `null` — so the Claude `.filter(Boolean)` idiom works. Abort/cap/budget
   errors are thrown *before* the loop and never become `null`. Failed agents are **not journaled**, so
   `resume` re-attempts them. Failures surface as `WorkflowRunResult.failures` / `WorkflowOutput.stats.failures`.
@@ -141,8 +143,11 @@ aborts it and awaits in-flight runner promises so backend sessions/processes sto
 - `src/runners/pi-cli.ts` — real pi runner (`@earendil-works/pi-coding-agent`, a full agentic harness:
   read/bash/edit/write/grep/find/ls tools). Spawns `pi -p --mode json --no-context-files [--approve]
   [--tools …] --provider/--model/--session-dir … "<prompt>"` per `agent()`. Parses pi's NDJSON event
-  stream: session id from the first `{type:"session"}`, the **last assistant `message_end`** text-blocks
-  as the result, and summed `usage.output` across assistant turns for `outputTokens`. **pi exits 0 even
+  stream incrementally without retaining the complete tool-heavy transcript: session id from the first
+  `{type:"session"}`, the **last assistant `message_end`** text-blocks as the result, and summed
+  `usage.output` across assistant turns for `outputTokens`. Individual unterminated NDJSON events are
+  capped at 16MB, while total stream size is bounded by the turn timeout rather than an in-memory buffer.
+  **pi exits 0 even
   when the model turn errored — success/failure is decided by the last assistant message's `stopReason`
   (`"error"` ⇒ throw a retryable failure), NOT the exit code.** A failed turn still reports its
   `sessionId`/`outputTokens` via `onMeta` *before* throwing, so a failed agent's partial usage/session

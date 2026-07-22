@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
+import { AgentOutputLimitExceededError } from "../errors.js";
 import { agentTimeoutError } from "./turn-control.js";
 
 /**
@@ -24,8 +25,13 @@ export interface SpawnAgentOptions {
   env: NodeJS.ProcessEnv;
   /** Written to the child's stdin then closed. When set, stdin is piped; otherwise it's ignored. */
   stdin?: string;
+  /** Total buffered stdout ceiling. Set to 0 when stdout is consumed incrementally and not retained. */
   maxStdoutBytes: number;
   maxStderrBytes: number;
+  /** Incremental decoded stdout consumer. Exceptions terminate the child and reject the run. */
+  onStdoutText?: (text: string) => void;
+  /** Defaults to true. Disable when onStdoutText retains all state needed by the caller. */
+  retainStdout?: boolean;
   /** Backend label used in overflow error messages, e.g. "Gemini CLI" or "pi". */
   label: string;
   signal: AbortSignal | undefined;
@@ -97,7 +103,18 @@ export function spawnAgentProcess(options: SpawnAgentOptions): Promise<SpawnAgen
     };
 
     const overflow = (stream: string, limit: number) => {
-      terminate(new Error(`${options.label} ${stream} exceeded ${limit} bytes — aborting to avoid unbounded buffering`));
+      terminate(new AgentOutputLimitExceededError(`${options.label} ${stream} exceeded ${limit} bytes — aborting to avoid unbounded buffering`));
+    };
+
+    const consumeStdout = (text: string) => {
+      if (!text) return;
+      try {
+        options.onStdoutText?.(text);
+      } catch (error) {
+        terminate(error);
+        return;
+      }
+      if (options.retainStdout !== false) stdout += text;
     };
 
     if (options.signal?.aborted) {
@@ -109,8 +126,8 @@ export function spawnAgentProcess(options: SpawnAgentOptions): Promise<SpawnAgen
     child.stdout!.on("data", (chunk: Buffer) => {
       if (pendingError !== undefined) return; // draining a doomed child; don't keep buffering
       stdoutBytes += chunk.length;
-      if (stdoutBytes > options.maxStdoutBytes) return overflow("stdout", options.maxStdoutBytes);
-      stdout += stdoutDecoder.write(chunk);
+      if (options.maxStdoutBytes > 0 && stdoutBytes > options.maxStdoutBytes) return overflow("stdout", options.maxStdoutBytes);
+      consumeStdout(stdoutDecoder.write(chunk));
     });
     child.stderr!.on("data", (chunk: Buffer) => {
       if (pendingError !== undefined) return;
@@ -124,7 +141,7 @@ export function spawnAgentProcess(options: SpawnAgentOptions): Promise<SpawnAgen
 
     // Settle on `close` (all stdio ended) — not `exit` — so trailing stdout is never truncated.
     child.on("close", (code, signalName) => {
-      stdout += stdoutDecoder.end();
+      consumeStdout(stdoutDecoder.end());
       stderr += stderrDecoder.end();
       if (pendingError !== undefined) {
         settle(pendingError);

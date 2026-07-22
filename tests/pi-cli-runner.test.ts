@@ -4,7 +4,7 @@ import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { PiCliAgentRunner, runWorkflow } from "../src/index.js";
-import { parsePiEvents } from "../src/runners/pi-cli.js";
+import { parsePiEvents, PiEventStreamParser } from "../src/runners/pi-cli.js";
 import type { WorkflowAgentCall, WorkflowAgentMeta } from "../src/index.js";
 
 function makeCall(prompt: string, options: Partial<WorkflowAgentCall["options"]> = {}): WorkflowAgentCall {
@@ -299,6 +299,54 @@ test("PiCliAgentRunner reports session + tokens before throwing on a stopReason:
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("PiCliAgentRunner preserves parsed session and token metadata when a later event overflows", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-workflow-pi-overflow-meta-"));
+  try {
+    const fakePi = path.join(dir, "fake-pi");
+    await writeFile(
+      fakePi,
+      `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ type: "session", id: "overflow-session" }) + "\\n");
+process.stdout.write(JSON.stringify({
+  type: "message_end",
+  message: { role: "assistant", content: [{ type: "text", text: "partial" }], usage: { output: 11 }, stopReason: "tool_use" }
+}) + "\\n");
+process.stdout.write(JSON.stringify({ type: "tool_progress", payload: "x".repeat(17 * 1024 * 1024) }) + "\\n");
+`,
+      "utf8",
+    );
+    await chmod(fakePi, 0o755);
+
+    const metas: WorkflowAgentMeta[] = [];
+    const runner = new PiCliAgentRunner({ command: fakePi, cwd: dir, model: "m", agentTimeoutMs: 5000 });
+    await assert.rejects(
+      () => runner.run(makeCall("x"), undefined, (meta) => metas.push(meta)),
+      /pi NDJSON event exceeded/,
+    );
+    assert.ok(metas.some((meta) => meta.sessionId === "overflow-session"), `expected session metadata, got ${JSON.stringify(metas)}`);
+    assert.ok(metas.some((meta) => meta.outputTokens === 11), `expected token metadata, got ${JSON.stringify(metas)}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("PiEventStreamParser handles more than the former 64 MiB total limit without retaining the stream", () => {
+  const parser = new PiEventStreamParser();
+  const noise = `${JSON.stringify({ type: "tool_progress", payload: "x".repeat(1024) })}\n`;
+  const iterations = Math.ceil((65 * 1024 * 1024) / Buffer.byteLength(noise));
+  for (let i = 0; i < iterations; i++) parser.push(noise);
+  parser.push(`${JSON.stringify({ type: "session", id: "large-stream" })}\n`);
+  parser.push(JSON.stringify({
+    type: "message_end",
+    message: { role: "assistant", content: [{ type: "text", text: "done" }], usage: { output: 3 }, stopReason: "stop" },
+  }));
+
+  const parsed = parser.finish();
+  assert.equal(parsed.response, "done");
+  assert.equal(parsed.sessionId, "large-stream");
+  assert.equal(parsed.outputTokens, 3);
 });
 
 test("parsePiEvents sums output tokens across multiple assistant turns and returns the last answer", () => {
