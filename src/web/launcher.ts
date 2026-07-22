@@ -40,7 +40,11 @@ export function openBrowser(url: string): void {
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
   try {
-    spawn(cmd, args, { detached: true, stdio: "ignore" }).unref();
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    // spawn failures such as a missing `xdg-open` arrive asynchronously on the child rather than
+    // throwing from spawn(), so consume the error to keep this best-effort convenience non-fatal.
+    child.once("error", () => {});
+    child.unref();
   } catch {
     // ignore — opening a browser is a convenience, not a requirement
   }
